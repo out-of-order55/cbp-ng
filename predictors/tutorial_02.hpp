@@ -22,8 +22,9 @@ struct tutorial : predictor {
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
-        // Hash the instruction PC to 6-bit index by first making an array of
-        // 6-bit values, then folding that array onto itself using XOR.
+        // Hash the instruction PC to a 6-bit index by first chunking it into
+        // an array of 6-bit values, then folding that array onto itself using
+        // XOR.
         val<6> index = inst_pc.make_array(val<6>{}).fold_xor();
 
         // Index into the array of 2-bit counters, saving the counter value to
