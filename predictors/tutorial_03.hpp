@@ -19,11 +19,11 @@ struct tutorial : predictor {
      * two-bit counters.
      */
 
-    ram<val<2 * LINE_INSTRUCTIONS>, 64> counters;
+    ram<arr<val<2>,LINE_INSTRUCTIONS>, 64> counters;
 
     // Record values from prediction-time to be used at update-time
     reg<6> index;
-    reg<2 * LINE_INSTRUCTIONS> counter;
+    arr<reg<2>, LINE_INSTRUCTIONS> counter;
     arr<reg<1>, LINE_INSTRUCTIONS> saturated;
     arr<reg<1>, LINE_INSTRUCTIONS> pred_taken;
 
@@ -31,7 +31,7 @@ struct tutorial : predictor {
     // update logic
     u64 num_branches = 0;
     arr<reg<4>, LINE_INSTRUCTIONS> branch_offset;
-    arr<reg<1>, LINE_INSTRUCTIONS> branch_dir;
+    arr<reg<1>, LINE_INSTRUCTIONS> branch_taken;
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
@@ -51,11 +51,10 @@ struct tutorial : predictor {
         // Save information about this prediction (its direction and whether
         // the counter was saturated) to be used for other predictions this
         // cycle and update-time.
-        arr<val<2>, LINE_INSTRUCTIONS> counter_arr = counter.make_array(val<2>{});
-        arr<val<1>, LINE_INSTRUCTIONS> saturated_val = [&](u64 i){ return (counter_arr[i] == hard<0>{}) | (counter_arr[i] == hard<3>{}); };
-        saturated = saturated_val;
-        arr<val<1>, LINE_INSTRUCTIONS> taken_val = [&](u64 i){ return counter_arr[i] >> 1;};
-        pred_taken = taken_val;
+        for (u64 i=0; i<LINE_INSTRUCTIONS; i++) {
+            saturated[i] = (counter[i] == hard<0>{}) | (counter[i] == hard<3>{});
+            pred_taken[i] = counter[i] >> 1;
+        }
 
         return predict(inst_pc);
     };
@@ -64,7 +63,7 @@ struct tutorial : predictor {
     {
         // Use the top bit of the counter to predict the branch's direction
         val<4> offset = inst_pc >> 2;
-        reuse_prediction(offset != (LINE_INSTRUCTIONS - 1));
+        reuse_prediction(offset != hard<LINE_INSTRUCTIONS-1>{});
         return pred_taken.select(offset);
     };
 
@@ -92,7 +91,7 @@ struct tutorial : predictor {
         // allowed to count branches and instructions using C++ integers and to
         // use those counts as you see demonstrated here.
         branch_offset[num_branches] = branch_pc >> 2;
-        branch_dir[num_branches] = taken;
+        branch_taken[num_branches] = taken;
         num_branches++;
     }
 
@@ -100,45 +99,39 @@ struct tutorial : predictor {
     {
         // In order to perform updates for the current cacheline, we want a
         // mask with one bit corresponding to one instruction offset in the
-        // line, but to start we have an array indexed by branch number. So we
-        // create one inner array per offset and fold that array into a single
-        // bit per offset.
-        arr<val<1>, LINE_INSTRUCTIONS> branch_arr = [&](u64 offset) {
-            arr<val<1>, LINE_INSTRUCTIONS> match_offset = [&](u64 i){
-                return (i < num_branches) & (branch_offset[i] == offset);
-            };
-            return match_offset.fold_or();
+        // line, but to start we have an array indexed by branch number.
+        arr<val<LINE_INSTRUCTIONS>, LINE_INSTRUCTIONS> branch_onehot = [&](u64 i) {
+            // `valid_mask` will have all bits set if this was a executed in
+            // this prediction block
+            val<LINE_INSTRUCTIONS> valid_mask = val<1>{i < num_branches}.replicate(hard<LINE_INSTRUCTIONS>{}).concat();
+            // `decode` sets the value at the index of the val it is called on. So, if `branch_offset[1]` holds a value of 5, this statement will output a 
+            return valid_mask & branch_offset[i].decode().concat();
         };
-        // Finally, we concatenate that array of 1-bit vals into a 16-bit val
-        val<LINE_INSTRUCTIONS> branch_mask = branch_arr.concat();
+        // Fold that array of 16-bit vals into a single 16-bit val with
+        // bitwise-OR
+        val<LINE_INSTRUCTIONS> branch_mask = branch_onehot.fold_or();
 
-        // The same logic as for `branch_arr` above, but this time we only want
-        // the bits in the mask set if this were a *taken* branch
-        arr<val<1>, LINE_INSTRUCTIONS> taken_arr = [&](u64 offset) {
-            arr<val<1>, LINE_INSTRUCTIONS> match_offset = [&](u64 i){
-                return (i < num_branches) & (branch_offset[i] == offset) & branch_dir[i];
-            };
-            return match_offset.fold_or();
+        // Similar to `branch_mask` above, but this time we only want the bits
+        // in the mask set if this were a *taken* branch
+        arr<val<LINE_INSTRUCTIONS>, LINE_INSTRUCTIONS> taken_onehot = [&](u64 i) {
+            return branch_onehot[i] & branch_taken[i].replicate(hard<LINE_INSTRUCTIONS>{}).concat();
         };
-        val<LINE_INSTRUCTIONS> taken_mask = taken_arr.concat();
+        val<LINE_INSTRUCTIONS> taken_mask = taken_onehot.fold_or();
 
         // Determine which offsets we want to update. We update any the counter
         // of any offset which was a branch and that branch's counter was
         // either incorrect or already-saturated.
         val<LINE_INSTRUCTIONS> incorrect = taken_mask ^ pred_taken.concat();
-        val<LINE_INSTRUCTIONS> unsaturated_or_mispredicted_branch = branch_mask & (~saturated.concat() | incorrect);
+        val<LINE_INSTRUCTIONS> update_mask = branch_mask & (~saturated.concat() | incorrect);
 
         // Determine whether to perform an update - when the updated counter is
         // different than the read counter
-        val<1> performing_update = (unsaturated_or_mispredicted_branch != hard<0>{});
-
-        arr<val<1>, LINE_INSTRUCTIONS> should_update = unsaturated_or_mispredicted_branch.make_array(val<1>{});
+        val<1> performing_update = (update_mask != hard<0>{});
 
         arr<val<2>, LINE_INSTRUCTIONS> new_counters = [&](u64 i){
-            val<2> this_counter = counter.make_array(val<2>{})[i];
-            return select(should_update[i],
-                          update_counter(this_counter, taken_arr[i]),
-                          this_counter);
+            return select(val<1>{update_mask>>i},
+                          update_counter(counter[i], val<1>{taken_mask>>i}),
+                          counter[i]);
         };
 
         // If we are doing an update, inform the simulator we need an extra
@@ -149,7 +142,7 @@ struct tutorial : predictor {
 
         // Finally, write back to the array (only if needed)
         execute_if(performing_update, [&](){
-            counters.write(index, new_counters.concat());
+            counters.write(index, new_counters);
         });
     }
 };
