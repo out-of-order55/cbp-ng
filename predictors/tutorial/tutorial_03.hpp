@@ -3,12 +3,14 @@
 
 using namespace hcm;
 
-template<u64 LINE_INSTRUCTIONS = 16>
+template<u64 LINE_BITS = 4>
 struct tutorial_03 : predictor {
     /*
      * Predict up to 16 instructions per cycle using an SRAM array of 16
      * two-bit counters.
      */
+
+    static constexpr u64 LINE_INSTRUCTIONS = 1 << LINE_BITS;
 
     ram<arr<val<2>,LINE_INSTRUCTIONS>, 64> counters;
 
@@ -21,7 +23,7 @@ struct tutorial_03 : predictor {
     // Record values from per-branch updates to be used in per-cacheline
     // update logic
     u64 num_branches = 0;
-    arr<reg<4>, LINE_INSTRUCTIONS> branch_offset;
+    arr<reg<LINE_BITS>, LINE_INSTRUCTIONS> branch_offset;
     arr<reg<1>, LINE_INSTRUCTIONS> branch_taken;
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
@@ -53,7 +55,7 @@ struct tutorial_03 : predictor {
     val<1> predict(val<64> inst_pc)
     {
         // Use the top bit of the counter to predict the branch's direction
-        val<4> offset = inst_pc >> 2;
+        val<LINE_BITS> offset = inst_pc >> 2;
         reuse_prediction(offset != hard<LINE_INSTRUCTIONS-1>{});
         return pred_taken.select(offset);
     };

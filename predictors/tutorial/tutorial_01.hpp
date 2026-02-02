@@ -9,7 +9,10 @@ struct tutorial_01 : predictor {
      * that PC as taken.
      */
 
+    // Store the last taken branch
     reg<64> last_taken;
+
+    // Save the branch PC and direction for use in `update_cycle()`
     reg<64> this_branch_pc;
     reg<1> this_branch_taken;
 
