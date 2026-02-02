@@ -1,19 +1,10 @@
-#include "../cbp.hpp"
-#include "../harcom.hpp"
+#include "../../cbp.hpp"
+#include "../../harcom.hpp"
 
 using namespace hcm;
 
-#define LINE_INSTRUCTIONS 16
-
-// Note: common.hpp contains a more generic version of a saturating counter
-// update, this is reproduced here for learning purposes.
-val<2> update_counter(val<2> counter, val<1> taken) {
-    val<2> increased = select(counter == 3, counter, val<2>{counter + 1});
-    val<2> decreased = select(counter == 0, counter, val<2>{counter - 1});
-    return select(taken, increased, decreased);
-}
-
-struct tutorial : predictor {
+template<u64 LINE_INSTRUCTIONS = 16>
+struct tutorial_03 : predictor {
     /*
      * Predict up to 16 instructions per cycle using an SRAM array of 16
      * two-bit counters.
@@ -53,7 +44,7 @@ struct tutorial : predictor {
         // cycle and update-time.
         for (u64 i=0; i<LINE_INSTRUCTIONS; i++) {
             saturated[i] = (counter[i] == hard<0>{}) | (counter[i] == hard<3>{});
-            pred_taken[i] = counter[i] >> 1;
+            pred_taken[i] = counter[i] >> (counter[i].size - 1);
         }
 
         return predict(inst_pc);
@@ -82,6 +73,14 @@ struct tutorial : predictor {
         return predict(inst_pc);
     }
 
+    // Note: common.hpp contains a more generic version of a saturating counter
+    // update, this is reproduced here for learning purposes.
+    inline val<2> update_counter(val<2> counter, val<1> taken) {
+        val<2> increased = select(counter == 3, counter, val<2>{counter + 1});
+        val<2> decreased = select(counter == 0, counter, val<2>{counter - 1});
+        return select(taken, increased, decreased);
+    }
+
     void update_condbr([[maybe_unused]] val<64> branch_pc, [[maybe_unused]] val<1> taken, [[maybe_unused]] val<64> next_pc)
     {
         // For each conditional branch executed, record its offset and whether
@@ -104,7 +103,9 @@ struct tutorial : predictor {
             // `valid_mask` will have all bits set if this was a executed in
             // this prediction block
             val<LINE_INSTRUCTIONS> valid_mask = val<1>{i < num_branches}.replicate(hard<LINE_INSTRUCTIONS>{}).concat();
-            // `decode` sets the value at the index of the val it is called on. So, if `branch_offset[1]` holds a value of 5, this statement will output a 
+            // `decode` sets a bit corresponding to the value it is called on.
+            // So, if `branch_offset[1]` holds a value of 5, this statement
+            // will return 0b10000, assuming `i < num_branches`.
             return valid_mask & branch_offset[i].decode().concat();
         };
         // Fold that array of 16-bit vals into a single 16-bit val with

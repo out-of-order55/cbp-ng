@@ -1,9 +1,9 @@
-#include "../cbp.hpp"
-#include "../harcom.hpp"
+#include "../../cbp.hpp"
+#include "../../harcom.hpp"
 
 using namespace hcm;
 
-struct tutorial : predictor {
+struct tutorial_01 : predictor {
     /*
      * Remember the PC of the last taken branch. Predict any branches matching
      * that PC as taken.

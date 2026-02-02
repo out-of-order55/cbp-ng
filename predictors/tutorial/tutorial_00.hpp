@@ -1,9 +1,9 @@
-#include "../cbp.hpp"
-#include "../harcom.hpp"
+#include "../../cbp.hpp"
+#include "../../harcom.hpp"
 
 using namespace hcm;
 
-struct tutorial : predictor {
+struct tutorial_00 : predictor {
     /*
      * Always predict not-taken (i.e. 0) for both first- and second-level
      * predictors. Predict a single instruction per cycle. 

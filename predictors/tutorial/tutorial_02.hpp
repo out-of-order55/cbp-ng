@@ -1,17 +1,9 @@
-#include "../cbp.hpp"
-#include "../harcom.hpp"
+#include "../../cbp.hpp"
+#include "../../harcom.hpp"
 
 using namespace hcm;
 
-// Note: common.hpp contains a more generic version of a saturating counter
-// update, this is reproduced here for learning purposes. 
-val<2> update_counter(val<2> counter, val<1> taken) {
-    val<2> increased = select(counter == 3, counter, val<2>{counter + 1});
-    val<2> decreased = select(counter == 0, counter, val<2>{counter - 1});
-    return select(taken, increased, decreased);
-}
-
-struct tutorial : predictor {
+struct tutorial_02 : predictor {
     /*
      * Predict one instruction per cycle using an SRAM array of simple two-bit
      * counters indexed by a hashed PC.
@@ -41,10 +33,18 @@ struct tutorial : predictor {
         return counter >> 1;
     }
 
+    // Note: common.hpp contains a more generic version of a saturating counter
+    // update, this is reproduced here for learning purposes.
+    inline val<2> update_counter(val<2> counter, val<1> taken) {
+        val<2> increased = select(counter == 3, counter, val<2>{counter + 1});
+        val<2> decreased = select(counter == 0, counter, val<2>{counter - 1});
+        return select(taken, increased, decreased);
+    }
+
     void update_condbr([[maybe_unused]] val<64> branch_pc, [[maybe_unused]] val<1> taken, [[maybe_unused]] val<64> next_pc)
     {
         // Calculate the new saturating counter value based on its previous
-        // value and the executed direction of the branch 
+        // value and the executed direction of the branch
         val<2> newcounter = update_counter(counter, taken);
 
         // Determine whether to perform an update - when the updated counter is
