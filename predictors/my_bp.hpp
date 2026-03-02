@@ -9,7 +9,7 @@
 
 using namespace hcm;
 
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=11, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6>
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=17, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6>
 struct my_bp : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
@@ -191,9 +191,11 @@ struct my_bp : predictor {
     {
         val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<1+NUMG*2>{});
+
         gfolds.fanout(hard<2>{});
 
         // compute indexes
+        
         bindex = lineaddr;
         bindex.fanout(hard<LINEINST>{});
         for (u64 i=0; i<NUMG; i++) {

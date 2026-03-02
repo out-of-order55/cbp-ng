@@ -5,15 +5,30 @@ TAGE 预测器对比脚本
   1. CSV 文件：从 docs/example_and_reference_predictor_results.csv 过滤指定预测器
   2. 结果目录：读取 .out 文件
 
-Usage:
-  # 对比 CSV 中的 tage 和目录中的 my_bp
-  python3 compare_predictors.py --base csv --base-predictor tage --compare dir --compare-dir results_my_bp/
+特性：
+  - 对比 base 和 compare 两个预测器的性能
+  - 自动加载 reference MPKI 作为参考基准
+  - 支持同名预测器修改前后对比（如修改 LOGG 参数）
+  - 支持手动指定存储配置参数
 
-  # 对比两个目录
-  python3 compare_predictors.py --base dir --base-dir results/ --compare dir --compare-dir results_my_bp/
+使用场景:
 
-  # 对比 CSV 中的两个预测器
-  python3 compare_predictors.py --base csv --base-predictor tage --compare csv --compare-predictor my_bp
+# 场景 1: 对比 tage 和 my_bp (不同预测器)
+python3 compare_predictors.py --base csv --base-predictor tage --compare dir --compare-dir results_my_bp/
+
+# 场景 2: 对比同名预测器修改前后
+python3 compare_predictors.py \\
+  --base dir --base-dir results_tage_v1/ \\
+  --compare dir --compare-dir results_tage_v2/ \\
+  --base-label "LOGG=11" --compare-label "LOGG=12" \\
+  --storage1 "LOGLB=6,NUMG=8,LOGG=11,LOGB=12,TAGW=11" \\
+  --storage2 "LOGLB=6,NUMG=8,LOGG=12,LOGB=12,TAGW=11"
+
+# 场景 3: 对比 tage 和 reference
+python3 compare_predictors.py --base csv --base-predictor tage --compare csv --compare-predictor reference
+
+# 场景 4: 对比两个目录的结果
+python3 compare_predictors.py --base dir --base-dir results/ --compare dir --compare-dir results_my_bp/
 """
 
 import sys
@@ -35,8 +50,57 @@ PREDICTORS = {
     }
 }
 
+# Reference MPKI 基准（从 docs/example_and_reference_predictor_results.csv 预计算）
+# MPKI = mispredictions / instructions * 1000
+REFERENCE_MPKI = {
+    'infra_22': 34973 / 39000011 * 1000,
+    'web_74': 88149 / 38999875 * 1000,
+    'xz-3.9139_0': 129243 / 12020327 * 1000,
+    'minizinc-3.2615_0': 37736 / 12020330 * 1000,
+    'int_145': 40758 / 38999986 * 1000,
+    'ntest-1.168389_0': 28094 / 12021627 * 1000,
+    'nodejs-zlib_3279': 161609 / 24372402 * 1000,
+    'rsbench-1.730_0': 317706 / 12020325 * 1000,
+    'web_205': 70805 / 13999869 * 1000,
+    'nodejs-octane_3483': 55193 / 21042413 * 1000,
+    'infra_61': 0,  # 需要根据实际 CSV 补充
+}
+
 MISPREDICTION_PENALTY = 8
 DEFAULT_CSV = 'docs/example_and_reference_predictor_results.csv'
+
+def load_ref_mpki_from_csv(csv_path):
+    """从 CSV 加载 reference 预测器的 MPKI"""
+    ref_mpki = {}
+    if not os.path.isfile(csv_path):
+        return ref_mpki
+
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get('predictor', '') != 'reference':
+                continue
+            trace = row.get('trace', '')
+            if not trace:
+                continue
+            try:
+                misp = int(row.get('mispredictions', 0))
+                instr = int(row.get('instructions', 0))
+                ref_mpki[trace] = (misp / instr * 1000) if instr > 0 else 0
+            except (ValueError, KeyError):
+                continue
+    return ref_mpki
+
+def parse_storage_config(config_str):
+    """解析存储配置字符串，如 'LOGLB=6,NUMG=8,LOGG=11'"""
+    if not config_str:
+        return None
+    params = {}
+    for item in config_str.split(','):
+        if '=' in item:
+            key, val = item.split('=', 1)
+            params[key.strip()] = int(val.strip())
+    return params
 
 def calc_storage(params):
     """计算预测器存储开销"""
@@ -290,29 +354,33 @@ def print_storage_comparison(storage1, storage2, name1='tage', name2='my_bp'):
     print("=" * 70)
 
 def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
-                                   data1, data2, name1='tage', name2='my_bp'):
+                                   data1, data2, ref_mpki,
+                                   name1='tage', name2='my_bp'):
     """打印每个 benchmark 的对比"""
-    print("\n" + "=" * 130)
+    print("\n" + "=" * 155)
     print("=== Per-Benchmark Comparison ===")
-    print("=" * 130)
+    print("=" * 155)
 
-    header = f"{'Benchmark':<30} {name1+' Acc':>11} {name2+' Acc':>11} {'Δ Acc':>9} "
-    header += f"{name1+' MPKI':>11} {name2+' MPKI':>11} {'Δ MPKI':>9} "
-    header += f"{name1+' EPI':>9} {name2+' EPI':>9} {'Norm':>7} "
-    header += f"{name1+' IPC':>9} {name2+' IPC':>9} {'Δ IPC':>9} "
-    header += f"{name1+' VFS':>9} {name2+' VFS':>9} {'Δ VFS':>9}"
+    header = f"{'Benchmark':<28} {'Ref MPKI':>10} {name1+' MPKI':>11} {name2+' MPKI':>11} "
+    header += f"{'vs Ref1':>9} {'vs Ref2':>9} "
+    header += f"{name1+' Acc':>10} {name2+' Acc':>10} {'Δ Acc':>9} "
+    header += f"{name1+' EPI':>8} {name2+' EPI':>8} {'Norm':>7} "
+    header += f"{name1+' VFS':>8} {name2+' VFS':>8} {'Δ VFS':>9}"
     print(header)
-    print("-" * 130)
+    print("-" * 155)
 
     rows = []
     for bench in sorted(common_benchmarks):
         m1 = metrics1[bench]
         m2 = metrics2[bench]
+        ref = ref_mpki.get(bench, None)
 
         d_acc = (m2['accuracy'] - m1['accuracy']) * 100
-        d_mpki = ((m2['mpki'] - m1['mpki']) / m1['mpki'] * 100) if m1['mpki'] > 0 else 0
         norm_epi = m2['epi'] / m1['epi'] if m1['epi'] > 0 else 0
-        d_ipc = ((m2['ipc'] - m1['ipc']) / m1['ipc'] * 100) if m1['ipc'] > 0 else 0
+
+        # vs reference MPKI
+        d_mpki1_ref = ((m1['mpki'] - ref) / ref * 100) if ref and ref > 0 else 0
+        d_mpki2_ref = ((m2['mpki'] - ref) / ref * 100) if ref and ref > 0 else 0
 
         v1 = calc_vfs(m1['ipc'], m1['cpi'], m1['epi'])
         v2 = calc_vfs(m2['ipc'], m2['cpi'], m2['epi'])
@@ -320,10 +388,11 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
 
         row = {
             'benchmark': bench,
+            'ref_mpki': ref,
+            'mpki1': m1['mpki'], 'mpki2': m2['mpki'],
+            'd_mpki1_ref': d_mpki1_ref, 'd_mpki2_ref': d_mpki2_ref,
             'acc1': m1['accuracy'], 'acc2': m2['accuracy'], 'd_acc': d_acc,
-            'mpki1': m1['mpki'], 'mpki2': m2['mpki'], 'd_mpki': d_mpki,
             'epi1': m1['epi'], 'epi2': m2['epi'], 'norm_epi': norm_epi,
-            'ipc1': m1['ipc'], 'ipc2': m2['ipc'], 'd_ipc': d_ipc,
             'vfs1': v1, 'vfs2': v2, 'd_vfs': d_vfs,
             'instr': data1[bench]['instructions'],
             'condbr': data1[bench]['condbr'],
@@ -335,21 +404,22 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
     rows.sort(key=lambda x: x['d_acc'], reverse=True)
 
     for row in rows:
-        line = f"{row['benchmark']:<30} {row['acc1']*100:>9.2f}% {row['acc2']*100:>9.2f}% "
-        line += f"{'+' if row['d_acc']>0 else ''}{row['d_acc']:.3f}% "
-        line += f"{row['mpki1']:>9.3f} {row['mpki2']:>9.3f} "
-        line += f"{'+' if row['d_mpki']>0 else ''}{row['d_mpki']:.2f}% "
-        line += f"{row['epi1']:>7.1f} {row['epi2']:>7.1f} {row['norm_epi']:>7.4f} "
-        line += f"{row['ipc1']:>7.4f} {row['ipc2']:>7.4f} "
-        line += f"{'+' if row['d_ipc']>0 else ''}{row['d_ipc']:.2f}% "
-        line += f"{row['vfs1']:>7.4f} {row['vfs2']:>7.4f} "
-        line += f"{'+' if row['d_vfs']>0 else ''}{row['d_vfs']:.2f}%"
+        ref_str = f"{row['ref_mpki']:.3f}" if row['ref_mpki'] is not None else "N/A"
+        line = f"{row['benchmark']:<28} {ref_str:>10} {row['mpki1']:>9.3f} {row['mpki2']:>9.3f} "
+        line += f"{'+' if row['d_mpki1_ref']>0 else ''}{row['d_mpki1_ref']:>7.1f}% "
+        line += f"{'+' if row['d_mpki2_ref']>0 else ''}{row['d_mpki2_ref']:>7.1f}% "
+        line += f"{row['acc1']*100:>8.2f}% {row['acc2']*100:>8.2f}% "
+        line += f"{'+' if row['d_acc']>0 else ''}{row['d_acc']:>7.3f}% "
+        line += f"{row['epi1']:>6.1f} {row['epi2']:>6.1f} {row['norm_epi']:>7.4f} "
+        line += f"{row['vfs1']:>6.4f} {row['vfs2']:>6.4f} "
+        line += f"{'+' if row['d_vfs']>0 else ''}{row['d_vfs']:>7.2f}%"
         print(line)
 
-    print("=" * 130)
+    print("=" * 155)
     return rows
 
-def print_overall_statistics(common_benchmarks, metrics1, metrics2, name1='tage', name2='my_bp'):
+def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
+                             name1='tage', name2='my_bp'):
     """打印总体统计"""
     print("\n" + "=" * 70)
     print("=== Overall Statistics ===")
@@ -358,6 +428,7 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, name1='tage'
     # 收集所有指标
     acc1_list, acc2_list = [], []
     mpki1_list, mpki2_list = [], []
+    mpki_ref_list = []
     epi1_list, epi2_list = [], []
     ipc1_list, ipc2_list = [], []
     cpi1_list, cpi2_list = [], []
@@ -366,10 +437,14 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, name1='tage'
     for bench in common_benchmarks:
         m1 = metrics1[bench]
         m2 = metrics2[bench]
+        ref = ref_mpki.get(bench, None)
+
         acc1_list.append(m1['accuracy'])
         acc2_list.append(m2['accuracy'])
         mpki1_list.append(m1['mpki'])
         mpki2_list.append(m2['mpki'])
+        if ref is not None:
+            mpki_ref_list.append(ref)
         epi1_list.append(m1['epi'])
         epi2_list.append(m2['epi'])
         ipc1_list.append(m1['ipc'])
@@ -386,9 +461,12 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, name1='tage'
     geo_mean_acc1 = math.exp(sum(math.log(a) for a in acc1_list) / len(acc1_list))
     geo_mean_acc2 = math.exp(sum(math.log(a) for a in acc2_list) / len(acc2_list))
 
-    # 算术平均
+    # 算术平均 MPKI
     avg_mpki1 = sum(mpki1_list) / len(mpki1_list)
     avg_mpki2 = sum(mpki2_list) / len(mpki2_list)
+    avg_mpki_ref = sum(mpki_ref_list) / len(mpki_ref_list) if mpki_ref_list else None
+
+    # 算术平均
     avg_epi1 = sum(epi1_list) / len(epi1_list)
     avg_epi2 = sum(epi2_list) / len(epi2_list)
 
@@ -402,16 +480,23 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, name1='tage'
     avg_vfs1 = sum(vfs1_list) / len(vfs1_list)
     avg_vfs2 = sum(vfs2_list) / len(vfs2_list)
 
-    print(f"\n{'Metric':<25} {name1:>15} {name2:>15} {'Relative Improvement':>20}")
+    print(f"\n{'Metric':<25} {name1:>15} {name2:>15} {'vs Ref':>10} {'vs Ref':>10}")
     print("-" * 70)
 
     d_acc = (geo_mean_acc2 - geo_mean_acc1) * 100
     print(f"Geometric Mean Accuracy {geo_mean_acc1*100:>13.4f}% {geo_mean_acc2*100:>13.4f}% "
           f"{'+' if d_acc>0 else ''}{d_acc:.4f}%")
 
-    d_mpki = ((avg_mpki2 - avg_mpki1) / avg_mpki1 * 100) if avg_mpki1 > 0 else 0
-    print(f"Average MPKI              {avg_mpki1:>13.4f} {avg_mpki2:>13.4f} "
-          f"{'+' if d_mpki>0 else ''}{d_mpki:.2f}% (lower is better)")
+    if avg_mpki_ref is not None:
+        d_mpki1_ref = ((avg_mpki1 - avg_mpki_ref) / avg_mpki_ref * 100) if avg_mpki_ref > 0 else 0
+        d_mpki2_ref = ((avg_mpki2 - avg_mpki_ref) / avg_mpki_ref * 100) if avg_mpki_ref > 0 else 0
+        print(f"Average MPKI              {avg_mpki1:>13.4f} {avg_mpki2:>13.4f} "
+              f"{'+' if d_mpki1_ref>0 else ''}{d_mpki1_ref:.2f}% "
+              f"{'+' if d_mpki2_ref>0 else ''}{d_mpki2_ref:.2f}%")
+    else:
+        d_mpki = ((avg_mpki2 - avg_mpki1) / avg_mpki1 * 100) if avg_mpki1 > 0 else 0
+        print(f"Average MPKI              {avg_mpki1:>13.4f} {avg_mpki2:>13.4f} "
+              f"{'+' if d_mpki>0 else ''}{d_mpki:.2f}% (lower is better)")
 
     d_epi = ((avg_epi2 - avg_epi1) / avg_epi1 * 100) if avg_epi1 > 0 else 0
     print(f"Average EPI (fJ)          {avg_epi1:>13.2f} {avg_epi2:>13.2f} "
@@ -440,7 +525,7 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, name1='tage'
         'avg_vfs1': avg_vfs1, 'avg_vfs2': avg_vfs2
     }
 
-def export_csv(common_benchmarks, metrics1, metrics2, data1, data2,
+def export_csv(common_benchmarks, metrics1, metrics2, data1, data2, ref_mpki,
                output_file='comparison_report.csv', name1='tage', name2='my_bp'):
     """导出 CSV 格式报告"""
     with open(output_file, 'w', newline='') as f:
@@ -448,11 +533,11 @@ def export_csv(common_benchmarks, metrics1, metrics2, data1, data2,
 
         # 写入表头
         header = ['Benchmark',
+                  'ref_mpki',
                   f'{name1}_accuracy', f'{name2}_accuracy', 'accuracy_diff',
                   f'{name1}_mpki', f'{name2}_mpki', 'mpki_diff_pct',
+                  f'{name1}_mpki_vs_ref', f'{name2}_mpki_vs_ref',
                   f'{name1}_epi', f'{name2}_epi', 'epi_ratio',
-                  f'{name1}_ipc', f'{name2}_ipc', 'ipc_diff_pct',
-                  f'{name1}_cpi', f'{name2}_cpi', 'cpi_diff_pct',
                   f'{name1}_vfs', f'{name2}_vfs', 'vfs_diff_pct',
                   'instructions', 'condbr',
                   f'{name1}_misp', f'{name2}_misp', 'misp_diff']
@@ -461,17 +546,23 @@ def export_csv(common_benchmarks, metrics1, metrics2, data1, data2,
         for bench in sorted(common_benchmarks):
             m1 = metrics1[bench]
             m2 = metrics2[bench]
+            ref = ref_mpki.get(bench, None)
 
             v1 = calc_vfs(m1['ipc'], m1['cpi'], m1['epi'])
             v2 = calc_vfs(m2['ipc'], m2['cpi'], m2['epi'])
 
+            # vs ref MPKI
+            mpki1_vs_ref = ((m1['mpki'] - ref) / ref * 100) if ref and ref > 0 else None
+            mpki2_vs_ref = ((m2['mpki'] - ref) / ref * 100) if ref and ref > 0 else None
+
             row = [
                 bench,
+                ref if ref is not None else '',
                 m1['accuracy'], m2['accuracy'], (m2['accuracy'] - m1['accuracy']),
                 m1['mpki'], m2['mpki'], ((m2['mpki'] - m1['mpki']) / m1['mpki'] * 100) if m1['mpki'] > 0 else 0,
+                mpki1_vs_ref if mpki1_vs_ref is not None else '',
+                mpki2_vs_ref if mpki2_vs_ref is not None else '',
                 m1['epi'], m2['epi'], (m2['epi'] / m1['epi']) if m1['epi'] > 0 else 0,
-                m1['ipc'], m2['ipc'], ((m2['ipc'] - m1['ipc']) / m1['ipc'] * 100) if m1['ipc'] > 0 else 0,
-                m1['cpi'], m2['cpi'], ((m2['cpi'] - m1['cpi']) / m1['cpi'] * 100) if m1['cpi'] > 0 else 0,
                 v1, v2, ((v2 - v1) / v1 * 100) if v1 > 0 else 0,
                 data1[bench]['instructions'],
                 data1[bench]['condbr'],
@@ -506,15 +597,37 @@ def main():
     parser.add_argument('--compare-dir', default='results_my_bp/',
                         help='Directory with .out files for compare predictor')
 
+    # 存储对比配置（支持同名预测器不同参数）
+    parser.add_argument('--storage1', default=None,
+                        help='Storage config for predictor 1 (format: LOGLB=6,NUMG=8,LOGG=11,...)')
+    parser.add_argument('--storage2', default=None,
+                        help='Storage config for predictor 2 (format: LOGLB=6,NUMG=8,LOGG=12,...)')
+
     # Output
     parser.add_argument('--output', default='comparison_report.csv',
                         help='Output CSV file path (default: comparison_report.csv)')
-    parser.add_argument('--name1', default='tage',
-                        help='Display name for base predictor (default: tage)')
-    parser.add_argument('--name2', default='my_bp',
-                        help='Display name for compare predictor (default: my_bp)')
+    parser.add_argument('--name1', default=None,
+                        help='Display name for base predictor (default: auto from predictor param)')
+    parser.add_argument('--name2', default=None,
+                        help='Display name for compare predictor (default: auto from predictor param)')
+    parser.add_argument('--base-label', default='base',
+                        help='Label for base in output (e.g., "before", "v1", default: "base")')
+    parser.add_argument('--compare-label', default='modified',
+                        help='Label for compare in output (e.g., "after", "v2", default: "modified")')
 
     args = parser.parse_args()
+
+    # 确定显示名称
+    # 如果用户没有指定 name1/name2，根据场景自动选择
+    if args.name1 is None:
+        name1 = args.base_label if args.base_predictor == args.compare_predictor else args.base_predictor
+    else:
+        name1 = args.name1
+
+    if args.name2 is None:
+        name2 = args.compare_label if args.base_predictor == args.compare_predictor else args.compare_predictor
+    else:
+        name2 = args.name2
 
     # Load base results
     print(f"Loading base predictor '{args.base_predictor}' results...")
@@ -546,16 +659,29 @@ def main():
         print(f"  Compare has: {list(results2.keys())[:5]}...")
         sys.exit(1)
 
-    name1 = args.name1
-    name2 = args.name2
+    # 存储对比：优先使用用户指定的配置，否则从 PREDICTORS 获取
+    storage1 = None
+    storage2 = None
 
-    # 如果两个预测器都在 PREDICTORS 配置中，打印存储对比
-    if name1 in PREDICTORS and name2 in PREDICTORS:
+    if args.storage1:
+        storage1 = calc_storage(parse_storage_config(args.storage1))
+    elif name1 in PREDICTORS:
         storage1 = calc_storage(PREDICTORS[name1])
+
+    if args.storage2:
+        storage2 = calc_storage(parse_storage_config(args.storage2))
+    elif name2 in PREDICTORS:
         storage2 = calc_storage(PREDICTORS[name2])
+
+    if storage1 and storage2:
         print_storage_comparison(storage1, storage2, name1, name2)
     else:
-        print("\nNote: Storage comparison skipped (predictor configs not found)")
+        print("\nNote: Storage comparison skipped (predictor configs not found or use --storage1/--storage2)")
+
+    # 加载 reference MPKI
+    print(f"\nLoading reference MPKI from {args.base_csv}...")
+    ref_mpki = load_ref_mpki_from_csv(args.base_csv)
+    print(f"  Loaded {len(ref_mpki)} benchmarks")
 
     # 计算 P1/P2 延迟
     p1_lat = 0
@@ -572,14 +698,14 @@ def main():
     metrics1 = {b: calc_metrics(results1[b], p1_lat, p2_lat) for b in common}
     metrics2 = {b: calc_metrics(results2[b], p1_lat, p2_lat) for b in common}
 
-    # 打印每 benchmark 对比
-    print_per_benchmark_comparison(common, metrics1, metrics2, results1, results2, name1, name2)
+    # 打印每 benchmark 对比（包含 reference MPKI）
+    print_per_benchmark_comparison(common, metrics1, metrics2, results1, results2, ref_mpki, name1, name2)
 
     # 打印总体统计
-    overall = print_overall_statistics(common, metrics1, metrics2, name1, name2)
+    overall = print_overall_statistics(common, metrics1, metrics2, ref_mpki, name1, name2)
 
-    # 导出 CSV
-    export_csv(common, metrics1, metrics2, results1, results2, args.output, name1, name2)
+    # 导出 CSV（包含 reference MPKI）
+    export_csv(common, metrics1, metrics2, results1, results2, ref_mpki, args.output, name1, name2)
 
     print("\nDone!")
 
