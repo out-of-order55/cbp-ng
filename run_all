@@ -1,12 +1,19 @@
 #!/bin/bash
+# filepath: /nfs/home/guobing1/cbp-ng/run_all
 
 EXEC="$1"
 TRACEDIR="$2"
 OUTDIR="$3"
 
-MAXJOBS=16
-CORES=$(nproc)
+# 自动检测核心数，最多用 16 个
+MAXJOBS=128
+CORES=$(nproc 2>/dev/null || echo 4)
 JOBS=$(( CORES < MAXJOBS ? CORES : MAXJOBS ))
 
-mkdir -p ${OUTDIR}
-find "$TRACEDIR/" -name "*_trace.gz" | parallel -j "$JOBS" ./run $EXEC {} "$OUTDIR"
+mkdir -p "${OUTDIR}"
+
+# 使用 xargs -P 替代 parallel
+# -P $JOBS : 并行执行数
+# -I {}    : 占位符
+find "$TRACEDIR/" -name "*_trace.gz" | \
+xargs -P "$JOBS" -I {} ./run "$EXEC" {} "$OUTDIR"
