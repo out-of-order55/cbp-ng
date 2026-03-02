@@ -8,6 +8,7 @@
 #include "predictors/gshareN.hpp"
 #include "predictors/gshareN_ahead.hpp"
 #include "predictors/tutorial/tutorial.hpp"
+#include "predictors/my_bp.hpp"
 
 #ifdef PREDICTOR
 using branch_predictor = PREDICTOR;

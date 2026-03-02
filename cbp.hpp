@@ -256,6 +256,7 @@ public:
                     info.is_return = {instruction.inst_class == INST_CLASS::BR_RETURN, next_time};
                     info.is_mispredict = {p2_misprediction, next_time};
                     info.next_pc = {instruction.next_pc, next_time};
+                    // info.next_pc.print();
                     p.update_cycle(info);
                     panel.next_cycle();
                     time = next_time;
