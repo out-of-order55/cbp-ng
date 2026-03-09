@@ -1,162 +1,124 @@
 // this is a basic TAGE, not necessarily well optimized
 
-#define USE_META
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+#define USE_ALT_PRED
 #define RESET_UBITS
-#define TAGE_VERBOSE
+
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
-
+#include "tutorial/energy_monitor.hpp"
 using namespace hcm;
+#ifdef DEBUG_ENERGY
+    struct energy_monitor monitor;
+#endif
 
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=17, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6>
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6
+, u64 NUMBANKS=4,u64 NUMWAYS=2,u64 CTRBIT=3,u64 UBIT=2>
 struct my_bp : predictor {
-    // provides 2^(LOGLB-2) predictions per cycle
-    // P2 is a TAGE, P1 is a gshare
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
     static constexpr u64 MINHIST = 2;
-    static constexpr u64 METABITS = 4;
+    static constexpr u64 USE_ALT_PRED_BITS = 4;
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 6;
-#ifdef USE_META
-    static constexpr u64 METAPIPE = 2;
-#endif
+
     static constexpr u64 LOGLINEINST = LOGLB-2;
     static constexpr u64 LINEINST = 1<<LOGLINEINST;
     static_assert(LOGP1 > LOGLINEINST);
     static_assert(LOGB > LOGLINEINST);
     static constexpr u64 index1_bits = LOGP1-LOGLINEINST;
     static constexpr u64 bindex_bits = LOGB-LOGLINEINST;
-    static_assert(TAGW > LOGLINEINST); // the unhashed line offset is part of the tag
-    static constexpr u64 HTAGBITS = TAGW-LOGLINEINST; // hashed tag bits
 
+    static_assert(TAGW > LOGLINEINST);
+    static constexpr u64 HTAGBITS = TAGW;
+
+    static constexpr u64 NUMGSETS = (1<<LOGB)/NUMBANKS/NUMWAYS;
+    static constexpr u64 GINDEXBITS = static_cast<u64>(std::log2(static_cast<double>(NUMGSETS)));
     geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
     reg<1> true_block = 1;
 
-    // for P1
-    reg<GHIST1> global_history1;
+    reg<GHIST1> path_history;
     reg<index1_bits> index1;
-    arr<reg<1>,LINEINST> readp1; // prediction bits read from P1 table for each offset
-    reg<LINEINST> p1; // P1 predictions
+    arr<reg<1>,LINEINST> readp1;
+    reg<LINEINST> p1;
 
-    // for P2
-    reg<bindex_bits> bindex; // bimodal table index
-    arr<reg<LOGG>,NUMG> gindex; // global tables indexes
-    arr<reg<HTAGBITS>,NUMG> htag; // computed hashed tags
+    reg<bindex_bits> bindex;
+    arr<reg<LOGG>,NUMG> gindex;
+    arr<reg<HTAGBITS>,NUMG> htag;
 
-    arr<reg<1>,LINEINST> readb; // read bimodal prediction bit for each offset
-    arr<reg<TAGW>,NUMG> readt; // read tags
-    arr<reg<1>,NUMG> readc; // read predictions
-    arr<reg<2>,NUMG> readh; // read hysteresis
-    arr<reg<1>,NUMG> readu; // read u bits
-    reg<NUMG> notumask; // read u bits, inverted
+    arr<reg<1>,LINEINST> readb;
+    arr<reg<1>,LINEINST> readb_low;  // Store bimodal hysteresis
+    arr<reg<HTAGBITS>,NUMG> readt[NUMWAYS];
+    arr<reg<1>,NUMG> readctr_pred[NUMWAYS];
+    arr<reg<CTRBIT-1>,NUMG> readctr_cnt[NUMWAYS];
+    arr<reg<UBIT>,NUMG> readu[NUMWAYS];
 
-    arr<reg<NUMG+1>,LINEINST> match; // all matches for each offset
-    arr<reg<NUMG+1>,LINEINST> match1; // longest match for each offset
-    arr<reg<NUMG+1>,LINEINST> match2; // second longest match for each offset
+    arr<reg<NUMG>,NUMWAYS> notumask;
 
-    arr<reg<1>,LINEINST> pred1; // primary P2 prediction for each offset
-    arr<reg<1>,LINEINST> pred2; // alternate P2 prediction for each offset
-    reg<LINEINST> p2; // final P2 predictions
+    arr<reg<NUMG>,LINEINST> match[NUMWAYS];
+    arr<reg<NUMG>,LINEINST> match_provider[NUMWAYS];
+    arr<reg<NUMG>,LINEINST> match_alt[NUMWAYS];
 
-#ifdef USE_META
-    arr<reg<METABITS,i64>,METAPIPE> meta; // select between pred1 and pred2
+    arr<reg<1>,LINEINST> provider[NUMWAYS];
+    arr<reg<1>,LINEINST> alt[NUMWAYS];
+    reg<LINEINST> p2;
+
+#ifdef USE_ALT_PRED
+    reg<USE_ALT_PRED_BITS> use_alt_on_na;
     arr<reg<1>,LINEINST> newly_alloc;
+    arr<reg<1>,LINEINST> use_provider[NUMWAYS];
 #endif
 
 #ifdef RESET_UBITS
-    reg<UCTRBITS> uctr; // u bits counter (reset u bits when counter saturates)
+    reg<UCTRBITS> uctr;
 #endif
 
-    // simulation artifacts, hardware cost may not be real
+#ifdef PERF_COUNTERS
+    performance_counters<NUMWAYS, NUMG> perf_counters;
+#endif
+
     u64 num_branch = 0;
-    u64 block_size = 0;//the position Vec in a block
+    u64 block_size = 0;
+
     arr<reg<LOGLINEINST>,LINEINST> branch_offset;
     arr<reg<1>,LINEINST> branch_dir;
-    reg<LINEINST> inst_mask; // one-hot vector
+    reg<LINEINST> inst_oh;
 
-    // P1 (gshare)
-    ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
+    ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"};
 
-    // P2 (TAGE)
-    ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
-    ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
-    rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
-    rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
-    ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
+    //205ps
+    rwram<TAGW,NUMGSETS,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
+    //183ps
+    rwram<CTRBIT,NUMGSETS,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
+    //
+    rwram<UBIT,NUMGSETS,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
+
+    //116ps
+    rwram<1,(1<<(bindex_bits-2)),4> bim_hi[LINEINST] {"bpred"};
+    rwram<1,(1<<(bindex_bits-2)),4> bim_low[LINEINST] {"bhyst"};
 
     zone UPDATE_ONLY;
-    ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
-    ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
+    ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"};
+
 
     my_bp()
     {
-        // 计算各预测器组件的存储开销（单位：bits 和 KB）
         constexpr u64 lineinst = 1 << LOGLINEINST;
-        constexpr u64 p1_size = (1ULL << index1_bits) * 1;  // P1 pred: 1 bit per entry
-        constexpr u64 p1_total = p1_size * lineinst;
-
-        constexpr u64 gtag_size = (1ULL << LOGG) * TAGW;
-        constexpr u64 gtag_total = gtag_size * NUMG;
-
-        constexpr u64 gpred_size = (1ULL << LOGG) * 1;
-        constexpr u64 gpred_total = gpred_size * NUMG;
-
-        constexpr u64 ghyst_size = (1ULL << LOGG) * 2;
-        constexpr u64 ghyst_total = ghyst_size * NUMG;
-
-        constexpr u64 ubit_size = (1ULL << LOGG) * 1;
-        constexpr u64 ubit_total = ubit_size * NUMG;
-
-        constexpr u64 bim_size = (1ULL << bindex_bits) * 1;
-        constexpr u64 bim_total = bim_size * lineinst;
-
-        constexpr u64 tage_total = gtag_total + gpred_total + ghyst_total + ubit_total + bim_total;
-        constexpr u64 total_bits = p1_total + tage_total;
-
-        constexpr double KB = 1024.0;
-
-#ifdef TAGE_VERBOSE
-        std::cerr << "TAGE history lengths: ";
-        for (u64 i=0; i<NUMG; i++) std::cerr << gfolds.HLEN[i] << " ";
-        std::cerr << std::endl;
-        if (LOGG == HTAGBITS) {
-            std::cerr << "WARNING: the tag function and index function are not different enough\n";
-        }
-#endif
-        std::cerr << "=== Branch Predictor Storage Overhead ===" << std::endl;
-        std::cerr << "Template parameters: LOGLB=" << LOGLB << ", NUMG=" << NUMG
-                  << ", LOGG=" << LOGG << ", LOGB=" << LOGB << ", TAGW=" << TAGW
-                  << ", GHIST=" << GHIST << ", LOGP1=" << LOGP1 << ", GHIST1=" << GHIST1 << std::endl;
-        std::cerr << "Derived: LINEINST=" << lineinst << ", index1_bits=" << index1_bits
-                  << ", bindex_bits=" << bindex_bits << ", HTAGBITS=" << HTAGBITS << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "P1 (gshare) predictor:" << std::endl;
-        std::cerr << "  table1_pred: " << p1_total << " bits (" << (p1_total / (KB * 8)) << " KB)" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "P2 (TAGE) predictor:" << std::endl;
-        std::cerr << "  gtag:   " << gtag_total << " bits (" << (gtag_total / (KB * 8)) << " KB) - "
-                  << NUMG << " tables x " << (1ULL << LOGG) << " entries x " << TAGW << " bits" << std::endl;
-        std::cerr << "  gpred:  " << gpred_total << " bits (" << (gpred_total / (KB * 8)) << " KB) - "
-                  << NUMG << " tables x " << (1ULL << LOGG) << " entries x 1 bit" << std::endl;
-        std::cerr << "  ghyst:  " << ghyst_total << " bits (" << (ghyst_total / (KB * 8)) << " KB) - "
-                  << NUMG << " tables x " << (1ULL << LOGG) << " entries x 2 bits" << std::endl;
-        std::cerr << "  ubit:   " << ubit_total << " bits (" << (ubit_total / (KB * 8)) << " KB) - "
-                  << NUMG << " tables x " << (1ULL << LOGG) << " entries x 1 bit" << std::endl;
-        std::cerr << "  bim:    " << bim_total << " bits (" << (bim_total / (KB * 8)) << " KB) - "
-                  << lineinst << " tables x " << (1ULL << bindex_bits) << " entries x 1 bit" << std::endl;
-        std::cerr << "  TAGE subtotal: " << tage_total << " bits (" << (tage_total / (KB * 8)) << " KB)" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "Total storage: " << total_bits << " bits (" << (total_bits / (KB * 8)) << " KB)" << std::endl;
-        std::cerr << "========================================" << std::endl;
+        constexpr u64 total_bits = (1ULL << index1_bits) * lineinst
+            + (1ULL << LOGG) * (TAGW + CTRBIT + UBIT) * NUMG * NUMWAYS
+            + (1ULL << bindex_bits) * 2 * lineinst;
+        std::cerr << "Total storage: " << total_bits << " bits (" << (total_bits / 8192.0) << " KB)" << std::endl;
     }
+
 
     void new_block(val<64> inst_pc)
     {
         val<LOGLINEINST> offset = inst_pc.fo1() >> 2;
-        inst_mask = offset.fo1().decode().concat();
-        inst_mask.fanout(hard<6*LINEINST>{});
+        inst_oh = offset.fo1().decode().concat();
+        inst_oh.fanout(hard<6*LINEINST>{});
         block_size = 1;
     }
 
@@ -167,139 +129,177 @@ struct my_bp : predictor {
         val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<2>{});
         if constexpr (GHIST1 <= index1_bits) {
-            index1 = lineaddr ^ (val<index1_bits>{global_history1}<<(index1_bits-GHIST1));
+            index1 = lineaddr ^ (val<index1_bits>{path_history}<<(index1_bits-GHIST1));
         } else {
-            index1 = global_history1.make_array(val<index1_bits>{}).append(lineaddr).fold_xor();
+            index1 = path_history.make_array(val<index1_bits>{}).append(lineaddr).fold_xor();
         }
         index1.fanout(hard<LINEINST>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
             readp1[offset] = table1_pred[offset].read(index1);
         }
         readp1.fanout(hard<2>{});
-        //a vec for all inst in a block
         p1 = readp1.concat();
         p1.fanout(hard<LINEINST>{});
-        return (inst_mask & p1) != hard<0>{};
+        return (inst_oh & p1) != hard<0>{};
     };
 
     val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc)
     {
-        return ((inst_mask<<block_size) & p1) != hard<0>{};
+        return ((inst_oh<<block_size) & p1) != hard<0>{};
     };
+
+    val<1> is_weak(val<1> pred, val<CTRBIT-1> ctr){
+        return select(pred, ctr!=ctr.maxval, ctr!=ctr.minval);
+    }
 
     val<1> predict2(val<64> inst_pc)
     {
-        val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
-        lineaddr.fanout(hard<1+NUMG*2>{});
+        val<HTAGBITS> raw_tag = inst_pc >> (2 + GINDEXBITS);
+        val<GINDEXBITS> raw_gindex = inst_pc >> 2;
+        val<bindex_bits> bindex_val = inst_pc >> LOGLB;
 
+        raw_tag.fanout(hard<1+NUMG*2>{});
+        raw_gindex.fanout(hard<NUMG>{});
         gfolds.fanout(hard<2>{});
+        bindex_val.fanout(hard<LINEINST>{});
 
-        // compute indexes
-        
-        bindex = lineaddr;
-        bindex.fanout(hard<LINEINST>{});
         for (u64 i=0; i<NUMG; i++) {
-            gindex[i] = lineaddr ^ gfolds.template get<0>(i);
+            gindex[i] = raw_gindex ^ gfolds.template get<0>(i);
         }
         gindex.fanout(hard<4>{});
 
-        // compute hashed tags
         for (u64 i=0; i<NUMG; i++) {
-            htag[i] = val<HTAGBITS>{lineaddr}.reverse() ^ gfolds.template get<1>(i);
+            htag[i] = raw_tag ^ gfolds.template get<1>(i);
         }
         htag.fanout(hard<2>{});
 
-        // read tables
         for (u64 offset=0; offset<LINEINST; offset++) {
-            readb[offset] = bim[offset].read(bindex);
+            readb[offset] = bim_hi[offset].read(bindex_val);
+            readb_low[offset] = bim_low[offset].read(bindex_val);
         }
         readb.fanout(hard<2>{});
-        for (u64 i=0; i<NUMG; i++) {
-            readt[i] = gtag[i].read(gindex[i]);
-            readc[i] = gpred[i].read(gindex[i]);
-            readh[i] = ghyst[i].read(gindex[i]);
-            readu[i] = ubit[i].read(gindex[i]);
-        }
-        readt.fanout(hard<LINEINST+1>{});
-        readc.fanout(hard<3>{});
-        readh.fanout(hard<2>{});
-        readu.fanout(hard<2>{});
-        notumask = ~readu.concat();
-        notumask.fanout(hard<2>{});
+        readb_low.fanout(hard<2>{});
 
-        // gather prediction bits for each offset
-        val<NUMG> gpreds = readc.concat();
-        gpreds.fanout(hard<LINEINST>{});
-        arr<val<NUMG+1>,LINEINST> preds = [&](u64 offset){return concat(readb[offset],gpreds);};
-        preds.fanout(hard<2*LINEINST>{});
-
-        // hashed tags comparisons
-        arr<val<1>,NUMG> htagcmp_split = [&](int i){return val<HTAGBITS>{readt[i]} == htag[i];};
-        val<NUMG> htagcmp = htagcmp_split.fo1().concat();
-        htagcmp.fanout(hard<LINEINST>{});
-
-        // generate match mask for each offset
-        static_loop<LINEINST>([&]<u64 offset>(){
-            arr<val<1>,NUMG> tagcmp = [&](int i){return val<LOGLINEINST>{readt[i]>>HTAGBITS} == hard<offset>{};};
-            match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp); // bimodal is default when no match
-        });
-        match.fanout(hard<2>{});
-
-        // for each offset, find longest match and select primary prediction
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            match1[offset] = match[offset].one_hot();
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for(u64 j=0; j<NUMG; j++){
+                //146ps
+                arr<val<1>,CTRBIT> ctr_val = gctr[w][j].read(gindex[j]).make_array(val<1>{});
+                readt[w][j] = gtag[w][j].read(gindex[j]);
+                readu[w][j] = ubit[w][j].read(gindex[j]);
+                readctr_pred[w][j] = ctr_val[CTRBIT-1];
+                readctr_cnt[w][j] = val<CTRBIT-1>{ctr_val.concat()};
+            }
         }
-        match1.fanout(hard<3>{});
-        //主预测
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
-        }
-        pred1.fanout(hard<2>{});
 
-        // for each offset, find second longest match and select secondary prediction
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            match2[offset] = (match[offset]^match1[offset]).one_hot();
+        for (u64 w=0; w<NUMWAYS; w++) {
+            readt[w].fanout(hard<LINEINST+1>{});
+            readu[w].fanout(hard<NUMG>{});
         }
-        match2.fanout(hard<2>{});
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
-        }
-        pred2.fanout(hard<2>{});
 
-#ifdef USE_META
-        meta.fanout(hard<2>{});
-        arr<val<1>,NUMG> weakctr = [&](int i) {return readh[i]==hard<0>{};};
-        val<NUMG> coldctr = notumask & weakctr.fo1().concat();
-        coldctr.fanout(hard<LINEINST>{});
-        val<1> metasign = (meta[METAPIPE-1] >= hard<0>{});
-        metasign.fanout(hard<LINEINST>{});
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            newly_alloc[offset] = (match1[offset] & coldctr) != hard<0>{};
-        }
-        newly_alloc.fanout(hard<2>{});
-        arr<val<1>,LINEINST> altsel = [&](u64 offset){
-            arr<val<1>,3> inputs = {metasign, newly_alloc[offset], match2[offset]!=hard<0>{}};
-            return inputs.fo1().fold_and();
+        //20ps
+        arr<val<NUMG>,NUMWAYS> umask = [&](u64 w){
+            arr<val<1>,NUMG> u = [&](u64 j){ return readu[w][j]!=hard<0>{}; };
+            return u.concat();
         };
-        p2 = arr<val<1>,LINEINST> {[&](u64 offset){
-            return select(altsel[offset].fo1(),pred2[offset],pred1[offset]);
+
+        //TODO: fix this
+        for(u64 way=0;way<NUMWAYS;way++){
+            notumask[way] = ~umask[way];
+        }
+        // notumask.fanout(hard<2>{});
+
+        //12ps 2000fJ
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                arr<val<1>,NUMG> wayhit = [&](u64 j){
+                    return readt[w][j] == (htag[j] ^ val<HTAGBITS>{offset});
+                };
+                match[w][offset] = wayhit.concat();
+            }
+        }
+        for (u64 w=0; w<NUMWAYS; w++) match[w].fanout(hard<2>{});
+
+        //20ps
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                match_provider[w][offset] = match[w][offset].one_hot();
+            }
+        }
+        for (u64 w=0; w<NUMWAYS; w++) match_provider[w].fanout(hard<3>{});
+
+        arr<val<NUMG+1>,NUMWAYS> gpreds = [&](u64 w){ return readctr_pred[w].concat(); };
+        // arr<val<NUMG+1>,LINEINST> preds = [&](u64 offset){return concat(readb[offset],gpreds);};
+        gpreds.fanout(hard<2>{});
+        //30ps
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                provider[w][offset] = (match_provider[w][offset] & gpreds[w]) != hard<0>{};
+            }
+        }
+        for (u64 w=0; w<NUMWAYS; w++) provider[w].fanout(hard<2>{});
+
+        //20ps
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                match_alt[w][offset] = (match[w][offset] ^ match_provider[w][offset]).one_hot();
+            }
+        }
+        for (u64 w=0; w<NUMWAYS; w++) match_alt[w].fanout(hard<2>{});
+        //20ps
+        //bim pred is in alt
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                alt[w][offset] = (match_alt[w][offset] & gpreds[w]) != hard<0>{};
+            }
+        }
+        for (u64 w=0; w<NUMWAYS; w++) alt[w].fanout(hard<2>{});
+
+#ifdef USE_ALT_PRED
+        use_alt_on_na.fanout(hard<2>{});
+        arr<val<1>,USE_ALT_PRED_BITS> use_alt_on_na_array = use_alt_on_na.make_array(val<1>{});
+        val<1> use_alt_on_na_pos = use_alt_on_na_array[USE_ALT_PRED_BITS-1];
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 inst=0; inst<LINEINST; inst++) {
+                arr<val<1>,NUMG> prov_oh = val<NUMG>{match_provider[w][inst]};
+
+                arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
+                    return select(prov_oh[j],readctr_cnt[w][j],val<CTRBIT-1>{0});
+                };
+                val<CTRBIT-1> prov_ctr  = prov_ctrs.fold_or();
+                use_provider[w][inst] = prov_oh.fold_or() &
+                    (~is_weak(provider[w][inst], prov_ctr) | ~use_alt_on_na_pos);
+            }
+        }
+        // use_provider.fanout(hard<2>{});
+
+        p2 = arr<val<1>,LINEINST>{[&](u64 offset){
+            arr<val<1>,NUMWAYS> final_pred = [&](u64 w){
+                val<1> has_alt = match_alt[w][offset] != hard<0>{};
+                return select(use_provider[w][offset], provider[w][offset],select(has_alt,alt[w][offset],readb[offset]));
+            };
+            return final_pred.fo1().fold_or();
         }}.concat();
+
 #else
-        p2 = pred1.concat();
+        p2 = arr<val<1>,LINEINST>{[&](u64 offset){
+            arr<val<1>,NUMWAYS> final_pred = [&](u64 w){ return provider[w][offset]; };
+            return select(final_pred.fo1().fold_or(), val<1>{1}, readb[offset]);
+        }}.concat();
 #endif
+
         p2.fanout(hard<LINEINST>{});
-        val<1> taken = (inst_mask & p2) != hard<0>{};
+        val<1> taken = (inst_oh & p2) != hard<0>{};
         taken.fanout(hard<2>{});
-        //not the final inst in a block
-        reuse_prediction(~val<1>{inst_mask>>(LINEINST-1)});
+        reuse_prediction(~val<1>{inst_oh>>(LINEINST-1)});
+
         return taken;
     }
 
     val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc)
     {
-        val<1> taken = ((inst_mask<<block_size) & p2) != hard<0>{};
+        val<1> taken = ((inst_oh<<block_size) & p2) != hard<0>{};
         taken.fanout(hard<2>{});
-        reuse_prediction(~val<1>{inst_mask>>(LINEINST-1-block_size)});
+        reuse_prediction(~val<1>{inst_oh>>(LINEINST-1-block_size)});
         block_size++;
         return taken;
     }
@@ -307,61 +307,64 @@ struct my_bp : predictor {
     void update_condbr(val<64> branch_pc, val<1> taken, [[maybe_unused]] val<64> next_pc)
     {
         assert(num_branch < LINEINST);
-        branch_offset[num_branch] = branch_pc.fo1() >> 2;
+        val<LOGLINEINST> offset = branch_pc.fo1() >> 2;
+        branch_offset[num_branch] = offset;
         branch_dir[num_branch] = taken.fo1();
         num_branch++;
     }
 
-    void update_cycle(instruction_info &block_end_info)
+    void update_cycle(instruction_info &block_end_info) override
     {
+        
+
         val<1> &mispredict = block_end_info.is_mispredict;
         val<64> &next_pc = block_end_info.next_pc;
-        // updates for all conditional branches in the predicted block
+
         if (num_branch == 0) {
-            // no conditional branch in this block
-            //block_size只在一个block起始位置调用
-            val<1> line_end = inst_mask >> (LINEINST-block_size);
-            // update global history if previous block ended on a mispredicted not-taken branch
-            // (we are still in the same line, this is the last chunk)
-            // or if the block ends before the line boundary (unconditional jump)
+            val<1> line_end = inst_oh >> (LINEINST-block_size);
             val<1> actual_block = ~(true_block & line_end.fo1());
             actual_block.fanout(hard<GHIST+NUMG*2+2>{});
             execute_if(actual_block, [&](){
                 next_pc.fanout(hard<2>{});
-                global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
+                path_history = (path_history << 1) ^ val<GHIST1>{next_pc>>2};
                 gfolds.update(val<PATHBITS>{next_pc>>2});
                 true_block = 1;
             });
-            return; // stop here
+            return;
         }
+
         mispredict.fanout(hard<NUMG+2>{});
         val<1> correct_pred = ~mispredict;
         correct_pred.fanout(hard<NUMG+2>{});
-        index1.fanout(hard<LINEINST*3>{});
-        p2.fanout(hard<2>{});
-        bindex.fanout(hard<LINEINST*3>{});
         gindex.fanout(hard<4>{});
         htag.fanout(hard<3>{});
-        readb.fanout(hard<2>{});
-        readt.fanout(hard<4>{});
-        readc.fanout(hard<2>{});
-        match1.fanout(hard<3>{});
-        match2.fanout(hard<2>{});
-        pred1.fanout(hard<2>{});
-        pred2.fanout(hard<2+NUMG>{});
+        for (u64 w=0; w<NUMWAYS; w++) {
+            match_provider[w].fanout(hard<3>{});
+            match_alt[w].fanout(hard<2>{});
+            provider[w].fanout(hard<2>{});
+            alt[w].fanout(hard<2>{});
+            use_provider[w].fanout(hard<2>{});
+            readctr_cnt[w].fanout(hard<2>{});
+            // notumask[w].fanout(hard<1>{});
+        }
         branch_offset.fanout(hard<LINEINST+NUMG+1>{});
         branch_dir.fanout(hard<2>{});
         gfolds.fanout(hard<2>{});
-#ifdef USE_META
-        meta.fanout(hard<2>{});
-#endif
+        index1.fanout(hard<LINEINST*3>{});
+        p1.fanout(hard<2>{});
+        p2.fanout(hard<2>{});
+        readp1.fanout(hard<2>{});
+        bindex.fanout(hard<LINEINST*3>{});
+        readb.fanout(hard<2>{});
+        readb_low.fanout(hard<2>{});
+
+
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
         last_offset.fanout(hard<4*NUMG+2>{});
 
         u64 update_valid = (u64(1)<<num_branch)-1;
         arr<val<LINEINST>,LINEINST> update_mask = [&](u64 offset){
-            //是否有分支匹配
-            arr<val<1>,LINEINST> match_offset = [&](u64 i){return branch_offset[i] == offset;};
+            arr<val<1>,LINEINST> match_offset = [&](u64 i){ return branch_offset[i] == offset; };
             return match_offset.fo1().concat() & update_valid;
         };
         update_mask.fanout(hard<2>{});
@@ -369,213 +372,378 @@ struct my_bp : predictor {
         arr<val<1>,LINEINST> is_branch = [&](u64 offset){
             return update_mask[offset] != hard<0>{};
         };
-        is_branch.fanout(hard<5>{});
+        is_branch.fanout(hard<6>{});
 
         val<LINEINST> branch_mask = is_branch.concat();
-        branch_mask.fanout(hard<2>{});
 
-        val<LINEINST> actualdirs = branch_dir.concat();
-        actualdirs.fanout(hard<LINEINST>{});
-
-        arr<val<1>,LINEINST> branch_taken = [&](u64 offset){
-            return (actualdirs & update_mask[offset]) != hard<0>{};
-        };
-        branch_taken.fanout(hard<3>{});
-
-        //找到每个分支对应的表
-        arr<val<NUMG+1>,LINEINST> actual_match1 = [&] (u64 offset) {
-            return select(is_branch[offset],match1[offset],val<NUMG+1>{0});
-        };
-        actual_match1.fanout(hard<2>{});
-
-        val<NUMG> primary_mask = actual_match1.fold_or();
-        primary_mask.fanout(hard<3>{});
-
-        arr<val<1>,NUMG> primary = primary_mask.make_array(val<1>{});
-        primary.fanout(hard<2>{});
-
-        arr<val<1>,LINEINST> primary_wrong = [&](u64 offset){
-            return pred1[offset] != branch_taken[offset];
-        };
-        primary_wrong.fanout(hard<2>{});
-
-        // select some candidate entries for allocation
-        val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
-        arr<val<1>,NUMG> last_tagcmp = [&](int i){return readt[i] == concat(last_offset,htag[i]);};
-        //找到最低位的表，最低位
-        val<NUMG+1> last_match1 = last_tagcmp.fo1().append(1).concat().one_hot();
-        last_match1.fanout(hard<2>{});
-        val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match1-1);
-        postmask.fanout(hard<2>{});
-        val<NUMG> candallocmask = postmask & notumask; // candidate post entries for allocation
-        candallocmask.fanout(hard<2>{});
-        // if multiple candidate entries, we select a single one, with some randomization
-        val<NUMG> collamask = candallocmask.reverse();
-        collamask.fanout(hard<2>{});
-        val<NUMG> collamask1 = collamask.one_hot();
-        collamask1.fanout(hard<3>{});
-        val<NUMG> collamask2 = (collamask^collamask1).one_hot();
-        val<NUMG> collamask12 = select(val<2>{std::rand()}==hard<0>{}, collamask2.fo1(), collamask1);
-        val<NUMG> allocmask = collamask12.fo1().reverse();
-        allocmask.fanout(hard<5>{});
-        arr<val<1>,NUMG> allocate = allocmask.make_array(val<1>{});
-        allocate.fanout(hard<5>{});
-
-        // associate a branch direction to each global table
-        arr<val<1>,NUMG> bdir = [&](u64 i) {
-            val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
-            val<LOGLINEINST> offset = select(allocate[i],last_offset,tag_offset.fo1());
-            offset.fanout(hard<LINEINST>{});
-            arr<val<1>,LINEINST> match_offset = [&](u64 j){return branch_offset[j] == offset;};
-            return (match_offset.fo1().concat() & update_valid & actualdirs) != hard<0>{};
-        };
-        bdir.fanout(hard<2>{});
-
-        // tell if global prediction is incorrect
-        arr<val<1>,NUMG> badpred1 = [&](u64 i){
-            return readc[i] != bdir[i];
-        };
-        badpred1.fanout(hard<3>{});
-
-        // associate to each global table a bit telling if local prediction differs from secondary prediction
-        arr<val<1>,NUMG> altdiffer = [&](u64 i){
-            val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
-            return readc[i] != pred2.select(tag_offset.fo1());
-        };
-
-        // associate to each global table a bit telling if prediction for owning branch is correct
-        arr<val<1>,NUMG> goodpred = [&](u64 i){
-            val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
-            return (tag_offset.fo1() != last_offset) | correct_pred;
-        };
-
-        // do P1 and P2 agree?
+        // ==================== P1 Disagree Check (before extra_cycle) ====================
         val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask;
         disagree_mask.fanout(hard<2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
 
-        // read the P1 hysteresis if P1 and P2 disagree
-        arr<val<1>,LINEINST> p1_weak = [&] (u64 offset) -> val<1> {
-            // returns 1 iff disagreement and hysteresis is weak
+        // Read P1 hysteresis if P1 and P2 disagree (must read before extra_cycle)
+        arr<val<1>,LINEINST> p1_weak = [&](u64 offset) -> val<1> {
             return execute_if(disagree[offset], [&](){
-                return ~table1_hyst[offset].read(index1); // hyst=0 means weak
+                return ~table1_hyst[offset].read(index1);
             });
         };
 
-        // read the bimodal hysteresis if bimodal caused a misprediction
-        arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
-            // returns 1 iff cause of misprediction and hysteresis is weak
-            val<1> bim_primary = actual_match1[offset] >> NUMG;
-            return execute_if(bim_primary.fo1() & primary_wrong[offset], [&](){
-                return ~bhyst[offset].read(bindex); // hyst=0 means weak
-            });
+        arr<val<1>,LINEINST> actualdirs = [&](u64 offset){
+            arr<val<1>,LINEINST> match_offset = [&](u64 i){ return (branch_offset[i] == offset) & branch_dir[i]; };
+            return match_offset.fo1().concat();
         };
+        actualdirs.fanout(hard<LINEINST>{});
 
-        // determine which primary global predictions are incorrect with a weak hysteresis
-        arr<val<1>,NUMG> g_weak = [&] (u64 i) -> val<1> {
-            // returns 1 iff incorrect primary prediction and hysteresis is weak
-            return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
+        // Aggregate match_provider across branches (like tage.hpp actual_match1)
+        arr<val<NUMG>,NUMWAYS> primary_mask = [&](u64 w){
+            arr<val<NUMG>,LINEINST> m = [&](u64 offset){
+                return val<NUMG>{is_branch[offset].replicate(hard<NUMG>{}).concat()} & 
+                val<NUMG>{match_provider[w][offset]};
+            };
+            return m.fo1().fold_or();
         };
+        primary_mask.fanout(hard<10>{});
 
-        // need extra cycle for modifying prediction bits and for TAGE allocation
-        val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
-        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
-        extra_cycle.fanout(hard<NUMG*2+1>{});
+
+
+        //TODO: fix bim update
+        /*
+        bim update:
+        1. pred wrong
+        2. pred right and weak
+        tage update:
+        1. ctr
+            1. pred right increase final pred table
+            2. pred wrong decrease final pred table
+            3. alloc set ctr to 1<<(CTRBIT-1)
+        2. tag: only update when alloc
+        3. ubit:
+            1. provider right ,alt wrong increase provider
+            2. alloc,set ubit to 0
+            3. reset
+
+        */
+
+        // Compute actual branch directions for update purposes
+        arr<val<1>,LINEINST> branch_taken = [&](u64 offset) {
+            // Extract the actual direction from branch_dir array
+            return val<1>{branch_dir[offset]};
+        };
+        branch_taken.fanout(hard<2>{});
+
+        // Calculate bimodal predictions
+        val<LINEINST> bim_predictions = readb.concat();
+        bim_predictions.fanout(hard<2>{});
+
+        // Determine which updates are needed for extra cycle
+        val<1> some_tage_update = primary_mask.fold_or() != hard<0>{};
+        val<1> some_bim_update = ((bim_predictions ^ actualdirs.concat()) & branch_mask) != hard<0>{};
+        val<1> some_p1_update = (disagree_mask != hard<0>{});
+        val<1> extra_cycle = some_tage_update | mispredict | some_bim_update | some_p1_update;
+        extra_cycle.fanout(hard<NUMG*2+2>{});
         need_extra_cycle(extra_cycle);
 
-#ifdef USE_META
-        // update meta counter
-        arr<val<1>,LINEINST> altdiff = [&](u64 offset){
-            // for each offset, tell if primary and secondary predictions differ
-            return (match2[offset] != hard<0>{}) & (pred2[offset] != pred1[offset]);
-        };
-        arr<val<2,i64>,LINEINST> meta_incr = [&](u64 offset) -> val<2,i64> {
-            val<1> update_meta = is_branch[offset] & altdiff[offset].fo1() & newly_alloc[offset];
-            val<1> bad_pred2 = (pred2[offset] != branch_taken[offset]);
-            return select(update_meta.fo1(),concat(bad_pred2.fo1(),val<1>{1}),val<2>{0});
-        };
-        for (u64 i=METAPIPE-1; i!=0; i--) {
-            meta[i] = meta[i-1];
-        }
-        auto newmeta = meta[0] + meta_incr.fo1().fold_add();
-        newmeta.fanout(hard<3>{});
-        using meta_t = valt<decltype(meta[0])>;
-        meta[0] = select(newmeta>meta_t::maxval, meta_t{meta_t::maxval}, select(newmeta<meta_t::minval, meta_t{meta_t::minval}, meta_t{newmeta}));
-#endif
+        // ==================== Bimodal Update ====================
+        // Bimodal update conditions:
+        // 1. pred wrong
+        // 2. pred right and weak (hysteresis == 0)
 
-        // overwrite the tag in the allocated entry (mispredict)
-        execute_if(allocmask, [&](u64 i){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
+        // Perform updates for each offset
+        for (u64 offset = 0; offset < LINEINST; offset++) {
+            val<1> branch_valid = is_branch[offset];
+            val<1> bim_pred = readb[offset];
+            val<1> curr_hyst = readb_low[offset];  // Use stored hysteresis
+            val<1> actual_dir = branch_taken[offset];
+            val<1> pred_correct = (bim_pred == actual_dir);
 
-        // update the u bits
-        val<NUMG> umask = primary_mask & altdiffer.fo1().concat(); // u bits update mask
-        // if all post entries have the u bit set, reset their u bits
-        val<1> noalloc = (candallocmask == hard<0>{});
-        val<NUMG> uclearmask = postmask & noalloc.fo1().replicate(hard<NUMG>{}).concat();
-        uclearmask.fanout(hard<2>{});
-        arr<val<1>,NUMG> uclear = uclearmask.make_array(val<1>{});
-        execute_if(umask.fo1() | allocmask | uclearmask, [&](u64 i) {
-            val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i].fo1();
-            ubit[i].write(gindex[i],newu.fo1(),extra_cycle);
-        });
+            // Compute conditions
+            val<1> pred_weak = (curr_hyst == hard<0>{});
+            val<1> should_update = branch_valid & (~pred_correct | (pred_correct & pred_weak));
 
-        // update P1 prediction if P1 and P2 disagree and the hysteresis bit is weak
-        auto p2_split = p2.make_array(val<1>{});
-        execute_if(p1_weak.fo1().concat(), [&](u64 offset){
-            // update with the P2 prediction, not with the actual branch direction
-            table1_pred[offset].write(index1,p2_split[offset].fo1());
-        });
-        // update P1 hysteresis
-        execute_if(branch_mask,[&](u64 offset){
-            table1_hyst[offset].write(index1,~disagree[offset]);
-        });
+            // Write (after extra_cycle), merged into single execute_if
+            execute_if(should_update, [&](){
+                val<1> new_pred = update_ctr(bim_pred, actual_dir);
+                val<1> new_hyst = update_ctr(curr_hyst, pred_correct);
 
-        // update incorrect bimodal prediction if primary provider and hysteresis is weak
-        execute_if(b_weak.fo1().concat(), [&](u64 offset){
-            bim[offset].write(bindex,branch_taken[offset]);
-        });
-        // update bimodal hysteresis if bimodal is primary provider
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            val<1> bim_primary = match1[offset] >> NUMG;
-            execute_if(is_branch[offset] & bim_primary.fo1(), [&](){
-                bhyst[offset].write(bindex,~primary_wrong[offset]);
+                bim_hi[offset].write(bindex, new_pred, extra_cycle);
+                bim_low[offset].write(bindex, new_hyst, extra_cycle);
             });
         }
 
-        // update incorrect global prediction if primary provider and the hysteresis is weak;
-        // initialize global prediction in the allocated entry
-        execute_if(g_weak.fo1().concat() | allocmask, [&](u64 i){
-            gpred[i].write(gindex[i],bdir[i]);
-        });
-        // update global prediction hysteresis if primary provider or allocated entry
-        execute_if(primary_mask | allocmask, [&](u64 i){
-            // if allocated entry, set hysteresis to 0;
-            // otherwise, increment hysteresis if correct pred, decrement if incorrect
-            val<2> newhyst = select(allocate[i],val<2>{0},update_ctr(readh[i],~badpred1[i]));
-            ghyst[i].write(gindex[i],newhyst.fo1(),extra_cycle);
-        });
+        // ==================== TAGE Allocation ====================
+        // Compute allocation mask (only on misprediction)
+        val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
+        mispmask.fanout(hard<2>{});
 
-#ifdef RESET_UBITS
-        uctr.fanout(hard<3>{});
-        val<NUMG> allocmask1  = collamask1.reverse();
-        allocmask1.fanout(hard<2>{});
-        val<1> faralloc = (((last_match1>>3) | allocmask1).one_hot() ^ allocmask1) == hard<0>{};
-        val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
-        uctrsat.fanout(hard<2>{});
-        uctr = select(correct_pred,uctr,select(uctrsat,val<decltype(uctr)::size>{0},update_ctr(uctr,faralloc.fo1())));
-        execute_if(uctrsat,[&](){for (auto &uram : ubit) uram.reset();});
+        // arr<val<1>,NUMG> last_tagcmp = [&](u64 j){
+        //     arr<val<1>,NUMWAYS> way_matches = [&](u64 w){
+        //         return readt[w][j] == (htag[j] ^ val<HTAGBITS>{last_offset});
+        //     };
+        //     return way_matches.fo1().fold_or();
+        // };
+        arr<val<1>,NUMWAYS> last_way = [&](u64 w){
+            arr<val<1>,NUMG> table_matches = [&](u64 g){
+                val<1> has_prov = match_provider[w][g] != hard<0>{};
+                return has_prov;
+            };
+            return table_matches.fo1().fold_or();
+        };
+        arr<val<NUMG>,NUMWAYS> last_match = [&](u64 w){
+            arr<val<NUMG>,LINEINST> last = [&](u64 offset){
+                return select(offset==last_offset,match_provider[w][offset],val<NUMG>{0});
+            };
+            return last.fold_or();
+        };
+        
+
+        val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match.fo1().fold_or()-1);
+        postmask.fanout(hard<2>{});
+
+        // Check if provider was not used but correct (to skip allocation)
+        arr<val<1>,NUMWAYS> skip_alloc_arr = [&](u64 w){
+            arr<val<NUMG>,LINEINST> prov_for_last = [&](u64 offset){
+                return select(branch_offset[num_branch-1] == offset, val<NUMG>{match_provider[w][offset]}, val<NUMG>{0});
+            };
+            val<NUMG> last_prov_mask = prov_for_last.fo1().fold_or();
+            val<1> has = last_prov_mask != hard<0>{};
+
+            arr<val<1>,LINEINST> used_for_last = [&](u64 offset){
+                return (branch_offset[num_branch-1] == offset) & use_provider[w][offset];
+            };
+            val<1> used = used_for_last.fo1().fold_or();
+
+            arr<val<1>,LINEINST> pred_for_last = [&](u64 offset){
+                return (branch_offset[num_branch-1] == offset) & provider[w][offset];
+            };
+            val<1> pred = pred_for_last.fo1().fold_or();
+
+            val<1> actual_last = val<1>{branch_dir[num_branch-1]};
+            val<1> correct = pred == actual_last;
+
+            return has & ~used & correct;
+        };
+        val<1> skip_alloc = skip_alloc_arr.fo1().fold_or();
+
+        arr<val<NUMG>,NUMWAYS> notumask_arr= [&](u64 way){
+            return select(last_way[way],notumask[way],val<NUMG>{0});
+        };
+        val<NUMG> candallocmask = postmask & notumask_arr.fo1().fold_or() & ~skip_alloc.replicate(hard<NUMG>{}).concat();
+        // candallocmask.fanout(hard<1>{});
+
+        val<NUMG> collamask = candallocmask.reverse();
+        collamask.fanout(hard<2>{});
+        val<NUMG> collamask_low = collamask.one_hot();
+        collamask_low.fanout(hard<2>{});
+        val<NUMG> collamask_high = (collamask ^ collamask_low).one_hot();
+        val<NUMG> collamask_final = select(val<2>{static_cast<u64>(std::rand())%2}==hard<0>{}, collamask_high.fo1(), collamask_low);
+        arr<val<1>,NUMG> allocate = collamask_final.fo1().reverse().make_array(val<1>{});
+        // allocate.fanout(hard<1>{});
+
+
+        u64 way_sel = static_cast<u64>(std::rand()) % NUMWAYS;
+
+        // ==================== TAGE Update ====================
+        // CTR update, tag update, and ubit update
+        // All reads before extra_cycle, all writes after extra_cycle
+
+        //one pred max 2 way
+        for (u64 w=0; w<NUMWAYS; w++) {
+            // Compute provider_correct and alt_wrong for this way
+            arr<val<1>,LINEINST> prov_correct_arr = [&](u64 offset){
+                return is_branch[offset] & (provider[w][offset]==actualdirs[offset]);
+            };
+
+            arr<val<1>,LINEINST> alt_wrong_arr = [&](u64 offset){
+                return is_branch[offset] & (alt[w][offset]!=actualdirs[offset]);
+            };
+
+            // val<1> actual = actualdirs != hard<0>{};
+            val<1> provider_correct = prov_correct_arr.fold_or();
+            val<1> alt_wrong = alt_wrong_arr.fold_or();
+
+            // Compute masks for CTR update
+            arr<val<NUMG>,LINEINST> provider_used_mask = [&](u64 offset){
+                return select(is_branch[offset] & use_provider[w][offset], val<NUMG>{match_provider[w][offset]}, val<NUMG>{0});
+            };
+            arr<val<NUMG>,LINEINST> alt_used_mask = [&](u64 offset){
+                return select(is_branch[offset] & ~use_provider[w][offset], val<NUMG>{match_alt[w][offset]}, val<NUMG>{0});
+            };
+
+            //at least one pred ,or bim pred
+            arr<val<NUMG>,LINEINST> dir_mask = [&](u64 offset){
+                val<NUMG> dir_rep = val<1>{actualdirs[offset]}.replicate(hard<NUMG>{}).concat();
+                val<NUMG> prov_dir = select(is_branch[offset] & use_provider[w][offset], val<NUMG>{match_provider[w][offset]} & dir_rep, val<NUMG>{0});
+                val<NUMG> alt_dir = select(is_branch[offset] & ~use_provider[w][offset], val<NUMG>{match_alt[w][offset]} & dir_rep, val<NUMG>{0});
+                return prov_dir | alt_dir;
+            };
+
+            val<NUMG> provider_used = provider_used_mask.fo1().fold_or();
+            val<NUMG> alt_used = alt_used_mask.fo1().fold_or();
+            val<NUMG> actual_dir = dir_mask.fo1().fold_or();
+
+            arr<val<1>,NUMG> prov_used_bits = provider_used.make_array(val<1>{});
+            arr<val<1>,NUMG> alt_used_bits = alt_used.make_array(val<1>{});
+            arr<val<1>,NUMG> actual_bits = actual_dir.make_array(val<1>{});
+
+            for (u64 j=0; j<NUMG; j++) {
+                val<1> was_used = prov_used_bits[j] | alt_used_bits[j];
+                val<1> actual_val = actual_bits[j];
+                val<1> do_alloc = (w == way_sel) ? allocate[j] : val<1>{0};
+
+                // Use stored CTR and UBIT values from predict phase
+                val<CTRBIT> current_ctr = concat(readctr_pred[w][j], readctr_cnt[w][j]);
+                val<UBIT> cur_u = readu[w][j];
+
+                // CTR update: increment if correct, decrement if wrong, init on alloc
+                val<CTRBIT> init_ctr = val<CTRBIT>{1 << (CTRBIT - 1)};
+                val<CTRBIT> updated_ctr = update_ctr(current_ctr, actual_val);
+                val<CTRBIT> new_ctr = select(do_alloc, init_ctr, updated_ctr);
+
+                // UBIT: alloc -> 0, provider right & alt wrong -> +1
+                arr<val<1>,NUMG> primary = primary_mask[w].make_array(val<1>{});
+                val<1> has_provider = primary[j];
+                val<1> inc_useful = has_provider & provider_correct & alt_wrong;
+
+                val<UBIT> new_u = select(cur_u == hard<cur_u.maxval>{}, cur_u, val<UBIT>{cur_u + 1});
+                val<UBIT> final_u = select(do_alloc, val<UBIT>{0}, new_u);
+
+                // Merge writes: CTR write when used or allocated
+                execute_if(was_used | do_alloc, [&](){
+                    gctr[w][j].write(gindex[j], new_ctr, extra_cycle);
+                });
+
+                // TAG write only on allocation
+                execute_if(do_alloc, [&](){
+                    val<TAGW> new_tag = htag[j] ^ val<HTAGBITS>{last_offset};
+                    gtag[w][j].write(gindex[j], new_tag, extra_cycle);
+                });
+
+                // UBIT write when allocated or incremented
+                execute_if(do_alloc | inc_useful, [&](){
+                    ubit[w][j].write(gindex[j], final_u, extra_cycle);
+                });
+            }
+        }
+
+        //TODO:fix it
+#ifdef USE_ALT_PRED
+        // USE_ALT_ON_NA update - aggregate conditions using arrays
+        arr<val<1>,NUMWAYS> inc_use_alt_arr = [&](u64 w){
+            arr<val<1>,NUMG> primary_bits = primary_mask[w].make_array(val<1>{});
+            arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
+                return select(primary_bits[j], readctr_cnt[w][j], val<CTRBIT-1>{0});
+            };
+            val<CTRBIT-1> prov_ctr = prov_ctrs.fo1().fold_or();
+
+            arr<val<1>,LINEINST> prov_pred = [&](u64 offset){
+                return is_branch[offset] & provider[w][offset];
+            };
+            val<1> provider_pred = prov_pred.fo1().fold_or();
+
+            arr<val<1>,LINEINST> alt_pred_arr = [&](u64 offset){
+                return is_branch[offset] & alt[w][offset];
+            };
+            val<1> alt_pred = alt_pred_arr.fo1().fold_or();
+
+            arr<val<1>,LINEINST> base_arr = [&](u64 offset){
+                return is_branch[offset] & readb[offset];
+            };
+            val<1> base_pred = base_arr.fo1().fold_or();
+
+            arr<val<NUMG>,LINEINST> alt_mask = [&](u64 offset){
+                return select(is_branch[offset], val<NUMG>{match_alt[w][offset]}, val<NUMG>{0});
+            };
+            val<1> has_alt = alt_mask.fo1().fold_or() != hard<0>{};
+            val<1> alt_or_base = select(has_alt, alt_pred, base_pred);
+            val<1> actual = actualdirs.concat() != hard<0>{};
+
+            val<1> has_provider = primary_mask[w] != hard<0>{};
+            val<1> provider_is_weak = is_weak(provider_pred, prov_ctr);
+            val<1> alt_or_base_match = alt_or_base == actual;
+
+            return has_provider & provider_is_weak & alt_or_base_match;
+        };
+
+        arr<val<1>,NUMWAYS> dec_use_alt_arr = [&](u64 w){
+            arr<val<1>,NUMG> primary_bits = primary_mask[w].make_array(val<1>{});
+            arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
+                return select(primary_bits[j], readctr_cnt[w][j], val<CTRBIT-1>{0});
+            };
+            val<CTRBIT-1> prov_ctr = prov_ctrs.fo1().fold_or();
+
+            arr<val<1>,LINEINST> prov_pred = [&](u64 offset){
+                return is_branch[offset] & provider[w][offset];
+            };
+            val<1> provider_pred = prov_pred.fo1().fold_or();
+
+            arr<val<1>,LINEINST> alt_pred_arr = [&](u64 offset){
+                return is_branch[offset] & alt[w][offset];
+            };
+            val<1> alt_pred = alt_pred_arr.fo1().fold_or();
+
+            arr<val<1>,LINEINST> base_arr = [&](u64 offset){
+                return is_branch[offset] & readb[offset];
+            };
+            val<1> base_pred = base_arr.fo1().fold_or();
+
+            arr<val<NUMG>,LINEINST> alt_mask = [&](u64 offset){
+                return select(is_branch[offset], val<NUMG>{match_alt[w][offset]}, val<NUMG>{0});
+            };
+            val<1> has_alt = alt_mask.fo1().fold_or() != hard<0>{};
+            val<1> alt_or_base = select(has_alt, alt_pred, base_pred);
+            val<1> actual = actualdirs.concat() != hard<0>{};
+
+            val<1> has_provider = primary_mask[w] != hard<0>{};
+            val<1> provider_is_weak = is_weak(provider_pred, prov_ctr);
+            val<1> alt_or_base_match = alt_or_base == actual;
+
+            return has_provider & provider_is_weak & ~alt_or_base_match;
+        };
+
+        val<1> any_inc_use_alt = inc_use_alt_arr.fo1().fold_or();
+        val<1> any_dec_use_alt = dec_use_alt_arr.fo1().fold_or();
+
+        use_alt_on_na.fanout(hard<3>{});
+        val<USE_ALT_PRED_BITS,i64> new_use_alt = select(any_inc_use_alt,
+            val<USE_ALT_PRED_BITS,i64>{use_alt_on_na + 1},
+            select(any_dec_use_alt,
+                val<USE_ALT_PRED_BITS,i64>{use_alt_on_na - 1},
+                use_alt_on_na));
+        using use_alt_t = valt<decltype(use_alt_on_na)>;
+        use_alt_on_na = select(new_use_alt > use_alt_t::maxval, use_alt_t{use_alt_t::maxval},
+                              select(new_use_alt < use_alt_t::minval, use_alt_t{use_alt_t::minval}, use_alt_t{new_use_alt}));
 #endif
 
-        // update global history
-        val<1> line_end = inst_mask >> (LINEINST-block_size);
+        // ==================== P1 Update (after extra_cycle) ====================
+        // Update P1 prediction if P1 and P2 disagree and hysteresis is weak
+        auto p2_split = p2.make_array(val<1>{});
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            execute_if(p1_weak[offset].fo1(), [&](){
+                table1_pred[offset].write(index1, p2_split[offset].fo1());
+            });
+        }
+
+        // Update P1 hysteresis for all branches
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            execute_if(is_branch[offset], [&](){
+                table1_hyst[offset].write(index1, ~disagree[offset]);
+            });
+        }
+
+        // Global history update
+        val<1> line_end = inst_oh >> (LINEINST-block_size);
         true_block = correct_pred | branch_dir[num_branch-1] | line_end.fo1();
         true_block.fanout(hard<GHIST+NUMG*2+2>{});
         execute_if(true_block, [&](){
             next_pc.fanout(hard<2>{});
-            global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
+            path_history = (path_history << 1) ^ val<GHIST1>{next_pc>>2};
             gfolds.update(val<PATHBITS>{next_pc>>2});
         });
 
-        num_branch = 0; // done
+        num_branch = 0;
+    }
+    ~my_bp() {
+        panel.print();
     }
 };

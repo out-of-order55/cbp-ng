@@ -1,3 +1,6 @@
+#ifndef ENERGY_MONITOR_HPP
+#define ENERGY_MONITOR_HPP
+
 #include <sstream>
 #include <string>
 #include <map>
@@ -63,3 +66,5 @@ struct energy_monitor {
 };
 
 #define energy_checkpoint(monitor) monitor.record(__FILE__, __LINE__)
+
+#endif // ENERGY_MONITOR_HPP

@@ -11,7 +11,7 @@ if [ "$NAME" == "$FILE" ]; then
 fi
 
 COMPILE="g++ -std=c++20"
-OPT="-O3"
+OPT="-g -O0"
 FLAGS="-Wall -Wextra -pedantic -Wold-style-cast -Werror -Wno-deprecated-declarations -Wno-mismatched-tags"
 
 set -x
