@@ -12,7 +12,7 @@
 
 ## 工作流程
 
-1. 每次开始请以plan模式开始，并且模型为Haiku
+1. 每次开始请以plan模式开始，先给出具体计划，写入文件，并且模型为Haiku
 2. 每次修改文件后，需要运行./compile cbp -DPREDICTOR="my_bp<>" ，保证没有错误，否则继续修改
 3. 之后运行./cbp ./gcc_test_trace.gz test 100 400 --format human，保证没有错误，否则继续修改
 4. 如果遇到错误，请使用gdb调试
