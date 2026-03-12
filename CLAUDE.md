@@ -14,7 +14,7 @@
 
 每次开始请以plan模式开始，先给出具体计划，写入文件，并且模型为Haiku,做完计划后代码请用sonnet4.6编写
 
-每次修改文件后，需要运行./compile cbp -DPREDICTOR="my_bp<>" -DVERBOSE -DPERF_COUNTERS -DCHEATING_MODE ，保证没有错误，否则继续修改
+每次修改文件后，需要运行./compile cbp -DPREDICTOR="my_bp<>" -DVERBOSE -DPERF_COUNTERS -DCHEATING_MODE -DUPDATEALTONWEAKMISP，保证没有错误，否则继续修改
 
 之后运行./cbp ./gcc_test_trace.gz test 100 400 --format human，保证没有错误，否则继续修改
 

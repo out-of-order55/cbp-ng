@@ -15,12 +15,12 @@ using namespace hcm;
     struct energy_monitor monitor;
 #endif
 // #define PERF_COUNTERS
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6
 , u64 NUMBANKS=4,u64 NUMWAYS=1,u64 CTRBIT=3,u64 UBIT=2>
 struct my_bp : predictor {
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
-    static constexpr u64 MINHIST = 2;
+    static constexpr u64 MINHIST = 4;
     static constexpr u64 USE_ALT_PRED_BITS = 4;
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 11;
@@ -77,11 +77,10 @@ struct my_bp : predictor {
     arr<reg<NUMG>,LINEINST> hc_pred_source[NUMWAYS]; // HC source bitmask (0=bimodal, one-hot=TAGE table)
     arr<reg<2>,LINEINST> hc_pred_type[NUMWAYS]; // HC source type: 0=bim, 1=prov, 2=alt
 
-#ifdef USE_ALT_PRED
-    reg<USE_ALT_PRED_BITS> use_alt_on_na;
-    arr<reg<1>,LINEINST> newly_alloc;
+
     arr<reg<1>,LINEINST> use_provider[NUMWAYS];
-#endif
+    reg<USE_ALT_PRED_BITS> use_alt_on_na;
+
 
 #ifdef RESET_UBITS
     reg<UCTRBITS> uctr;
@@ -108,12 +107,12 @@ struct my_bp : predictor {
     u64 perf_tage_conf[NUMWAYS][NUMG][4] = {};        // CTR confidence dist at hit: 0=low,1=med-lo,2=med-hi,3=high
     u64 perf_tage_ubit_resets_total = 0;
     u64 perf_tage_skip_alloc_total=0;
-    u64 perf_hc_prov_count = 0;  // times HCpred from provider
-    u64 perf_hc_alt_count  = 0;  // times HCpred from alt
-    u64 perf_hc_bim_count  = 0;  // times HCpred from bimodal
-    u64 perf_hc_prov_correct = 0;
-    u64 perf_hc_alt_correct  = 0;
-    u64 perf_hc_bim_correct  = 0;
+    u64 perf_hc_prov_count[NUMWAYS] = {};  // times HCpred from provider per way
+    u64 perf_hc_alt_count[NUMWAYS] = {};   // times HCpred from alt per way
+    u64 perf_hc_bim_count[NUMWAYS] = {};   // times HCpred from bimodal per way
+    u64 perf_hc_prov_correct[NUMWAYS] = {};
+    u64 perf_hc_alt_correct[NUMWAYS] = {};
+    u64 perf_hc_bim_correct[NUMWAYS] = {};
 
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
@@ -140,7 +139,19 @@ struct my_bp : predictor {
         }
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
-        // TAGE statistics per way per table with detailed analysis
+        // Aggregate HC statistics for merging with TAGE
+        u64 total_prov_count = 0, total_alt_count = 0, total_bim_count = 0;
+        u64 total_prov_correct = 0, total_alt_correct = 0, total_bim_correct = 0;
+        for (u64 w=0; w<NUMWAYS; w++) {
+            total_prov_count += perf_hc_prov_count[w];
+            total_alt_count += perf_hc_alt_count[w];
+            total_bim_count += perf_hc_bim_count[w];
+            total_prov_correct += perf_hc_prov_correct[w];
+            total_alt_correct += perf_hc_alt_correct[w];
+            total_bim_correct += perf_hc_bim_correct[w];
+        }
+
+        // TAGE statistics per way per table with HCpred source info
         for (u64 w=0; w<NUMWAYS; w++) {
             std::cerr << "\n┌─ TAGE Way " << w << " ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
             std::cerr << "│ Tbl │ HistLen │ Reads │ Hits │ Hit% │ Prov │ PrvAcc% │ Alt │ AltAcc% │ Total │ Use% │ TotAcc% │ Alloc │ Conf0(lo) │ Conf1(mlo) │ Conf2(mhi) │ Conf3(hi) │\n";
@@ -222,22 +233,85 @@ struct my_bp : predictor {
         std::cerr << "│ Total UBIT Resets: " << std::setw(41) << std::left << perf_tage_ubit_resets_total << "│\n";
         std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
 
-        // HC source type statistics
-        std::cerr << "\n┌─ HCpred Source Type Statistics ───────────────────────────────┐\n";
-        std::cerr << "│ Provider count:   " << std::setw(42) << std::left << perf_hc_prov_count << "│\n";
-        std::cerr << "│ Alt count:        " << std::setw(42) << std::left << perf_hc_alt_count  << "│\n";
-        std::cerr << "│ Bimodal count:    " << std::setw(42) << std::left << perf_hc_bim_count  << "│\n";
-        if (perf_hc_prov_count > 0) {
-            double acc = (100.0 * perf_hc_prov_correct) / perf_hc_prov_count;
-            std::cerr << "│ Provider acc:     " << std::setw(42) << std::left << std::fixed << std::setprecision(2) << acc << "%│\n";
+        // HCpred Source Statistics - merged with TAGE info
+        std::cerr << "\n┌─ Prediction Source Distribution (via HCpred) ─────────────────┐\n";
+        std::cerr << "│ Source   │ Count │ Correct │ Accuracy │ % of Total │\n";
+        std::cerr << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
+
+        u64 total_tage_count = total_prov_count + total_alt_count;
+        u64 total_tage_correct = total_prov_correct + total_alt_correct;
+        u64 total_all = total_tage_count + total_bim_count;
+
+        // TAGE Provider row
+        std::cerr << "│ TAGE Prov│ " << std::setw(5) << std::right << total_prov_count << " │ ";
+        std::cerr << std::setw(7) << std::right << total_prov_correct << " │ ";
+        if (total_prov_count > 0) {
+            double acc = (100.0 * total_prov_correct) / total_prov_count;
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right << acc << "% │ ";
+        } else {
+            std::cerr << "    N/A │ ";
         }
-        if (perf_hc_alt_count > 0) {
-            double acc = (100.0 * perf_hc_alt_correct) / perf_hc_alt_count;
-            std::cerr << "│ Alt acc:          " << std::setw(42) << std::left << std::fixed << std::setprecision(2) << acc << "%│\n";
+        if (total_all > 0) {
+            double pct = (100.0 * total_prov_count) / total_all;
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right << pct << "% │\n";
+        } else {
+            std::cerr << "    N/A │\n";
         }
-        if (perf_hc_bim_count > 0) {
-            double acc = (100.0 * perf_hc_bim_correct) / perf_hc_bim_count;
-            std::cerr << "│ Bimodal acc:      " << std::setw(42) << std::left << std::fixed << std::setprecision(2) << acc << "%│\n";
+
+        // TAGE Alt row
+        std::cerr << "│ TAGE Alt │ " << std::setw(5) << std::right << total_alt_count << " │ ";
+        std::cerr << std::setw(7) << std::right << total_alt_correct << " │ ";
+        if (total_alt_count > 0) {
+            double acc = (100.0 * total_alt_correct) / total_alt_count;
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right << acc << "% │ ";
+        } else {
+            std::cerr << "    N/A │ ";
+        }
+        if (total_all > 0) {
+            double pct = (100.0 * total_alt_count) / total_all;
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right << pct << "% │\n";
+        } else {
+            std::cerr << "    N/A │\n";
+        }
+
+        // Bimodal row
+        std::cerr << "│ Bimodal  │ " << std::setw(5) << std::right << total_bim_count << " │ ";
+        std::cerr << std::setw(7) << std::right << total_bim_correct << " │ ";
+        if (total_bim_count > 0) {
+            double acc = (100.0 * total_bim_correct) / total_bim_count;
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right << acc << "% │ ";
+        } else {
+            std::cerr << "    N/A │ ";
+        }
+        if (total_all > 0) {
+            double pct = (100.0 * total_bim_count) / total_all;
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right << pct << "% │\n";
+        } else {
+            std::cerr << "    N/A │\n";
+        }
+
+        // Total row
+        std::cerr << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
+        std::cerr << "│ Total    │ " << std::setw(5) << std::right << total_all << " │ ";
+        u64 total_correct = total_tage_correct + total_bim_correct;
+        std::cerr << std::setw(7) << std::right << total_correct << " │ ";
+        if (total_all > 0) {
+            double acc = (100.0 * total_correct) / total_all;
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right << acc << "% │ ";
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right << 100.0 << "% │\n";
+        } else {
+            std::cerr << "    N/A │     N/A │\n";
+        }
+        std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
+
+        // Verification
+        std::cerr << "\n┌─ Verification ────────────────────────────────────────────────┐\n";
+        std::cerr << "│ P1 Predictions:  " << std::setw(45) << std::left << perf_p1_predictions << "│\n";
+        std::cerr << "│ HCpred Total:    " << std::setw(45) << std::left << total_all << "│\n";
+        if (total_all == perf_p1_predictions) {
+            std::cerr << "│ Status:          " << std::setw(45) << std::left << "✓ MATCH (Counters correct)" << "│\n";
+        } else {
+            std::cerr << "│ Status:          " << std::setw(45) << std::left << "✗ MISMATCH" << "│\n";
         }
         std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
 
@@ -275,10 +349,12 @@ struct my_bp : predictor {
         constexpr u64 total_bits = (1ULL << index1_bits) * lineinst
             + (1ULL << LOGG) * (TAGW + CTRBIT + UBIT) * NUMG * NUMWAYS
             + (1ULL << bindex_bits) * 2 * lineinst;
+#ifdef VERBOSE
         std::cerr << "TAGE history lengths: ";
         for (u64 i=0; i<NUMG; i++) std::cerr << gfolds.HLEN[i] << " ";
         std::cerr << std::endl;
         std::cerr << "Total storage: " << total_bits << " bits (" << (total_bits / 8192.0) << " KB)" << std::endl;
+#endif
     }
 
 
@@ -307,7 +383,7 @@ struct my_bp : predictor {
         }
         readp1.fanout(hard<2>{});
         p1 = readp1.concat();
-        p1.fanout(hard<LINEINST>{});
+        p1.fanout(hard<LINEINST+1>{});
         return (inst_oh & p1) != hard<0>{};
     };
 
@@ -428,7 +504,7 @@ struct my_bp : predictor {
         }
         for (u64 w=0; w<NUMWAYS; w++) alt[w].fanout(hard<2>{});
 
-#ifdef USE_ALT_PRED
+
         use_alt_on_na.fanout(hard<2>{});
         arr<val<1>,USE_ALT_PRED_BITS> use_alt_on_na_array = use_alt_on_na.make_array(val<1>{});
         val<1> use_alt_on_na_pos = use_alt_on_na_array[USE_ALT_PRED_BITS-1];
@@ -446,9 +522,12 @@ struct my_bp : predictor {
                 // provider & alt
                 val<1> prov_is_weak = is_weak(provider[w][inst], prov_ctr);
                 prov_is_weak.fanout(hard<2>{});
+#ifdef USE_ALT_PRED
                 use_provider[w][inst] = prov_oh.fold_or() &
                 select(alt_oh.fo1().fold_or(),(~prov_is_weak | ~use_alt_on_na_pos_dup[inst]),val<1>{1});
-
+#else
+                use_provider[w][inst] = prov_oh.fold_or();
+#endif
                 // ── HCpred ──────────────────────────────────────────────
                 // Provider: not weak and exists → HCpred = provider
                 
@@ -483,16 +562,13 @@ struct my_bp : predictor {
                 val<2> hc_type = select(use_provider_hc, val<2>{1},   // provider
                                  select(use_alt_hc,       val<2>{2},   // alternate
                                                            val<2>{0})); // bimodal
-                hc_pred_type[w][inst] = hc_type.fo1();
+                hc_pred_type[w][inst] = hc_type;
             }
         }
         // hc_pred_val is used once in p2 computation - no fanout needed (FO=1)
-        // hc_pred_source is used 4 times: extra_cycle(2) + gctr_update(1) + (was 5, bimodal check now uses hc_pred_type)
-        for (u64 w=0; w<NUMWAYS; w++) hc_pred_source[w].fanout(hard<4>{});
-        // hc_pred_type is used 2 times: bimodal_update(1) + perf_counters(1)
-        for (u64 w=0; w<NUMWAYS; w++) hc_pred_type[w].fanout(hard<2>{});
-        // use_provider.fanout(hard<2>{});
-
+#ifdef USE_ALT_PRED
+        // for (u64 w=0; w<NUMWAYS; w++) hc_pred_source[w].fanout(hard<4>{});
+        // for (u64 w=0; w<NUMWAYS; w++) hc_pred_type[w].fanout(hard<2>{});
         // p2 now uses HCpred: strongest non-weak entry (provider > longest non-weak alt > bimodal)
         p2 = arr<val<1>,LINEINST>{[&](u64 offset){
             arr<val<1>,NUMWAYS> final_pred = [&](u64 w){
@@ -504,11 +580,12 @@ struct my_bp : predictor {
 #else
         p2 = arr<val<1>,LINEINST>{[&](u64 offset){
             arr<val<1>,NUMWAYS> final_pred = [&](u64 w){ return provider[w][offset]; };
-            return select(final_pred.fo1().fold_or(), val<1>{1}, readb[offset]);
+            arr<val<NUMG>,NUMWAYS> has_prov = [&](u64 w){ return match_provider[w][offset]; };
+            return select(has_prov.fold_or() != val<NUMG>{0}, final_pred.fold_or(), readb[offset]);
         }}.concat();
 #endif
 
-        p2.fanout(hard<LINEINST>{});
+        p2.fanout(hard<LINEINST+2>{});
         val<1> taken = (inst_oh & p2) != hard<0>{};
         taken.fanout(hard<2>{});
         reuse_prediction(~val<1>{inst_oh>>(LINEINST-1)});
@@ -588,7 +665,7 @@ struct my_bp : predictor {
         gfolds.fanout(hard<2>{});
         index1.fanout(hard<LINEINST*3>{});
         // p1.fanout(hard<2>{});
-        p2.fanout(hard<2*LINEINST>{});
+        // p2.fanout(hard<2*LINEINST>{});
         readp1.fanout(hard<2>{});
         bindex.fanout(hard<LINEINST*3>{});
         readb.fanout(hard<4>{});
@@ -657,13 +734,6 @@ struct my_bp : predictor {
             3. reset
 
         */
-
-        // Compute actual branch directions for update purposes
-        // arr<val<1>,LINEINST> branch_taken = [&](u64 offset) {
-        //     // Extract the actual direction from branch_dir array
-        //     return val<1>{branch_dir[offset]};
-        // };
-
         // ==================== Extra Cycle Determination ====================
         // Determine which updates are needed for extra cycle
         // 1. TAGE update: any table was used as HCpred, provider, or extra alt
@@ -867,7 +937,11 @@ struct my_bp : predictor {
                 // - HCpred used this table
                 // - Provider hit (always update longest match)
                 // - Extra alt update (provider weak & wrong & this is an alt)
+#ifdef UPDATEALTONWEAKMISP
                 val<1> was_used = hc_used_bits[j] | prov_hit_bits[j] | extra_alt_bits[j];
+#else
+                val<1> was_used = prov_hit_bits[j];
+#endif
                 val<1> do_alloc = (w == way_sel) ? allocate[j] : val<1>{0};
 
                 // Compute actual direction for this table j
@@ -1145,19 +1219,46 @@ struct my_bp : predictor {
             }
         }
 
-        // Count HCpred source type (provider/alt/bimodal) stats
-        for (u64 w=0; w<NUMWAYS; w++) {
-            for (u64 offset=0; offset<LINEINST; offset++) {
+        // Count HCpred source type and accuracy - once per branch (not per way)
+        // For each branch, determine which source was used and count it once
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            val<1> is_br = is_branch[offset];
+
+            // Aggregate across ways to find which source was used
+            arr<val<1>,NUMWAYS> prov_hit_arr = [&](u64 w){
                 val<2> hc_t = hc_pred_type[w][offset];
-                val<1> is_br = is_branch[offset];
-                val<1> hc_correct = val<1>{hc_pred_val[w][offset]} == actualdirs[offset];
-                perf_hc_prov_count   += static_cast<u64>((hc_t == val<2>{1}) & is_br);
-                perf_hc_alt_count    += static_cast<u64>((hc_t == val<2>{2}) & is_br);
-                perf_hc_bim_count    += static_cast<u64>((hc_t == val<2>{0}) & is_br);
-                perf_hc_prov_correct += static_cast<u64>((hc_t == val<2>{1}) & hc_correct & is_br);
-                perf_hc_alt_correct  += static_cast<u64>((hc_t == val<2>{2}) & hc_correct & is_br);
-                perf_hc_bim_correct  += static_cast<u64>((hc_t == val<2>{0}) & hc_correct & is_br);
-            }
+                val<1> prov_hit = (val<NUMG>{match_provider[w][offset]} != hard<0>{});
+                return (hc_t == val<2>{1}) & prov_hit;
+            };
+            val<1> any_prov_hit = prov_hit_arr.fo1().fold_or();
+
+            arr<val<1>,NUMWAYS> alt_hit_arr = [&](u64 w){
+                val<2> hc_t = hc_pred_type[w][offset];
+                val<1> alt_hit = (val<NUMG>{match_alt[w][offset]} != hard<0>{});
+                return (hc_t == val<2>{2}) & alt_hit;
+            };
+            val<1> any_alt_hit = alt_hit_arr.fo1().fold_or();
+
+            arr<val<1>,NUMWAYS> bim_used_arr = [&](u64 w){
+                val<2> hc_t = hc_pred_type[w][offset];
+                return (hc_t == val<2>{0});
+            };
+            val<1> any_bim_used = bim_used_arr.fo1().fold_or();
+
+            // Check if prediction was correct
+            arr<val<1>,NUMWAYS> correct_arr = [&](u64 w){
+                return val<1>{hc_pred_val[w][offset]} == actualdirs[offset];
+            };
+            val<1> hc_correct = correct_arr.fo1().fold_or();
+
+            // Count this branch once based on the source used (only if it's a branch)
+            perf_hc_prov_count[0]   += static_cast<u64>(is_br & any_prov_hit);
+            perf_hc_alt_count[0]    += static_cast<u64>(is_br & any_alt_hit);
+            perf_hc_bim_count[0]    += static_cast<u64>(is_br & any_bim_used);
+
+            perf_hc_prov_correct[0] += static_cast<u64>(is_br & any_prov_hit & hc_correct);
+            perf_hc_alt_correct[0]  += static_cast<u64>(is_br & any_alt_hit & hc_correct);
+            perf_hc_bim_correct[0]  += static_cast<u64>(is_br & any_bim_used & hc_correct);
         }
 #endif
 #endif
