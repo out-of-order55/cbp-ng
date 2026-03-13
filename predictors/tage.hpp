@@ -6,6 +6,7 @@
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
+#include <iomanip>
 
 using namespace hcm;
 
@@ -76,6 +77,187 @@ struct tage : predictor {
     arr<reg<1>,LINEINST> branch_dir;
     reg<LINEINST> block_entry; // one-hot vector
 
+#ifdef PERF_COUNTERS
+    // Overall statistics
+    u64 perf_predictions = 0;
+    u64 perf_correct = 0;
+
+    // Per-table source tracking
+    u64 perf_provider_used[NUMG] = {};
+    u64 perf_provider_correct[NUMG] = {};
+    u64 perf_alt_used[NUMG] = {};
+    u64 perf_alt_correct[NUMG] = {};
+
+    // Bimodal tracking
+    u64 perf_bimodal_used = 0;
+    u64 perf_bimodal_correct = 0;
+
+    // Table statistics
+    u64 perf_table_reads[NUMG] = {};
+    u64 perf_table_hits[NUMG] = {};
+    u64 perf_table_alloc[NUMG] = {};
+
+    // Allocation failures
+    u64 perf_alloc_failures = 0;
+
+    void print_perf_counters() {
+        std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
+        std::cerr << "║           TAGE PREDICTOR PERFORMANCE COUNTERS                   ║\n";
+        std::cerr << "╚════════════════════════════════════════════════════════════════╝\n";
+
+        // Overall statistics
+        std::cerr << "\n┌─ Overall Statistics ────────────────────────────────────────────┐\n";
+        std::cerr << "│ Total Predictions: " << std::setw(43) << std::left << perf_predictions << "│\n";
+        std::cerr << "│ Correct:           " << std::setw(43) << std::left << perf_correct << "│\n";
+        if (perf_predictions > 0) {
+            double accuracy = (100.0 * perf_correct) / perf_predictions;
+            std::cerr << "│ Accuracy:          " << std::fixed << std::setprecision(2)
+                      << std::setw(40) << std::left << accuracy << "% │\n";
+        }
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+        // Per-table statistics
+        std::cerr << "\n┌─ TAGE Table Statistics ─────────────────────────────────────────────────────────────────────────────────┐\n";
+        std::cerr << "│ Tbl │ HistLen │ Reads │ Hits │ Hit%  │ Prov │ PrvAcc% │ Alt │ AltAcc% │ Total │ TotAcc% │ Alloc │\n";
+        std::cerr << "├─────┼─────────┼───────┼──────┼───────┼──────┼─────────┼─────┼─────────┼───────┼─────────┼───────┤\n";
+
+        for (u64 j=0; j<NUMG; j++) {
+            u64 reads = perf_table_reads[j];
+            u64 hits = perf_table_hits[j];
+            u64 prov = perf_provider_used[j];
+            u64 prov_ok = perf_provider_correct[j];
+            u64 alt = perf_alt_used[j];
+            u64 alt_ok = perf_alt_correct[j];
+            u64 total = prov + alt;
+            u64 total_ok = prov_ok + alt_ok;
+            u64 alloc = perf_table_alloc[j];
+
+            std::cerr << "│ " << std::setw(3) << std::left << j << " │ ";
+            std::cerr << std::setw(7) << std::right << gfolds.HLEN[j] << " │ ";
+            std::cerr << std::setw(5) << std::right << reads << " │ ";
+            std::cerr << std::setw(4) << std::right << hits << " │ ";
+
+            if (reads > 0)
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(5) << std::right
+                          << (100.0*hits/reads) << "% │ ";
+            else
+                std::cerr << "  N/A │ ";
+
+            std::cerr << std::setw(4) << std::right << prov << " │ ";
+            if (prov > 0)
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right
+                          << (100.0*prov_ok/prov) << "% │ ";
+            else
+                std::cerr << "    N/A │ ";
+
+            std::cerr << std::setw(3) << std::right << alt << " │ ";
+            if (alt > 0)
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right
+                          << (100.0*alt_ok/alt) << "% │ ";
+            else
+                std::cerr << "    N/A │ ";
+
+            std::cerr << std::setw(5) << std::right << total << " │ ";
+            if (total > 0)
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right
+                          << (100.0*total_ok/total) << "% │ ";
+            else
+                std::cerr << "    N/A │ ";
+
+            std::cerr << std::setw(5) << std::right << alloc << " │\n";
+        }
+        std::cerr << "└─────┴─────────┴───────┴──────┴───────┴──────┴─────────┴─────┴─────────┴───────┴─────────┴───────┘\n";
+
+        // Prediction source distribution
+        std::cerr << "\n┌─ Prediction Source Distribution ────────────────────────────────┐\n";
+        std::cerr << "│ Source   │ Count │ Correct │ Accuracy │ % of Total │\n";
+        std::cerr << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
+
+        u64 total_prov = 0, total_prov_ok = 0;
+        u64 total_alt = 0, total_alt_ok = 0;
+        for (u64 j=0; j<NUMG; j++) {
+            total_prov += perf_provider_used[j];
+            total_prov_ok += perf_provider_correct[j];
+            total_alt += perf_alt_used[j];
+            total_alt_ok += perf_alt_correct[j];
+        }
+
+        u64 total_all = total_prov + total_alt + perf_bimodal_used;
+
+        // Provider row
+        std::cerr << "│ Provider │ " << std::setw(5) << std::right << total_prov << " │ ";
+        std::cerr << std::setw(7) << std::right << total_prov_ok << " │ ";
+        if (total_prov > 0)
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right
+                      << (100.0*total_prov_ok/total_prov) << "% │ ";
+        else
+            std::cerr << "    N/A │ ";
+        if (total_all > 0)
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right
+                      << (100.0*total_prov/total_all) << "% │\n";
+        else
+            std::cerr << "    N/A │\n";
+
+        // Alternate row
+        std::cerr << "│ Alternate│ " << std::setw(5) << std::right << total_alt << " │ ";
+        std::cerr << std::setw(7) << std::right << total_alt_ok << " │ ";
+        if (total_alt > 0)
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right
+                      << (100.0*total_alt_ok/total_alt) << "% │ ";
+        else
+            std::cerr << "    N/A │ ";
+        if (total_all > 0)
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right
+                      << (100.0*total_alt/total_all) << "% │\n";
+        else
+            std::cerr << "    N/A │\n";
+
+        // Bimodal row
+        std::cerr << "│ Bimodal  │ " << std::setw(5) << std::right << perf_bimodal_used << " │ ";
+        std::cerr << std::setw(7) << std::right << perf_bimodal_correct << " │ ";
+        if (perf_bimodal_used > 0)
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right
+                      << (100.0*perf_bimodal_correct/perf_bimodal_used) << "% │ ";
+        else
+            std::cerr << "    N/A │ ";
+        if (total_all > 0)
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right
+                      << (100.0*perf_bimodal_used/total_all) << "% │\n";
+        else
+            std::cerr << "    N/A │\n";
+
+        // Total row
+        std::cerr << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
+        std::cerr << "│ Total    │ " << std::setw(5) << std::right << total_all << " │ ";
+        u64 total_correct = total_prov_ok + total_alt_ok + perf_bimodal_correct;
+        std::cerr << std::setw(7) << std::right << total_correct << " │ ";
+        if (total_all > 0) {
+            std::cerr << std::fixed << std::setprecision(2) << std::setw(8) << std::right
+                      << (100.0*total_correct/total_all) << "% │ ";
+            std::cerr << std::fixed << std::setprecision(1) << std::setw(9) << std::right
+                      << 100.0 << "% │\n";
+        } else {
+            std::cerr << "    N/A │     N/A │\n";
+        }
+        std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
+
+        // Allocation failures
+        std::cerr << "\n┌─ Allocation Statistics ─────────────────────────────────────────┐\n";
+        std::cerr << "│ Allocation Failures: " << std::setw(41) << std::left
+                  << perf_alloc_failures << "│\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+        // Verification
+        std::cerr << "\n┌─ Verification ──────────────────────────────────────────────────┐\n";
+        std::cerr << "│ Source total matches predictions: ";
+        if (total_all == perf_predictions)
+            std::cerr << "✓ PASS                      │\n";
+        else
+            std::cerr << "✗ FAIL (" << total_all << " vs " << perf_predictions << ")    │\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+    }
+#endif
+
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
 
@@ -101,6 +283,12 @@ struct tage : predictor {
         }
 #endif
     }
+
+#ifdef PERF_COUNTERS
+    ~tage() {
+        print_perf_counters();
+    }
+#endif
 
     void new_block(val<64> inst_pc)
     {
@@ -319,6 +507,30 @@ struct tage : predictor {
         val<LINEINST> actualdirs = branch_dir.concat();
         actualdirs.fanout(hard<LINEINST>{});
 
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+    // Count table reads and hits
+    u64 num_branches = 0;
+    for (u64 offset=0; offset<LINEINST; offset++) {
+        if (static_cast<bool>(is_branch[offset])) num_branches++;
+    }
+
+    for (u64 j=0; j<NUMG; j++) {
+        perf_table_reads[j] += num_branches;
+
+        // Count hits for this table
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            if (!static_cast<bool>(is_branch[offset])) continue;
+            val<NUMG> prov_mask = match1[offset] >> 1;
+            val<1> hit_j = (prov_mask >> j) & val<1>{1};
+            if (static_cast<bool>(hit_j)) {
+                perf_table_hits[j]++;
+            }
+        }
+    }
+#endif
+#endif
+
         arr<val<1>,LINEINST> branch_taken = [&](u64 offset){
             return (actualdirs & update_mask[offset]) != hard<0>{};
         };
@@ -357,6 +569,17 @@ struct tage : predictor {
         val<NUMG> collamask12 = select(val<2>{std::rand()}==hard<0>{}, collamask2.fo1(), collamask1);
         arr<val<1>,NUMG> allocate = collamask12.fo1().reverse().make_array(val<1>{});
         allocate.fanout(hard<7>{});
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+    // Track allocations per table
+    for (u64 j=0; j<NUMG; j++) {
+        if (static_cast<bool>(allocate[j])) {
+            perf_table_alloc[j]++;
+        }
+    }
+#endif
+#endif
 
         // associate a branch direction to each global table
         arr<val<1>,NUMG> bdir = [&](u64 i) {
@@ -455,6 +678,14 @@ struct tage : predictor {
         val<NUMG> uclearmask = postmask & noalloc.fo1().replicate(hard<NUMG>{}).concat();
         arr<val<1>,NUMG> uclear = uclearmask.fo1().make_array(val<1>{});
         uclear.fanout(hard<2>{});
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+    if (static_cast<bool>(noalloc)) {
+        perf_alloc_failures++;
+    }
+#endif
+#endif
         for (u64 i=0; i<NUMG; i++) {
             execute_if(update_u[i].fo1() | allocate[i] | uclear[i], [&]() {
                 val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i];
@@ -528,6 +759,103 @@ struct tage : predictor {
             global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
             gfolds.update(val<PATHBITS>{next_pc>>2});
         });
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+    // Track prediction sources and accuracy - only for offsets that have branches
+    for (u64 offset=0; offset<LINEINST; offset++) {
+        if (!static_cast<bool>(is_branch[offset])) continue;
+
+        perf_predictions++;
+
+        // Determine which source was used
+        val<NUMG> prov_mask = match1[offset] >> 1;
+        val<NUMG> alt_mask = match2[offset] >> 1;
+        val<1> has_provider = prov_mask != hard<0>{};
+        val<1> has_alt = alt_mask != hard<0>{};
+
+        #ifdef USE_META
+        val<1> metasign = (meta[METAPIPE-1] >= hard<0>{});
+        val<1> use_alt = metasign & newly_alloc[offset] & has_alt;
+
+        if (static_cast<bool>(use_alt)) {
+            for (u64 j=0; j<NUMG; j++) {
+                val<1> is_alt_j = (alt_mask >> j) & val<1>{1};
+                if (static_cast<bool>(is_alt_j)) {
+                    perf_alt_used[j]++;
+                    break;
+                }
+            }
+        } else if (static_cast<bool>(has_provider)) {
+            for (u64 j=0; j<NUMG; j++) {
+                val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
+                if (static_cast<bool>(is_prov_j)) {
+                    perf_provider_used[j]++;
+                    break;
+                }
+            }
+        } else {
+            perf_bimodal_used++;
+        }
+        #else
+        if (static_cast<bool>(has_provider)) {
+            for (u64 j=0; j<NUMG; j++) {
+                val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
+                if (static_cast<bool>(is_prov_j)) {
+                    perf_provider_used[j]++;
+                    break;
+                }
+            }
+        } else {
+            perf_bimodal_used++;
+        }
+        #endif
+
+        // Check if prediction was correct
+        val<1> actual = branch_taken[offset];
+        val<1> predicted = (p2 >> offset) & val<1>{1};
+        val<1> correct = (predicted == actual);
+
+        if (static_cast<bool>(correct)) {
+            perf_correct++;
+
+            #ifdef USE_META
+            if (static_cast<bool>(use_alt)) {
+                for (u64 j=0; j<NUMG; j++) {
+                    val<1> is_alt_j = (alt_mask >> j) & val<1>{1};
+                    if (static_cast<bool>(is_alt_j)) {
+                        perf_alt_correct[j]++;
+                        break;
+                    }
+                }
+            } else if (static_cast<bool>(has_provider)) {
+                for (u64 j=0; j<NUMG; j++) {
+                    val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
+                    if (static_cast<bool>(is_prov_j)) {
+                        perf_provider_correct[j]++;
+                        break;
+                    }
+                }
+            } else {
+                perf_bimodal_correct++;
+            }
+            #else
+            if (static_cast<bool>(has_provider)) {
+                for (u64 j=0; j<NUMG; j++) {
+                    val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
+                    if (static_cast<bool>(is_prov_j)) {
+                        perf_provider_correct[j]++;
+                        break;
+                    }
+                }
+            } else {
+                perf_bimodal_correct++;
+            }
+            #endif
+        }
+    }
+#endif
+#endif
 
         num_branch = 0; // done
     }
