@@ -15,12 +15,12 @@ using namespace hcm;
     struct energy_monitor monitor;
 #endif
 // #define PERF_COUNTERS
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6
 , u64 NUMBANKS=4,u64 NUMWAYS=1,u64 CTRBIT=3,u64 UBIT=2>
 struct my_bp : predictor {
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
-    static constexpr u64 MINHIST = 4;
+    static constexpr u64 MINHIST = 2;
     static constexpr u64 USE_ALT_PRED_BITS = 4;
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 11;
@@ -41,17 +41,24 @@ struct my_bp : predictor {
     static constexpr u64 NUMGSETS = (1<<LOGB)/NUMBANKS/NUMWAYS;
     static constexpr u64 NUMBSETS = (1<<(bindex_bits))/NUMBANKS;
     static constexpr u64 NUMP1SETS = (1<<(index1_bits))/NUMBANKS;
-    static constexpr u64 GINDEXBITS = static_cast<u64>(std::log2(static_cast<double>(NUMGSETS)));
+
+    //rwram will compute the bank and local index for us, but we need to compute the folded global history indexes and tags
+    static constexpr u64 BANKBITS       = static_cast<u64>(std::log2(static_cast<double>(NUMBANKS)));
+    static constexpr u64 GINDEXBITS     = static_cast<u64>(std::log2(static_cast<double>(NUMGSETS)));
+    
+    static constexpr u64 BINDEXBITS     = static_cast<u64>(std::log2(static_cast<double>(NUMBSETS)));
+    static constexpr u64 P1INDEXBITS    = static_cast<u64>(std::log2(static_cast<double>(NUMP1SETS)));
     // static constexpr u64 BANK = static_cast<u64>(std::log2(static_cast<double>(NUMGSETS)));
-    geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
+    geometric_folds<NUMG,MINHIST,GHIST,GINDEXBITS + BANKBITS,HTAGBITS> gfolds;
     reg<1> true_block = 1;
 
     reg<GHIST1> path_history;
-    reg<index1_bits> index1;
+    reg<LOGP1> index1;
+    
     arr<reg<1>,LINEINST> readp1;
     reg<LINEINST> p1;
 
-    reg<bindex_bits> bindex;
+    reg<LOGB> bindex;
     arr<reg<LOGG>,NUMG> gindex;
     arr<reg<HTAGBITS>,NUMG> htag;
 
@@ -107,6 +114,12 @@ struct my_bp : predictor {
     u64 perf_tage_conf[NUMWAYS][NUMG][4] = {};        // CTR confidence dist at hit: 0=low,1=med-lo,2=med-hi,3=high
     u64 perf_tage_ubit_resets_total = 0;
     u64 perf_tage_skip_alloc_total=0;
+    u64 perf_tage_alloc_fail_total = 0;  // Count allocation failures (no free entries)
+    u64 perf_extra_cycle_tage_update = 0;    // Extra cycles due to TAGE update
+    u64 perf_extra_cycle_mispredict = 0;     // Extra cycles due to misprediction
+    u64 perf_extra_cycle_bim_update = 0;     // Extra cycles due to bimodal update
+    u64 perf_extra_cycle_p1_update = 0;      // Extra cycles due to P1 update
+    u64 perf_extra_cycle_total = 0;          // Total extra cycles
     u64 perf_hc_prov_count[NUMWAYS] = {};  // times HCpred from provider per way
     u64 perf_hc_alt_count[NUMWAYS] = {};   // times HCpred from alt per way
     u64 perf_hc_bim_count[NUMWAYS] = {};   // times HCpred from bimodal per way
@@ -114,6 +127,9 @@ struct my_bp : predictor {
     u64 perf_hc_alt_correct[NUMWAYS] = {};
     u64 perf_hc_bim_correct[NUMWAYS] = {};
 
+    u64 perf_useful_alloc = 0;   
+    u64 perf_useful_inc= 0;    
+    u64 perf_useful_reset= 0; 
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
         std::cerr << "║              BRANCH PREDICTOR PERFORMANCE COUNTERS              ║\n";
@@ -233,6 +249,21 @@ struct my_bp : predictor {
         std::cerr << "│ Total UBIT Resets: " << std::setw(41) << std::left << perf_tage_ubit_resets_total << "│\n";
         std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
 
+        std::cerr << "\n┌─ Allocation Failure Statistics ───────────────────────────────┐\n";
+        std::cerr << "│ Total Alloc Failures: " << std::setw(38) << std::left
+                  << perf_tage_alloc_fail_total << "│\n";
+        std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
+
+        std::cerr << "\n┌─ Extra Cycle Statistics ──────────────────────────────────────┐\n";
+        std::cerr << "│ Total Extra Cycles:     " << std::setw(36) << std::left << perf_extra_cycle_total << "│\n";
+        std::cerr << "│   TAGE Update:          " << std::setw(36) << std::left << perf_extra_cycle_tage_update << "│\n";
+        std::cerr << "│   Misprediction:        " << std::setw(36) << std::left << perf_extra_cycle_mispredict << "│\n";
+        std::cerr << "│   Bimodal Update:       " << std::setw(36) << std::left << perf_extra_cycle_bim_update << "│\n";
+        std::cerr << "│   P1 Update:            " << std::setw(36) << std::left << perf_extra_cycle_p1_update << "│\n";
+        std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
+        printf("Useful Allocations: %lu\n", (unsigned long)perf_useful_alloc);
+        printf("Useful Increments: %lu\n", (unsigned long)perf_useful_inc);
+        printf("Useful Resets: %lu\n", (unsigned long)perf_useful_reset);
         // HCpred Source Statistics - merged with TAGE info
         std::cerr << "\n┌─ Prediction Source Distribution (via HCpred) ─────────────────┐\n";
         std::cerr << "│ Source   │ Count │ Correct │ Accuracy │ % of Total │\n";
@@ -304,17 +335,6 @@ struct my_bp : predictor {
         }
         std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
 
-        // Verification
-        std::cerr << "\n┌─ Verification ────────────────────────────────────────────────┐\n";
-        std::cerr << "│ P1 Predictions:  " << std::setw(45) << std::left << perf_p1_predictions << "│\n";
-        std::cerr << "│ HCpred Total:    " << std::setw(45) << std::left << total_all << "│\n";
-        if (total_all == perf_p1_predictions) {
-            std::cerr << "│ Status:          " << std::setw(45) << std::left << "✓ MATCH (Counters correct)" << "│\n";
-        } else {
-            std::cerr << "│ Status:          " << std::setw(45) << std::left << "✗ MISMATCH" << "│\n";
-        }
-        std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
-
         std::cerr << "\n";
     }
 #endif
@@ -326,22 +346,23 @@ struct my_bp : predictor {
     arr<reg<1>,LINEINST> branch_dir;
     reg<LINEINST> inst_oh;
 
-    rwram<1,NUMP1SETS,NUMBANKS> table1_pred[LINEINST] {"P1 pred"};
+    rwram<1,(1<<LOGP1),NUMBANKS> table1_pred[LINEINST] {"P1 pred"};
 
     //205ps
-    rwram<TAGW,NUMGSETS,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
+    rwram<TAGW,1<<LOGG,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
+    // ram<val<TAGW>,(1<<LOGG)> gtag[NUMWAYS][NUMG] {"tags"}; // tags
     //183ps
-    rwram<CTRBIT,NUMGSETS,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
+    rwram<CTRBIT,1<<LOGG,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
     //
-    rwram<UBIT,NUMGSETS,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
+    rwram<UBIT,1<<LOGG,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
 
     //116ps
-    rwram<1,NUMBSETS,NUMBANKS> bim_hi[LINEINST] {"bpred"};
+    rwram<1,1<<LOGB,NUMBANKS> bim_hi[LINEINST] {"bpred"};
 
 
     zone UPDATE_ONLY;
-    rwram<1,NUMP1SETS,NUMBANKS> table1_hyst[LINEINST] {"P1 hyst"};
-    rwram<1,NUMBSETS,NUMBANKS> bim_low[LINEINST] {"bhyst"};
+    rwram<1,1<<LOGP1,NUMBANKS> table1_hyst[LINEINST] {"P1 hyst"};
+    rwram<1,1<<LOGB,NUMBANKS> bim_low[LINEINST] {"bhyst"};
 
     my_bp()
     {
@@ -370,12 +391,15 @@ struct my_bp : predictor {
     {
         inst_pc.fanout(hard<2>{});
         new_block(inst_pc);
-        val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
-        lineaddr.fanout(hard<2>{});
-        if constexpr (GHIST1 <= index1_bits) {
-            index1 = lineaddr ^ (val<index1_bits>{path_history}<<(index1_bits-GHIST1));
+        // val<std::max(P1INDEXBITS+BANKBITS,GHIST1)> lineaddr = inst_pc >> (LOGLB);
+        val<BANKBITS> bankid = inst_pc >> (LOGLB);
+        val<P1INDEXBITS> raw_index = inst_pc >> (LOGLB+BANKBITS);
+
+        
+        if constexpr (GHIST1 <= P1INDEXBITS) {
+            index1 = concat(raw_index ^ (val<P1INDEXBITS>{path_history}<<(P1INDEXBITS-GHIST1)), bankid);
         } else {
-            index1 = path_history.make_array(val<index1_bits>{}).append(lineaddr).fold_xor();
+            index1 = concat(path_history.make_array(val<P1INDEXBITS>{}).append(raw_index).fold_xor(), bankid);
         }
         index1.fanout(hard<LINEINST>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
@@ -393,19 +417,25 @@ struct my_bp : predictor {
     };
 
     val<1> is_weak(val<1> pred, val<CTRBIT-1> ctr){
-        return select(pred, ctr!=ctr.maxval, ctr!=ctr.minval);
+        return select(pred, ctr==ctr.minval, ctr==ctr.maxval);
     }
 
     val<1> predict2(val<64> inst_pc)
     {
-        val<HTAGBITS> raw_tag = inst_pc >> (2 + GINDEXBITS);
-        val<GINDEXBITS> raw_gindex = inst_pc >> 2;
-        val<bindex_bits> bindex_val = inst_pc >> LOGLB;
+        val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB) ;
+        val<GINDEXBITS+BANKBITS> raw_gindex = inst_pc >> (2+BANKBITS);
+        val<BANKBITS>   gbankid = inst_pc >> 2;
+
+        val<BANKBITS> bbankid = inst_pc >> LOGLB;
+        val<BINDEXBITS> raw_bindex = inst_pc >> (LOGLB+BANKBITS);
 
         raw_tag.fanout(hard<NUMG>{});
         raw_gindex.fanout(hard<NUMG>{});
         gfolds.fanout(hard<2>{});
-        bindex_val.fanout(hard<2*LINEINST>{});
+        
+
+        bindex = concat(raw_bindex.fo1(), bbankid.fo1());
+        bindex.fanout(hard<2*LINEINST>{});
 
         for (u64 i=0; i<NUMG; i++) {
             gindex[i] = raw_gindex ^ gfolds.template get<0>(i);
@@ -413,13 +443,13 @@ struct my_bp : predictor {
         gindex.fanout(hard<3*NUMWAYS>{});
 
         for (u64 i=0; i<NUMG; i++) {
-            htag[i] = raw_tag ^ gfolds.template get<1>(i);
+            htag[i] = raw_tag.reverse() ^ gfolds.template get<1>(i);
         }
         // htag.fanout(hard<2>{});
 
         for (u64 offset=0; offset<LINEINST; offset++) {
-            readb[offset] = bim_hi[offset].read(bindex_val);
-            readb_low[offset] = bim_low[offset].read(bindex_val);
+            readb[offset] = bim_hi[offset].read(bindex);
+            readb_low[offset] = bim_low[offset].read(bindex);
         }
         // readb.fanout(hard<NUMWAYS>{});
 
@@ -550,25 +580,34 @@ struct my_bp : predictor {
 
                 val<1> use_alt_hc = ~use_provider_hc & has_hc_alt.fo1();
                 use_alt_hc.fanout(hard<2>{});
+#ifdef USE_ALT_PRED
                 // Final HCpred value and source
                 val<1> hc_val = select(use_provider_hc, provider[w][inst],
                                 select(use_alt_hc,     hc_alt_pred_val.fo1(),
-                                                       readb[inst]));
+                                                       select(prov_oh.fold_or(),provider[w][inst],readb[inst])));
                 val<NUMG> hc_src = select(use_provider_hc, val<NUMG>{match_provider[w][inst]},
                                    select(use_alt_hc,      hc_alt_mask,
-                                                            val<NUMG>{0}));
-                hc_pred_val[w][inst]    = hc_val.fo1();
-                hc_pred_source[w][inst] = hc_src.fo1();
+                                                            select(prov_oh.fold_or(),val<NUMG>{match_provider[w][inst]},val<NUMG>{0})));
                 val<2> hc_type = select(use_provider_hc, val<2>{1},   // provider
                                  select(use_alt_hc,       val<2>{2},   // alternate
                                                            val<2>{0})); // bimodal
+#else
+                       // Final HCpred value and source
+                val<1> hc_val = select(prov_oh.fold_or(), provider[w][inst],
+                                readb[inst]);
+                val<NUMG> hc_src = select(prov_oh.fold_or(), val<NUMG>{match_provider[w][inst]},
+                                   val<NUMG>{0});         
+                val<2> hc_type = select(prov_oh.fold_or(), val<2>{1},   // provider
+                                                           val<2>{0}); // bimodal
+#endif
+                hc_pred_val[w][inst]    = hc_val.fo1();
+                hc_pred_source[w][inst] = hc_src.fo1();
+
                 hc_pred_type[w][inst] = hc_type;
             }
         }
         // hc_pred_val is used once in p2 computation - no fanout needed (FO=1)
-#ifdef USE_ALT_PRED
-        // for (u64 w=0; w<NUMWAYS; w++) hc_pred_source[w].fanout(hard<4>{});
-        // for (u64 w=0; w<NUMWAYS; w++) hc_pred_type[w].fanout(hard<2>{});
+
         // p2 now uses HCpred: strongest non-weak entry (provider > longest non-weak alt > bimodal)
         p2 = arr<val<1>,LINEINST>{[&](u64 offset){
             arr<val<1>,NUMWAYS> final_pred = [&](u64 w){
@@ -577,15 +616,9 @@ struct my_bp : predictor {
             return final_pred.fo1().fold_or();
         }}.concat();
 
-#else
-        p2 = arr<val<1>,LINEINST>{[&](u64 offset){
-            arr<val<1>,NUMWAYS> final_pred = [&](u64 w){ return provider[w][offset]; };
-            arr<val<NUMG>,NUMWAYS> has_prov = [&](u64 w){ return match_provider[w][offset]; };
-            return select(has_prov.fold_or() != val<NUMG>{0}, final_pred.fold_or(), readb[offset]);
-        }}.concat();
-#endif
 
-        p2.fanout(hard<LINEINST+2>{});
+
+        p2.fanout(hard<LINEINST>{});
         val<1> taken = (inst_oh & p2) != hard<0>{};
         taken.fanout(hard<2>{});
         reuse_prediction(~val<1>{inst_oh>>(LINEINST-1)});
@@ -631,29 +664,11 @@ struct my_bp : predictor {
             return;
         }
 
-#ifdef RESET_UBITS
-        // ==================== TAGE UBIT Reset Counter ====================
-        // Increment uctr and check if reset is needed
-        val<UCTRBITS> uctr_threshold = val<UCTRBITS>{1 << (UCTRBITS - 1)};
-        val<1> should_reset = (uctr == uctr_threshold);
 
-        // Update uctr: increment normally, reset to 0 when threshold reached
-        uctr = select(should_reset, val<UCTRBITS>{0}, val<UCTRBITS>{uctr + 1});
-        should_reset.fanout(hard<NUMWAYS*NUMG>{});
-
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-        // Increment ubit reset counter
-        perf_tage_ubit_resets_total += static_cast<u64>(should_reset);
-#endif
-#endif
-#endif
 
         mispredict.fanout(hard<3>{});
         val<1> correct_pred = ~mispredict;
-        // correct_pred.fanout(hard<2>{});
         gindex.fanout(hard<3*NUMWAYS>{});
-        // htag.fanout(hard<1>{});
         for (u64 w=0; w<NUMWAYS; w++) {
             match_provider[w].fanout(hard<8>{});
             provider[w].fanout(hard<4>{});
@@ -664,12 +679,9 @@ struct my_bp : predictor {
         branch_dir.fanout(hard<LINEINST+NUMWAYS>{});
         gfolds.fanout(hard<2>{});
         index1.fanout(hard<LINEINST*3>{});
-        // p1.fanout(hard<2>{});
-        // p2.fanout(hard<2*LINEINST>{});
         readp1.fanout(hard<2>{});
         bindex.fanout(hard<LINEINST*3>{});
         readb.fanout(hard<4>{});
-        // readb_low.fanout(hard<2>{});
 
 
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
@@ -786,6 +798,18 @@ struct my_bp : predictor {
         val<1> some_p1_update = (disagree_mask != hard<0>{});
         val<1> extra_cycle = some_tage_update | mispredict | some_bim_update | some_p1_update;
         extra_cycle.fanout(hard<7>{});
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        // Count extra cycle types
+        perf_extra_cycle_tage_update += static_cast<u64>(some_tage_update);
+        perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
+        perf_extra_cycle_bim_update += static_cast<u64>(some_bim_update);
+        perf_extra_cycle_p1_update += static_cast<u64>(some_p1_update);
+        perf_extra_cycle_total += static_cast<u64>(extra_cycle);
+#endif
+#endif
+
         need_extra_cycle(extra_cycle);
 
         // ==================== Bimodal Update ====================
@@ -855,6 +879,28 @@ struct my_bp : predictor {
 
         val<NUMG> candallocmask = postmask & notumask.fo1().fold_or() & ~(skip_alloc.replicate(hard<NUMG>{}).concat());
         // candallocmask.fanout(hard<1>{});
+        val<1> alloc_fail = mispredict & (candallocmask == hard<0>{});
+
+
+#ifdef RESET_UBITS
+        // ==================== TAGE UBIT Reset Counter ====================
+        // Increment uctr and check if reset is needed
+        val<UCTRBITS> uctr_threshold = val<UCTRBITS>{1 << (UCTRBITS - 1)};
+        val<1> should_reset = (uctr == uctr_threshold);
+
+        // Update uctr: increment normally, reset to 0 when threshold reached
+        uctr = select(should_reset, val<UCTRBITS>{0}, select(alloc_fail,val<UCTRBITS>{uctr + 1}, uctr));
+        should_reset.fanout(hard<NUMWAYS*NUMG>{});
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        // Increment ubit reset counter
+        perf_tage_ubit_resets_total += static_cast<u64>(should_reset);
+        perf_tage_alloc_fail_total += static_cast<u64>(alloc_fail);
+#endif
+#endif
+#endif
+
 
         val<NUMG> collamask = candallocmask.reverse();
         collamask.fanout(hard<2>{});
@@ -912,19 +958,19 @@ struct my_bp : predictor {
             val<1> provider_wrong = ~provider_correct;
 
             // All alt hits (not just match_alt which is one-hot)
-            arr<val<NUMG>,LINEINST> all_alt_mask = [&](u64 offset){
-                val<NUMG> all_alts = val<NUMG>{match[w][offset]} ^ val<NUMG>{match_provider[w][offset]};
-                return select(is_branch[offset], all_alts, val<NUMG>{0});
+            arr<val<NUMG>,LINEINST> alt_mask = [&](u64 offset){
+                
+                return select(is_branch[offset], match_alt[w][offset], val<NUMG>{0});
             };
-            val<NUMG> all_alt_hits = all_alt_mask.fo1().fold_or();
+            val<NUMG> alt_hits = alt_mask.fo1().fold_or();
 
             // Extra alt update condition: provider weak & wrong
-            val<1> extra_alt_cond = provider_is_weak & provider_wrong;
-            val<NUMG> extra_alt_update = select(extra_alt_cond, all_alt_hits, val<NUMG>{0});
+            val<1> base_cond = provider_is_weak & provider_wrong;
+            // val<NUMG> extra_alt_update = select(extra_alt_cond, alt_hits, val<NUMG>{0});
 
             arr<val<1>,NUMG> hc_used_bits = hc_used.make_array(val<1>{});
             arr<val<1>,NUMG> prov_hit_bits = provider_hit.make_array(val<1>{});
-            arr<val<1>,NUMG> extra_alt_bits = extra_alt_update.make_array(val<1>{});
+            arr<val<1>,NUMG> extra_alt_bits = alt_hits.make_array(val<1>{});
 
             // Compute provider_correct and alt_wrong for ubit update
             arr<val<1>,LINEINST> alt_wrong_arr = [&](u64 offset){
@@ -938,7 +984,7 @@ struct my_bp : predictor {
                 // - Provider hit (always update longest match)
                 // - Extra alt update (provider weak & wrong & this is an alt)
 #ifdef UPDATEALTONWEAKMISP
-                val<1> was_used = hc_used_bits[j] | prov_hit_bits[j] | extra_alt_bits[j];
+                val<1> was_used = ((hc_used_bits[j] | extra_alt_bits[j]) & base_cond) | prov_hit_bits[j];
 #else
                 val<1> was_used = prov_hit_bits[j];
 #endif
@@ -1032,6 +1078,9 @@ struct my_bp : predictor {
                 val<1> ubit_update_cond = do_alloc | inc_useful;
                 perf_tage_ctr_updates[w][j]   += static_cast<u64>(ctr_update_cond);
                 perf_tage_useful_updates[w][j] += static_cast<u64>(ubit_update_cond);
+                perf_useful_alloc += static_cast<u64>(do_alloc);   
+                perf_useful_inc  += static_cast<u64>(inc_useful);
+                perf_useful_reset+= static_cast<u64>(should_reset);
 #endif
 #endif
 
@@ -1047,13 +1096,14 @@ struct my_bp : predictor {
 #else
                     val<TAGW> new_tag = concat(val<LOGLINEINST>{last_offset},htag[j]);
 #endif
-                    gtag[w][j].write(gindex[j], new_tag, extra_cycle);
+                    gtag[w][j].write(gindex[j], new_tag,extra_cycle);
                 });
 
                 // UBIT write when allocated or incremented
 #ifdef RESET_UBITS
                 // When reset is triggered, write 0 to all u-bits; otherwise write normal value
                 val<UBIT> ubit_value = select(should_reset, val<UBIT>{0}, final_u);
+                // execute_if(should_reset,[&](){ubit[w][j].reset();});
                 execute_if(do_alloc | inc_useful | should_reset, [&](){
                     ubit[w][j].write(gindex[j], ubit_value, extra_cycle);
                 });
@@ -1157,7 +1207,6 @@ struct my_bp : predictor {
 
         // Update P1 hysteresis for all branches
         for (u64 offset=0; offset<LINEINST; offset++) {
-            // val<1> pred_correct = readp1[offset] == actualdirs[offset];
             execute_if(is_branch[offset], [&](){
                 table1_hyst[offset].write(index1, ~disagree[offset],extra_cycle);
             });
@@ -1219,26 +1268,37 @@ struct my_bp : predictor {
             }
         }
 
-        // Count HCpred source type and accuracy - once per branch (not per way)
-        // For each branch, determine which source was used and count it once
+        // Count HCpred source type and accuracy - per way for TAGE, once for bimodal
+        // For each branch and each way, count which source was used
+        for (u64 w=0; w<NUMWAYS; w++) {
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                val<1> is_br = is_branch[offset];
+                val<2> hc_t = hc_pred_type[w][offset];
+
+                // Check which source was used in this way
+                val<1> prov_hit = (val<NUMG>{match_provider[w][offset]} != hard<0>{});
+                val<1> alt_hit = (val<NUMG>{match_alt[w][offset]} != hard<0>{});
+
+                val<1> is_prov = (hc_t == val<2>{1}) & prov_hit;
+                val<1> is_alt = (hc_t == val<2>{2}) & alt_hit;
+
+                // Check if prediction was correct
+                val<1> hc_correct = val<1>{hc_pred_val[w][offset]} == actualdirs[offset];
+
+                // Count provider and alt per way
+                perf_hc_prov_count[w]   += static_cast<u64>(is_br & is_prov);
+                perf_hc_alt_count[w]    += static_cast<u64>(is_br & is_alt);
+
+                perf_hc_prov_correct[w] += static_cast<u64>(is_br & is_prov & hc_correct);
+                perf_hc_alt_correct[w]  += static_cast<u64>(is_br & is_alt & hc_correct);
+            }
+        }
+
+        // Count bimodal once per branch (not per way, since it's global)
         for (u64 offset=0; offset<LINEINST; offset++) {
             val<1> is_br = is_branch[offset];
 
-            // Aggregate across ways to find which source was used
-            arr<val<1>,NUMWAYS> prov_hit_arr = [&](u64 w){
-                val<2> hc_t = hc_pred_type[w][offset];
-                val<1> prov_hit = (val<NUMG>{match_provider[w][offset]} != hard<0>{});
-                return (hc_t == val<2>{1}) & prov_hit;
-            };
-            val<1> any_prov_hit = prov_hit_arr.fo1().fold_or();
-
-            arr<val<1>,NUMWAYS> alt_hit_arr = [&](u64 w){
-                val<2> hc_t = hc_pred_type[w][offset];
-                val<1> alt_hit = (val<NUMG>{match_alt[w][offset]} != hard<0>{});
-                return (hc_t == val<2>{2}) & alt_hit;
-            };
-            val<1> any_alt_hit = alt_hit_arr.fo1().fold_or();
-
+            // Aggregate across ways to find if bimodal was used
             arr<val<1>,NUMWAYS> bim_used_arr = [&](u64 w){
                 val<2> hc_t = hc_pred_type[w][offset];
                 return (hc_t == val<2>{0});
@@ -1251,13 +1311,8 @@ struct my_bp : predictor {
             };
             val<1> hc_correct = correct_arr.fo1().fold_or();
 
-            // Count this branch once based on the source used (only if it's a branch)
-            perf_hc_prov_count[0]   += static_cast<u64>(is_br & any_prov_hit);
-            perf_hc_alt_count[0]    += static_cast<u64>(is_br & any_alt_hit);
+            // Count bimodal once per branch
             perf_hc_bim_count[0]    += static_cast<u64>(is_br & any_bim_used);
-
-            perf_hc_prov_correct[0] += static_cast<u64>(is_br & any_prov_hit & hc_correct);
-            perf_hc_alt_correct[0]  += static_cast<u64>(is_br & any_alt_hit & hc_correct);
             perf_hc_bim_correct[0]  += static_cast<u64>(is_br & any_bim_used & hc_correct);
         }
 #endif
