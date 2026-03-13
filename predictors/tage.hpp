@@ -681,7 +681,7 @@ struct tage : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-    if (static_cast<bool>(noalloc)) {
+    if (static_cast<bool>(noalloc) && static_cast<bool>(mispredict)) {
         perf_alloc_failures++;
     }
 #endif

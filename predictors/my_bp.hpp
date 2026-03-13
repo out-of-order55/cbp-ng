@@ -3,6 +3,11 @@
 #include <cmath>
 #include <iostream>
 #include <iomanip>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+#include <string>
 #define USE_ALT_PRED
 #define RESET_UBITS
 #define HASH_TAG
@@ -38,9 +43,10 @@ struct my_bp : predictor {
 #else
     static constexpr u64 HTAGBITS = TAGW-LOGLINEINST;
 #endif
-    static constexpr u64 NUMGSETS = (1<<LOGB)/NUMBANKS/NUMWAYS;
+    static constexpr u64 NUMGSETS = (1<<LOGG)/NUMBANKS/NUMWAYS;
     static constexpr u64 NUMBSETS = (1<<(bindex_bits))/NUMBANKS;
     static constexpr u64 NUMP1SETS = (1<<(index1_bits))/NUMBANKS;
+    static constexpr u64 NUMGTSETS = (1<<LOGG)/NUMWAYS;
 
     //rwram will compute the bank and local index for us, but we need to compute the folded global history indexes and tags
     static constexpr u64 BANKBITS       = static_cast<u64>(std::log2(static_cast<double>(NUMBANKS)));
@@ -49,16 +55,16 @@ struct my_bp : predictor {
     static constexpr u64 BINDEXBITS     = static_cast<u64>(std::log2(static_cast<double>(NUMBSETS)));
     static constexpr u64 P1INDEXBITS    = static_cast<u64>(std::log2(static_cast<double>(NUMP1SETS)));
     // static constexpr u64 BANK = static_cast<u64>(std::log2(static_cast<double>(NUMGSETS)));
-    geometric_folds<NUMG,MINHIST,GHIST,GINDEXBITS + BANKBITS,HTAGBITS> gfolds;
+    geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
     reg<1> true_block = 1;
 
     reg<GHIST1> path_history;
-    reg<LOGP1> index1;
+    reg<index1_bits> index1;
     
     arr<reg<1>,LINEINST> readp1;
     reg<LINEINST> p1;
 
-    reg<LOGB> bindex;
+    reg<bindex_bits> bindex;
     arr<reg<LOGG>,NUMG> gindex;
     arr<reg<HTAGBITS>,NUMG> htag;
 
@@ -339,30 +345,69 @@ struct my_bp : predictor {
     }
 #endif
 
+#ifdef CHEATING_MODE
+    std::unordered_map<u64, u64> mispred_pc_count;
+    u64 total_mispred_branches = 0;
+
+    void record_mispred_branch_pc(u64 pc)
+    {
+        mispred_pc_count[pc]++;
+        total_mispred_branches++;
+    }
+
+    void dump_mispred_branch_db_csv(const std::string &path = "results/mispred_branches.csv")
+    {
+        std::vector<std::pair<u64, u64>> rows;
+        rows.reserve(mispred_pc_count.size());
+        for (const auto &entry : mispred_pc_count) rows.push_back(entry);
+
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+
+        std::ofstream out(path);
+        if (!out.is_open()) {
+            std::cerr << "[mispred-db] failed to open " << path << " for writing\n";
+            return;
+        }
+
+        out << "pc_hex,pc_dec,mispred_count\n";
+        for (const auto &row : rows) {
+            std::ios old_state(nullptr);
+            old_state.copyfmt(out);
+            out << "0x" << std::hex << row.first;
+            out.copyfmt(old_state);
+            out << "," << row.first << "," << row.second << "\n";
+        }
+    }
+#endif
+
     u64 num_branch = 0;
     u64 block_size = 0;
 
     arr<reg<LOGLINEINST>,LINEINST> branch_offset;
+    arr<reg<64>,LINEINST> branch_pc;
     arr<reg<1>,LINEINST> branch_dir;
     reg<LINEINST> inst_oh;
 
-    rwram<1,(1<<LOGP1),NUMBANKS> table1_pred[LINEINST] {"P1 pred"};
+    rwram<1,(1<<index1_bits),NUMBANKS> table1_pred[LINEINST] {"P1 pred"};
 
     //205ps
-    rwram<TAGW,1<<LOGG,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
+    rwram<TAGW,NUMGTSETS,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
     // ram<val<TAGW>,(1<<LOGG)> gtag[NUMWAYS][NUMG] {"tags"}; // tags
     //183ps
-    rwram<CTRBIT,1<<LOGG,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
+    rwram<CTRBIT,NUMGTSETS,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
     //
-    rwram<UBIT,1<<LOGG,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
+    rwram<UBIT,NUMGTSETS,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
 
     //116ps
-    rwram<1,1<<LOGB,NUMBANKS> bim_hi[LINEINST] {"bpred"};
+    rwram<1,1<<bindex_bits,NUMBANKS> bim_hi[LINEINST] {"bpred"};
 
 
     zone UPDATE_ONLY;
-    rwram<1,1<<LOGP1,NUMBANKS> table1_hyst[LINEINST] {"P1 hyst"};
-    rwram<1,1<<LOGB,NUMBANKS> bim_low[LINEINST] {"bhyst"};
+    rwram<1,1<<index1_bits,NUMBANKS> table1_hyst[LINEINST] {"P1 hyst"};
+    rwram<1,1<<bindex_bits,NUMBANKS> bim_low[LINEINST] {"bhyst"};
 
     my_bp()
     {
@@ -392,14 +437,14 @@ struct my_bp : predictor {
         inst_pc.fanout(hard<2>{});
         new_block(inst_pc);
         // val<std::max(P1INDEXBITS+BANKBITS,GHIST1)> lineaddr = inst_pc >> (LOGLB);
-        val<BANKBITS> bankid = inst_pc >> (LOGLB);
-        val<P1INDEXBITS> raw_index = inst_pc >> (LOGLB+BANKBITS);
+        // val<BANKBITS> bankid = inst_pc >> (LOGLB);
+        val<index1_bits> raw_index = inst_pc >> (LOGLB);
 
         
-        if constexpr (GHIST1 <= P1INDEXBITS) {
-            index1 = concat(raw_index ^ (val<P1INDEXBITS>{path_history}<<(P1INDEXBITS-GHIST1)), bankid);
+        if constexpr (GHIST1 <= index1_bits) {
+            index1 = raw_index ^ (val<index1_bits>{path_history}<<(index1_bits-GHIST1));
         } else {
-            index1 = concat(path_history.make_array(val<P1INDEXBITS>{}).append(raw_index).fold_xor(), bankid);
+            index1 = path_history.make_array(val<index1_bits>{}).append(raw_index).fold_xor();
         }
         index1.fanout(hard<LINEINST>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
@@ -422,19 +467,17 @@ struct my_bp : predictor {
 
     val<1> predict2(val<64> inst_pc)
     {
-        val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB) ;
-        val<GINDEXBITS+BANKBITS> raw_gindex = inst_pc >> (2+BANKBITS);
-        val<BANKBITS>   gbankid = inst_pc >> 2;
+        val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB);
+        val<LOGG>       raw_gindex = inst_pc >> (LOGLB);
 
-        val<BANKBITS> bbankid = inst_pc >> LOGLB;
-        val<BINDEXBITS> raw_bindex = inst_pc >> (LOGLB+BANKBITS);
+        val<bindex_bits> raw_bindex = inst_pc >> (LOGLB);
 
         raw_tag.fanout(hard<NUMG>{});
         raw_gindex.fanout(hard<NUMG>{});
         gfolds.fanout(hard<2>{});
         
 
-        bindex = concat(raw_bindex.fo1(), bbankid.fo1());
+        bindex = raw_bindex.fo1();
         bindex.fanout(hard<2*LINEINST>{});
 
         for (u64 i=0; i<NUMG; i++) {
@@ -638,15 +681,15 @@ struct my_bp : predictor {
     void update_condbr(val<64> branch_pc, val<1> taken, [[maybe_unused]] val<64> next_pc)
     {
         assert(num_branch < LINEINST);
-        val<LOGLINEINST> offset = branch_pc.fo1() >> 2;
+        val<LOGLINEINST> offset = branch_pc >> 2;
         branch_offset[num_branch] = offset;
+        this->branch_pc[num_branch] = branch_pc;
         branch_dir[num_branch] = taken.fo1();
         num_branch++;
     }
 
     void update_cycle(instruction_info &block_end_info) override
     {
-
 
         val<1> &mispredict = block_end_info.is_mispredict;
         val<64> &next_pc = block_end_info.next_pc;
@@ -666,7 +709,8 @@ struct my_bp : predictor {
 
 
 
-        mispredict.fanout(hard<3>{});
+        mispredict.fanout(hard<4>{});
+
         val<1> correct_pred = ~mispredict;
         gindex.fanout(hard<3*NUMWAYS>{});
         for (u64 w=0; w<NUMWAYS; w++) {
@@ -842,7 +886,7 @@ struct my_bp : predictor {
             return last.fold_or();
         };
         
-        val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match.fo1().fold_or()-1);
+        val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match.append(1).concat().one_hot()-1);
         postmask.fanout(hard<2>{});
 
         // Check if provider was not used but correct (to skip allocation)
@@ -870,16 +914,11 @@ struct my_bp : predictor {
         };
         val<1> skip_alloc = skip_alloc_arr.fo1().fold_or();
 
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-        perf_tage_skip_alloc_total += static_cast<u64>(skip_alloc);
-#endif
-        // assert(last_match.concat().ones()<=1);
-#endif
 
         val<NUMG> candallocmask = postmask & notumask.fo1().fold_or() & ~(skip_alloc.replicate(hard<NUMG>{}).concat());
         // candallocmask.fanout(hard<1>{});
         val<1> alloc_fail = mispredict & (candallocmask == hard<0>{});
+
 
 
 #ifdef RESET_UBITS
@@ -894,6 +933,7 @@ struct my_bp : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
+        perf_tage_skip_alloc_total += static_cast<u64>(skip_alloc);
         // Increment ubit reset counter
         perf_tage_ubit_resets_total += static_cast<u64>(should_reset);
         perf_tage_alloc_fail_total += static_cast<u64>(alloc_fail);
@@ -908,9 +948,20 @@ struct my_bp : predictor {
         collamask_low.fanout(hard<2>{});
         val<NUMG> collamask_high = (collamask ^ collamask_low).one_hot();
         val<NUMG> collamask_final = select(val<2>{static_cast<u64>(std::rand())%2}==hard<0>{}, collamask_high.fo1(), collamask_low);
-        arr<val<1>,NUMG> allocate = collamask_final.fo1().reverse().make_array(val<1>{});
+        arr<val<1>,NUMG> allocate = collamask_final.reverse().make_array(val<1>{});
         // allocate.fanout(hard<1>{});
-
+#ifdef CHEATING_MODE
+        if (num_branch > 0 && static_cast<u64>(mispredict)) {
+            u64 last_branch_pc = static_cast<u64>(val<64>{branch_pc[num_branch-1]});
+            record_mispred_branch_pc(last_branch_pc);
+            if(last_branch_pc == 15588712){
+                std::cout << "act dir " << std::bitset<1>(static_cast<u64>(branch_dir[num_branch-1])) 
+                          << " ,cand " << std::bitset<NUMG>(static_cast<u64>(candallocmask)) 
+                          << " prov hit " << std::bitset<NUMG>(static_cast<u64>(last_match.fold_or())) 
+                          << " alloc " << std::bitset<NUMG>(static_cast<u64>(collamask_final.reverse())) << std::endl;
+            }
+        }
+#endif
 
         u64 way_sel = static_cast<u64>(std::rand()) % NUMWAYS;
 
@@ -974,7 +1025,7 @@ struct my_bp : predictor {
 
             // Compute provider_correct and alt_wrong for ubit update
             arr<val<1>,LINEINST> alt_wrong_arr = [&](u64 offset){
-                return is_branch[offset] & (alt[w][offset]!=actualdirs[offset]);
+                return is_branch[offset] & (select(alt_hits!=val<NUMG>{0},alt[w][offset]!=actualdirs[offset], readb[offset] != actualdirs[offset]));
             };
             val<1> alt_wrong = alt_wrong_arr.fold_or();
 
@@ -993,7 +1044,7 @@ struct my_bp : predictor {
                 // Compute actual direction for this table j
                 // For allocation: use last_offset branch direction
                 // For existing entry: use the branch direction from the offset that matched this table
-#ifdef HASH_TAG
+// #ifdef HASH_TAG
                 // With HASH_TAG, we need to find which offset matched this table
                 arr<val<1>,LINEINST> offset_match = [&](u64 offset){
                     val<1> j_matches = match[w][offset].make_array(val<1>{})[j];
@@ -1003,14 +1054,15 @@ struct my_bp : predictor {
                     return select(offset_match[offset], actualdirs[offset], val<1>{0});
                 };
                 val<1> matched_dir = offset_dir.fo1().fold_or();
-#else
-                // Without HASH_TAG, extract offset from tag
-                val<LOGLINEINST> tag_offset = readt[w][j] >> HTAGBITS;
-                arr<val<1>,LINEINST> offset_match = [&](u64 i){
-                    return (branch_offset[i] == tag_offset);
-                };
-                val<1> matched_dir = (offset_match.fo1().concat() & actualdirs.concat()) != hard<0>{};
-#endif
+// #else
+//                 // // Without HASH_TAG, extract offset from tag
+//                 val<LOGLINEINST> tag_offset = readt[w][j] >> HTAGBITS;
+//                 arr<val<1>,LINEINST> offset_match = [&](u64 offset){
+//                     val<1> j_matches = match[w][offset].make_array(val<1>{})[j];
+//                     return is_branch[offset] & j_matches;
+//                 };
+//                 val<1> matched_dir = (offset_match.fo1().concat() & actualdirs.concat()) != hard<0>{};
+// #endif
                 val<1> last_dir = branch_dir[num_branch-1];
                 val<1> actual_val = select(do_alloc, last_dir, matched_dir);
 
@@ -1019,7 +1071,7 @@ struct my_bp : predictor {
                 val<UBIT> cur_u = readu[w][j];
 
                 // CTR update: increment if correct, decrement if wrong, init on alloc
-                val<CTRBIT> init_ctr = val<CTRBIT>{1 << (CTRBIT - 1)};
+                val<CTRBIT> init_ctr = concat(actual_val,val<CTRBIT-1>{0});
                 val<CTRBIT> updated_ctr = update_ctr(current_ctr, actual_val);
                 val<CTRBIT> new_ctr = select(do_alloc, init_ctr, updated_ctr);
 
@@ -1179,12 +1231,6 @@ struct my_bp : predictor {
         val<1> any_inc_use_alt = inc_use_alt_arr.fo1().fold_or();
         val<1> any_dec_use_alt = dec_use_alt_arr.fo1().fold_or();
 
-        // if((any_inc_use_alt)){
-        //     printf("inc\n");
-        // }
-        // if(any_dec_use_alt){
-        //     printf("dec\n");
-        // }
         use_alt_on_na.fanout(hard<3>{});
         val<USE_ALT_PRED_BITS,i64> new_use_alt = select(any_inc_use_alt,
             val<USE_ALT_PRED_BITS,i64>{use_alt_on_na + 1},
@@ -1331,6 +1377,7 @@ struct my_bp : predictor {
     }
     ~my_bp() {
 #ifdef CHEATING_MODE
+        dump_mispred_branch_db_csv();
 #ifdef PERF_COUNTERS
         print_perf_counters();
 #endif
