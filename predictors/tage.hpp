@@ -16,7 +16,7 @@
 
 using namespace hcm;
 
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6>
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6>
 struct tage : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
@@ -85,6 +85,12 @@ struct tage : predictor {
     reg<LINEINST> block_entry; // one-hot vector
 
 #ifdef PERF_COUNTERS
+    // Store prediction source per offset (set in predict2, read in update_cycle)
+    // 0=bimodal, 1=provider, 2=alt
+    arr<reg<2>,LINEINST> pred_source_stored;
+    arr<reg<NUMG+1>,LINEINST> pred_match1_stored; // stored match1 for hit info
+    arr<reg<NUMG+1>,LINEINST> pred_match2_stored; // stored match2 for alt info
+
     // Overall statistics
     u64 perf_predictions = 0;
     u64 perf_correct = 0;
@@ -117,6 +123,29 @@ struct tage : predictor {
         u64 hit_gindex = 0;
     };
     std::unordered_map<u64, MispredRecord> mispred_db;
+
+    // Branch execution flow trace (one entry per branch execution)
+    struct ExecRecord {
+        u64 cycle = 0;
+        u64 pc = 0;
+        u64 offset = 0;
+        u64 actual_dir = 0;
+        u64 predicted_dir = 0;
+        u64 mispredict = 0;
+        // prediction source: 0=bimodal, 1=tage_provider, 2=tage_alt
+        u64 pred_source = 0;
+        u64 pred_table = 0; // which TAGE table (NUMG=bimodal)
+        u64 bim_index = 0;
+        u64 hit = 0;
+        u64 hit_table = 0;
+        u64 hit_gtag = 0;
+        u64 hit_gindex = 0;
+        u64 alloc = 0;
+        u64 alloc_table = 0;
+        u64 alloc_gindex = 0;
+        u64 alloc_tag = 0;
+    };
+    std::vector<ExecRecord> exec_trace;
 
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
@@ -274,22 +303,40 @@ struct tage : predictor {
             std::cerr << "✗ FAIL (" << total_all << " vs " << perf_predictions << ")    │\n";
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
-        // Write full mispred trace to file + top-20 to stderr
+        // Write full exec trace to file
         {
-            std::ofstream tf("mispred_trace_tage.csv");
-            tf << "pc,count,last_actual_dir,last_hit,last_hit_table,last_hit_gtag,last_hit_gindex\n";
+            std::ofstream ef("mispred_trace_tage.csv");
+            ef << "seq,cycle,pc,offset,actual_dir,predicted_dir,mispredict,pred_source,pred_table,bim_index,hit,hit_table,hit_gtag,hit_gindex,alloc,alloc_table,alloc_gindex,alloc_tag\n";
+            for (u64 i = 0; i < exec_trace.size(); i++) {
+                auto &r = exec_trace[i];
+                std::string src_str = (r.pred_source == 0) ? "bimodal" :
+                                      (r.pred_source == 1) ? "tage_prov" : "tage_alt";
+                ef << i << ","
+                   << r.cycle << ","
+                   << "0x" << std::hex << r.pc << std::dec << ","
+                   << r.offset << ","
+                   << r.actual_dir << ","
+                   << r.predicted_dir << ","
+                   << r.mispredict << ","
+                   << src_str << ","
+                   << (r.pred_source != 0 ? std::to_string(r.pred_table) : "N/A") << ","
+                   << r.bim_index << ","
+                   << r.hit << ","
+                   << (r.hit ? std::to_string(r.hit_table) : "N/A") << ","
+                   << (r.hit ? ("0x" + [&]{ std::ostringstream s; s << std::hex << r.hit_gtag; return s.str(); }()) : "N/A") << ","
+                   << (r.hit ? std::to_string(r.hit_gindex) : "N/A") << ","
+                   << r.alloc << ","
+                   << (r.alloc ? std::to_string(r.alloc_table) : "N/A") << ","
+                   << (r.alloc ? std::to_string(r.alloc_gindex) : "N/A") << ","
+                   << (r.alloc ? ("0x" + [&]{ std::ostringstream s; s << std::hex << r.alloc_tag; return s.str(); }()) : "N/A") << "\n";
+            }
+        }
+
+        // Write per-PC mispred summary + top-20 to stderr
+        {
             std::vector<std::pair<u64,MispredRecord>> sorted_db(mispred_db.begin(), mispred_db.end());
             std::sort(sorted_db.begin(), sorted_db.end(),
                 [](const auto &a, const auto &b){ return a.second.count > b.second.count; });
-            for (auto &[pc, rec] : sorted_db) {
-                tf << "0x" << std::hex << pc << std::dec << ","
-                   << rec.count << ","
-                   << rec.actual_dir << ","
-                   << rec.hit << ","
-                   << (rec.hit ? std::to_string(rec.hit_table) : "N/A") << ","
-                   << (rec.hit ? ("0x" + [&]{ std::ostringstream s; s << std::hex << rec.hit_gtag; return s.str(); }()) : "N/A") << ","
-                   << (rec.hit ? std::to_string(rec.hit_gindex) : "N/A") << "\n";
-            }
 
             std::cerr << "\n┌─ Top 20 Most Mispredicted PCs (full trace -> mispred_trace_tage.csv) ──────────────────────┐\n";
             std::cerr << "│ Rank │       PC       │ Mispreds │ Dir │ Hit │ Tbl │    GTTag     │  GIndex  │\n";
@@ -311,7 +358,7 @@ struct tage : predictor {
                 }
                 rank++;
             }
-            std::cerr << "└──────┴────────────────┴─���────────┴─────┴─────┴─────┴──────────────┴──────────┘\n";
+            std::cerr << "└──────┴────────────────┴──────────┴─────┴─────┴─────┴──────────────┴──────────┘\n";
         }
     }
 #endif
@@ -482,6 +529,26 @@ struct tage : predictor {
         p2.fanout(hard<LINEINST>{});
         val<1> taken = (block_entry & p2) != hard<0>{};
         taken.fanout(hard<2>{});
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        // Store prediction source for each offset (used in update_cycle)
+        for (u64 offset=0; offset<LINEINST; offset++) {
+#ifdef USE_META
+            val<1> use_alt_o = metasign & newly_alloc[offset] & (match2[offset]!=hard<0>{});
+            // bimodal is bit NUMG (highest bit), tables are bits 0..NUMG-1
+            val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
+            val<2> src = select(use_alt_o.fo1(), val<2>{2},
+                         select(has_tage, val<2>{1}, val<2>{0}));
+#else
+            val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
+            val<2> src = select(has_tage, val<2>{1}, val<2>{0});
+#endif
+            pred_source_stored[offset] = src;
+            pred_match1_stored[offset] = match1[offset];
+            pred_match2_stored[offset] = match2[offset];
+        }
+#endif
+#endif
         reuse_prediction(~val<1>{block_entry>>(LINEINST-1)});
         return taken;
     }
@@ -577,11 +644,12 @@ struct tage : predictor {
     for (u64 j=0; j<NUMG; j++) {
         perf_table_reads[j] += num_branches;
 
-        // Count hits for this table
+        // Count hits for this table (any tag match, not just longest)
         for (u64 offset=0; offset<LINEINST; offset++) {
             if (!static_cast<bool>(is_branch[offset])) continue;
-            val<NUMG> prov_mask = match1[offset] >> 1;
-            val<1> hit_j = (prov_mask >> j) & val<1>{1};
+            // bits 0..NUMG-1 = tables, bit NUMG = bimodal
+            val<NUMG> all_hits = val<NUMG+1>{pred_match1_stored[offset]} & hard<(1<<NUMG)-1>{};
+            val<1> hit_j = (all_hits >> j) & val<1>{1};
             if (static_cast<bool>(hit_j)) {
                 perf_table_hits[j]++;
             }
@@ -827,48 +895,23 @@ struct tage : predictor {
 
         perf_predictions++;
 
-        // Determine which source was used
-        val<NUMG> prov_mask = match1[offset] >> 1;
-        val<NUMG> alt_mask = match2[offset] >> 1;
-        val<1> has_provider = prov_mask != hard<0>{};
-        val<1> has_alt = alt_mask != hard<0>{};
+        // Use stored source from predict2() — avoids stale meta issue
+        u64 src = static_cast<u64>(val<2>{pred_source_stored[offset]});
+        // bimodal = bit NUMG, tables = bits 0..NUMG-1
+        val<NUMG> prov_mask = val<NUMG+1>{pred_match1_stored[offset]} & hard<(1<<NUMG)-1>{};
+        val<NUMG> alt_mask  = val<NUMG+1>{pred_match2_stored[offset]} & hard<(1<<NUMG)-1>{};
 
-        #ifdef USE_META
-        val<1> metasign = (meta[METAPIPE-1] >= hard<0>{});
-        val<1> use_alt = metasign & newly_alloc[offset] & has_alt;
-
-        if (static_cast<bool>(use_alt)) {
+        if (src == 2) { // alt
             for (u64 j=0; j<NUMG; j++) {
-                val<1> is_alt_j = (alt_mask >> j) & val<1>{1};
-                if (static_cast<bool>(is_alt_j)) {
-                    perf_alt_used[j]++;
-                    break;
-                }
+                if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_used[j]++; break; }
             }
-        } else if (static_cast<bool>(has_provider)) {
+        } else if (src == 1) { // provider
             for (u64 j=0; j<NUMG; j++) {
-                val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
-                if (static_cast<bool>(is_prov_j)) {
-                    perf_provider_used[j]++;
-                    break;
-                }
+                if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_used[j]++; break; }
             }
-        } else {
+        } else { // bimodal
             perf_bimodal_used++;
         }
-        #else
-        if (static_cast<bool>(has_provider)) {
-            for (u64 j=0; j<NUMG; j++) {
-                val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
-                if (static_cast<bool>(is_prov_j)) {
-                    perf_provider_used[j]++;
-                    break;
-                }
-            }
-        } else {
-            perf_bimodal_used++;
-        }
-        #endif
 
         // Check if prediction was correct
         val<1> actual = branch_taken[offset];
@@ -877,64 +920,100 @@ struct tage : predictor {
 
         if (static_cast<bool>(correct)) {
             perf_correct++;
-
-            #ifdef USE_META
-            if (static_cast<bool>(use_alt)) {
+            if (src == 2) {
                 for (u64 j=0; j<NUMG; j++) {
-                    val<1> is_alt_j = (alt_mask >> j) & val<1>{1};
-                    if (static_cast<bool>(is_alt_j)) {
-                        perf_alt_correct[j]++;
-                        break;
-                    }
+                    if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_correct[j]++; break; }
                 }
-            } else if (static_cast<bool>(has_provider)) {
+            } else if (src == 1) {
                 for (u64 j=0; j<NUMG; j++) {
-                    val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
-                    if (static_cast<bool>(is_prov_j)) {
-                        perf_provider_correct[j]++;
-                        break;
-                    }
+                    if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_correct[j]++; break; }
                 }
             } else {
                 perf_bimodal_correct++;
             }
-            #else
-            if (static_cast<bool>(has_provider)) {
-                for (u64 j=0; j<NUMG; j++) {
-                    val<1> is_prov_j = (prov_mask >> j) & val<1>{1};
-                    if (static_cast<bool>(is_prov_j)) {
-                        perf_provider_correct[j]++;
-                        break;
-                    }
-                }
-            } else {
-                perf_bimodal_correct++;
-            }
-            #endif
         }
 
-        // Misprediction trace
-        if (!static_cast<bool>(correct)) {
-            u64 pc_val  = static_cast<u64>(branch_pc[offset]);
-            u64 dir_val = static_cast<u64>(actual);
+        // Look up PC for this offset by scanning branch slots
+        u64 pc_val = 0;
+        for (u64 bi = 0; bi < num_branch; bi++) {
+            if (static_cast<u64>(branch_offset[bi]) == offset) {
+                pc_val = static_cast<u64>(branch_pc[bi]);
+                break;
+            }
+        }
 
-            // match1 is NUMG+1 bits: bits 0..NUMG-1 = TAGE tables, bit NUMG = bimodal
-            u64 hit_found = 0, hit_table = NUMG, hit_gtag = 0, hit_gindex = 0;
-            u64 pmask = static_cast<u64>(match1[offset]) & ((1ULL << NUMG) - 1); // mask out bimodal bit
-            if (pmask != 0) {
-                for (u64 j = 0; j < NUMG; j++) {
-                    if ((pmask >> j) & 1) {
-                        hit_found  = 1;
-                        hit_table  = j;
-                        hit_gtag   = static_cast<u64>(readt[j]);
-                        hit_gindex = static_cast<u64>(gindex[j]);
-                        break;
-                    }
+        // match1 is NUMG+1 bits: bits 0..NUMG-1 = TAGE tables, bit NUMG = bimodal
+        u64 hit_found = 0, hit_table = NUMG, hit_gtag = 0, hit_gindex = 0;
+        u64 pmask = static_cast<u64>(val<NUMG+1>{pred_match1_stored[offset]}) & ((1ULL << NUMG) - 1);
+        if (pmask != 0) {
+            for (u64 j = 0; j < NUMG; j++) {
+                if ((pmask >> j) & 1) {
+                    hit_found  = 1;
+                    hit_table  = j;
+                    hit_gtag   = static_cast<u64>(readt[j]);
+                    hit_gindex = static_cast<u64>(gindex[j]);
+                    break;
                 }
             }
+        }
+
+        // Determine prediction source from stored value
+        u64 pred_source = src; // already computed above from pred_source_stored
+        u64 pred_table  = NUMG;
+        if (pred_source == 2) {
+            u64 amask = static_cast<u64>(alt_mask);
+            for (u64 j = 0; j < NUMG; j++) {
+                if ((amask >> j) & 1) { pred_table = j; break; }
+            }
+        } else if (pred_source == 1) {
+            u64 pmask2 = static_cast<u64>(prov_mask);
+            for (u64 j = 0; j < NUMG; j++) {
+                if ((pmask2 >> j) & 1) { pred_table = j; break; }
+            }
+        }
+
+        // Find alloc event for this branch (only on mispredict, last branch)
+        u64 is_last = (offset == static_cast<u64>(branch_offset[num_branch-1]));
+        u64 is_misp = static_cast<u64>(mispredict);
+        u64 alloc_found = 0, alloc_table = 0, alloc_gindex_val = 0, alloc_tag_val = 0;
+        if (is_misp && is_last) {
+            for (u64 j = 0; j < NUMG; j++) {
+                if (static_cast<bool>(allocate[j])) {
+                    alloc_found     = 1;
+                    alloc_table     = j;
+                    alloc_gindex_val = static_cast<u64>(gindex[j]);
+                    alloc_tag_val   = static_cast<u64>(concat(branch_offset[num_branch-1], htag[j]));
+                    break;
+                }
+            }
+        }
+
+        // Record exec trace entry
+        ExecRecord er;
+        er.cycle        = static_cast<u64>(panel.cycle);
+        er.pc           = pc_val;
+        er.offset       = offset;
+        er.actual_dir   = static_cast<u64>(actual);
+        er.predicted_dir = static_cast<u64>(predicted);
+        er.mispredict   = is_misp & is_last;
+        er.pred_source  = pred_source;
+        er.pred_table   = pred_table;
+        er.bim_index    = static_cast<u64>(bindex);
+        er.hit          = hit_found;
+        er.hit_table    = hit_table;
+        er.hit_gtag     = hit_gtag;
+        er.hit_gindex   = hit_gindex;
+        er.alloc        = is_misp & is_last & alloc_found;
+        er.alloc_table  = alloc_table;
+        er.alloc_gindex = alloc_gindex_val;
+        er.alloc_tag    = alloc_tag_val;
+        exec_trace.push_back(er);
+
+        // Misprediction trace (per-PC summary)
+        if (!static_cast<bool>(correct)) {
             auto &rec = mispred_db[pc_val];
             rec.count++;
-            rec.actual_dir  = dir_val;
+            rec.actual_dir  = static_cast<u64>(actual);
             rec.hit         = hit_found;
             rec.hit_table   = hit_table;
             rec.hit_gtag    = hit_gtag;

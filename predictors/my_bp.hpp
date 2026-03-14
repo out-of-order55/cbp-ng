@@ -27,7 +27,7 @@ template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHI
 struct my_bp : predictor {
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
-    static constexpr u64 MINHIST = 2;
+    static constexpr u64 MINHIST = 4;
     static constexpr u64 USE_ALT_PRED_BITS = 4;
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 11;
