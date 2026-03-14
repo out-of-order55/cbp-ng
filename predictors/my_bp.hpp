@@ -5,8 +5,10 @@
 #include <iomanip>
 #include <unordered_map>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include <string>
 #define USE_ALT_PRED
 #define RESET_UBITS
@@ -20,7 +22,7 @@ using namespace hcm;
     struct energy_monitor monitor;
 #endif
 // #define PERF_COUNTERS
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6
 , u64 NUMBANKS=4,u64 NUMWAYS=1,u64 CTRBIT=3,u64 UBIT=2>
 struct my_bp : predictor {
     static_assert(LOGLB>2);
@@ -133,9 +135,70 @@ struct my_bp : predictor {
     u64 perf_hc_alt_correct[NUMWAYS] = {};
     u64 perf_hc_bim_correct[NUMWAYS] = {};
 
-    u64 perf_useful_alloc = 0;   
-    u64 perf_useful_inc= 0;    
-    u64 perf_useful_reset= 0; 
+    u64 perf_useful_alloc = 0;
+    u64 perf_useful_inc= 0;
+    u64 perf_useful_reset= 0;
+
+    // Misprediction trace: per-PC record (for top-20 stderr summary)
+    struct MispredRecord {
+        u64 count = 0;
+        u64 actual_dir = 0;
+        u64 hit = 0;
+        u64 hit_table = 0;
+        u64 hit_gtag = 0;
+        u64 hit_gindex = 0;
+    };
+    std::unordered_map<u64, MispredRecord> mispred_db;
+
+    // Branch execution flow trace (one entry per branch execution)
+    struct ExecRecord {
+        u64 cycle = 0;        // simulation cycle
+        u64 pc = 0;
+        u64 offset = 0;       // instruction offset within block (bits [LOGLB-1:2] of PC)
+        u64 actual_dir = 0;
+        u64 predicted_dir = 0;
+        u64 mispredict = 0;
+        // prediction source: 0=bimodal, 1=tage_provider, 2=tage_alt
+        u64 pred_source = 0;
+        u64 pred_table = NUMG; // which TAGE table gave the prediction (NUMG=bimodal)
+        u64 bim_index = 0;    // bimodal table index (bindex) for this branch
+        u64 hit = 0;          // provider hit?
+        u64 hit_table = 0;    // provider table index
+        u64 hit_gtag = 0;     // provider tag
+        u64 hit_gindex = 0;   // provider gindex
+        // alloc event (on mispredict)
+        u64 alloc = 0;        // was an entry allocated?
+        u64 alloc_table = 0;  // which table
+        u64 alloc_gindex = 0; // which index
+        u64 alloc_tag = 0;    // tag written
+    };
+    std::vector<ExecRecord> exec_trace;
+
+    // Bimodal update trace (independent of mispred trace)
+    struct BimUpdateRecord {
+        u64 seq = 0;          // global sequence number
+        u64 cycle = 0;        // simulation cycle
+        u64 pc = 0;
+        u64 offset = 0;       // instruction offset within block
+        u64 bim_index = 0;    // bindex
+        u64 old_pred = 0;     // bim_hi before update
+        u64 old_hyst = 0;     // bim_low before update
+        u64 actual_dir = 0;   // branch actual direction
+        u64 new_pred = 0;     // bim_hi after update (1=written, else unchanged)
+        u64 new_hyst = 0;     // bim_low after update
+        u64 pred_written = 0; // was bim_hi actually written?
+        u64 hyst_written = 0; // was bim_low actually written?
+        // why update triggered
+        u64 no_hit = 0;           // condition 1: no TAGE hit
+        u64 cond_extra_bim = 0;   // condition 2: hc_is_bim & prov_weak_wrong
+        u64 hc_is_bim = 0;        // HCpred fell back to bimodal
+        u64 prov_weak_wrong = 0;  // provider was weak and wrong
+        u64 prov_pred = 0;        // provider prediction (if any)
+        u64 prov_ctr = 0;         // provider CTR lower bits (if any)
+    };
+    std::vector<BimUpdateRecord> bim_update_trace;
+    u64 bim_trace_seq = 0; // global sequence counter shared with exec_trace
+
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
         std::cerr << "║              BRANCH PREDICTOR PERFORMANCE COUNTERS              ║\n";
@@ -341,50 +404,100 @@ struct my_bp : predictor {
         }
         std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
 
+        // Write branch execution flow trace to file, top-20 mispred summary to stderr
+        {
+            std::ofstream tf("mispred_trace.csv");
+            tf << "seq,cycle,pc,offset,actual_dir,predicted_dir,mispredict,pred_source,pred_table,bim_index,hit,hit_table,hit_gtag,hit_gindex,alloc,alloc_table,alloc_gindex,alloc_tag\n";
+            for (u64 i = 0; i < exec_trace.size(); i++) {
+                auto &r = exec_trace[i];
+                std::string src_str = (r.pred_source == 0) ? "bimodal" :
+                                      (r.pred_source == 1) ? "tage_prov" : "tage_alt";
+                tf << i << ","
+                   << r.cycle << ","
+                   << "0x" << std::hex << r.pc << std::dec << ","
+                   << r.offset << ","
+                   << r.actual_dir << ","
+                   << r.predicted_dir << ","
+                   << r.mispredict << ","
+                   << src_str << ","
+                   << (r.pred_source != 0 ? std::to_string(r.pred_table) : "N/A") << ","
+                   << r.bim_index << ","
+                   << r.hit << ","
+                   << (r.hit ? std::to_string(r.hit_table) : "N/A") << ","
+                   << (r.hit ? ("0x" + [&]{ std::ostringstream s; s << std::hex << r.hit_gtag; return s.str(); }()) : "N/A") << ","
+                   << (r.hit ? std::to_string(r.hit_gindex) : "N/A") << ","
+                   << r.alloc << ","
+                   << (r.alloc ? std::to_string(r.alloc_table) : "N/A") << ","
+                   << (r.alloc ? std::to_string(r.alloc_gindex) : "N/A") << ","
+                   << (r.alloc ? ("0x" + [&]{ std::ostringstream s; s << std::hex << r.alloc_tag; return s.str(); }()) : "N/A") << "\n";
+            }
+
+            // Write bimodal update trace to separate file
+            {
+                std::ofstream bf("bim_update_trace.csv");
+                bf << "seq,cycle,pc,offset,bim_index,old_pred,old_hyst,actual_dir,pred_written,new_pred,hyst_written,new_hyst,no_hit,cond_extra_bim,hc_is_bim,prov_weak_wrong,prov_pred,prov_ctr\n";
+                for (auto &b : bim_update_trace) {
+                    bf << b.seq << ","
+                       << b.cycle << ","
+                       << "0x" << std::hex << b.pc << std::dec << ","
+                       << b.offset << ","
+                       << b.bim_index << ","
+                       << b.old_pred << ","
+                       << b.old_hyst << ","
+                       << b.actual_dir << ","
+                       << b.pred_written << ","
+                       << b.new_pred << ","
+                       << b.hyst_written << ","
+                       << b.new_hyst << ","
+                       << b.no_hit << ","
+                       << b.cond_extra_bim << ","
+                       << b.hc_is_bim << ","
+                       << b.prov_weak_wrong << ","
+                       << b.prov_pred << ","
+                       << b.prov_ctr << "\n";
+                }
+            }
+
+            // top-20 mispred summary (stderr unchanged)
+            std::vector<std::pair<u64,MispredRecord>> sorted_db(mispred_db.begin(), mispred_db.end());
+            std::sort(sorted_db.begin(), sorted_db.end(),
+                [](const auto &a, const auto &b){ return a.second.count > b.second.count; });
+
+            // Top-20 summary to stderr
+            std::cerr << "\n┌─ Top 20 Most Mispredicted PCs (full trace -> mispred_trace.csv) ─────────────────────────┐\n";
+            std::cerr << "│ Rank │       PC       │ Mispreds │ Dir │ Hit │ Tbl │    GTTag     │  GIndex  │\n";
+            std::cerr << "├──────┼────────────────┼──────────┼─────┼─────┼─────┼──────────────┼──────────┤\n";
+            u64 rank = 0;
+            for (auto &[pc, rec] : sorted_db) {
+                if (rank >= 20) break;
+                std::cerr << "│ " << std::setw(4) << std::right << (rank+1) << " │ ";
+                std::cerr << "0x" << std::hex << std::setw(12) << std::setfill('0') << pc << std::dec << std::setfill(' ') << " │ ";
+                std::cerr << std::setw(8) << rec.count << " │ ";
+                std::cerr << std::setw(3) << rec.actual_dir << " │ ";
+                std::cerr << std::setw(3) << rec.hit << " │ ";
+                if (rec.hit) {
+                    std::cerr << std::setw(3) << rec.hit_table << " │ ";
+                    std::cerr << "0x" << std::hex << std::setw(10) << std::setfill('0') << rec.hit_gtag << std::dec << std::setfill(' ') << " │ ";
+                    std::cerr << std::setw(8) << rec.hit_gindex << " │\n";
+                } else {
+                    std::cerr << "N/A │          N/A │      N/A │\n";
+                }
+                rank++;
+            }
+            std::cerr << "└──────┴────────────────┴──────────┴─────┴─────┴─────┴──────────────┴──────────┘\n";
+        }
+
         std::cerr << "\n";
     }
+
 #endif
 
-#ifdef CHEATING_MODE
-    std::unordered_map<u64, u64> mispred_pc_count;
-    u64 total_mispred_branches = 0;
 
-    void record_mispred_branch_pc(u64 pc)
-    {
-        mispred_pc_count[pc]++;
-        total_mispred_branches++;
-    }
-
-    void dump_mispred_branch_db_csv(const std::string &path = "results/mispred_branches.csv")
-    {
-        std::vector<std::pair<u64, u64>> rows;
-        rows.reserve(mispred_pc_count.size());
-        for (const auto &entry : mispred_pc_count) rows.push_back(entry);
-
-        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
-            if (a.second != b.second) return a.second > b.second;
-            return a.first < b.first;
-        });
-
-        std::ofstream out(path);
-        if (!out.is_open()) {
-            std::cerr << "[mispred-db] failed to open " << path << " for writing\n";
-            return;
-        }
-
-        out << "pc_hex,pc_dec,mispred_count\n";
-        for (const auto &row : rows) {
-            std::ios old_state(nullptr);
-            old_state.copyfmt(out);
-            out << "0x" << std::hex << row.first;
-            out.copyfmt(old_state);
-            out << "," << row.first << "," << row.second << "\n";
-        }
-    }
-#endif
 
     u64 num_branch = 0;
     u64 block_size = 0;
+
+
 
     arr<reg<LOGLINEINST>,LINEINST> branch_offset;
     arr<reg<64>,LINEINST> branch_pc;
@@ -467,8 +580,8 @@ struct my_bp : predictor {
 
     val<1> predict2(val<64> inst_pc)
     {
-        val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB);
-        val<LOGG>       raw_gindex = inst_pc >> (LOGLB);
+        val<HTAGBITS>   raw_tag = inst_pc >> (2+LOGG);
+        val<LOGG>       raw_gindex = inst_pc >> 2;
 
         val<bindex_bits> raw_bindex = inst_pc >> (LOGLB);
 
@@ -486,7 +599,7 @@ struct my_bp : predictor {
         gindex.fanout(hard<3*NUMWAYS>{});
 
         for (u64 i=0; i<NUMG; i++) {
-            htag[i] = raw_tag.reverse() ^ gfolds.template get<1>(i);
+            htag[i] = raw_tag ^ gfolds.template get<1>(i);
         }
         // htag.fanout(hard<2>{});
 
@@ -593,7 +706,8 @@ struct my_bp : predictor {
                 val<CTRBIT-1> prov_ctr  = prov_ctrs.fo1().fold_or();
                 prov_ctr.fanout(hard<2>{});
                 // provider & alt
-                val<1> prov_is_weak = is_weak(provider[w][inst], prov_ctr);
+                val<1> prov_is_weak = is_weak(provider[w][inst], prov_ctr) & 
+                (match_provider[w][inst] & (notumask.fold_or()!=val<NUMG>{0}));
                 prov_is_weak.fanout(hard<2>{});
 #ifdef USE_ALT_PRED
                 use_provider[w][inst] = prov_oh.fold_or() &
@@ -604,7 +718,7 @@ struct my_bp : predictor {
                 // ── HCpred ──────────────────────────────────────────────
                 // Provider: not weak and exists → HCpred = provider
                 
-                val<1> use_provider_hc = prov_oh.fold_or() & ~prov_is_weak;
+                val<1> use_provider_hc = prov_oh.fold_or() & (~prov_is_weak | ~use_alt_on_na_pos_dup[inst]);
                 use_provider_hc.fanout(hard<3>{});
                 // Alt: from all alt hits (not just one_hot), find longest non-weak
                 val<NUMG> all_alt_hits = val<NUMG>{match[w][inst]} ^ val<NUMG>{match_provider[w][inst]};
@@ -626,11 +740,10 @@ struct my_bp : predictor {
 #ifdef USE_ALT_PRED
                 // Final HCpred value and source
                 val<1> hc_val = select(use_provider_hc, provider[w][inst],
-                                select(use_alt_hc,     hc_alt_pred_val.fo1(),
-                                                       select(prov_oh.fold_or(),provider[w][inst],readb[inst])));
+                                select(use_alt_hc,     hc_alt_pred_val.fo1(),readb[inst]));
                 val<NUMG> hc_src = select(use_provider_hc, val<NUMG>{match_provider[w][inst]},
                                    select(use_alt_hc,      hc_alt_mask,
-                                                            select(prov_oh.fold_or(),val<NUMG>{match_provider[w][inst]},val<NUMG>{0})));
+                                                            val<NUMG>{0}));
                 val<2> hc_type = select(use_provider_hc, val<2>{1},   // provider
                                  select(use_alt_hc,       val<2>{2},   // alternate
                                                            val<2>{0})); // bimodal
@@ -680,6 +793,7 @@ struct my_bp : predictor {
 
     void update_condbr(val<64> branch_pc, val<1> taken, [[maybe_unused]] val<64> next_pc)
     {
+        //TODO: fix fanout
         assert(num_branch < LINEINST);
         val<LOGLINEINST> offset = branch_pc >> 2;
         branch_offset[num_branch] = offset;
@@ -706,8 +820,6 @@ struct my_bp : predictor {
             });
             return;
         }
-
-
 
         mispredict.fanout(hard<4>{});
 
@@ -760,7 +872,7 @@ struct my_bp : predictor {
 
         arr<val<1>,LINEINST> actualdirs = [&](u64 offset){
             arr<val<1>,LINEINST> match_offset = [&](u64 i){ return (branch_offset[i] == offset) & branch_dir[i]; };
-            return match_offset.fo1().fold_or();
+            return (match_offset.fo1().concat() & update_valid) != val<LINEINST>{0};
         };
         actualdirs.fanout(hard<7>{});
 
@@ -800,15 +912,16 @@ struct my_bp : predictor {
         // Check if any TAGE table needs update (HCpred used, provider hit, or extra alt)
         val<1> some_tage_update = (primary_mask.fold_or() != val<NUMG>{0});
 
+
         // Check if any bimodal needs update
         arr<val<1>,LINEINST> bim_update_arr = [&](u64 offset){
             val<1> branch_valid = is_branch[offset];
             val<1> actual_dir = actualdirs[offset];
             // Condition 1: no TAGE hit at all
-            arr<val<1>,NUMWAYS> no_provider_arr = [&](u64 w){
-                return match_provider[w][offset] == hard<0>{};
+            arr<val<1>,NUMWAYS> has_provider_arr = [&](u64 w){
+                return match_provider[w][offset] != hard<0>{};
             };
-            val<1> no_hit = no_provider_arr.fo1().fold_and();
+            val<1> no_hit = ~has_provider_arr.fold_or();
             // Condition 2: HCpred fell back to bimodal (hc_pred_type == 0)
             arr<val<1>,NUMWAYS> hc_is_bim_arr = [&](u64 w){
                 return val<2>{hc_pred_type[w][offset]} == hard<0>{};
@@ -817,7 +930,8 @@ struct my_bp : predictor {
 
             // Provider weak & wrong check (for condition 2)
             arr<val<1>,NUMWAYS> prov_weak_wrong_arr = [&](u64 w){
-                arr<val<1>,NUMG> prov_bits = primary_mask[w].make_array(val<1>{});
+                // use match_provider[w][offset] (per-offset), not primary_mask[w] (aggregated)
+                arr<val<1>,NUMG> prov_bits = val<NUMG>{match_provider[w][offset]}.make_array(val<1>{});
                 arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
                     return select(prov_bits[j], readctr_cnt[w][j], val<CTRBIT-1>{0});
                 };
@@ -825,8 +939,7 @@ struct my_bp : predictor {
                 val<1> prov_pred = provider[w][offset];
                 val<1> prov_weak = is_weak(prov_pred, prov_ctr);
                 val<1> prov_wrong = prov_pred != actual_dir;
-                val<1> has_prov = primary_mask[w] != hard<0>{};
-                return has_prov & prov_weak & prov_wrong;
+                return has_provider_arr[w] & prov_weak & prov_wrong;
             };
             val<1> prov_weak_wrong = prov_weak_wrong_arr.fo1().fold_or();
 
@@ -843,16 +956,7 @@ struct my_bp : predictor {
         val<1> extra_cycle = some_tage_update | mispredict | some_bim_update | some_p1_update;
         extra_cycle.fanout(hard<7>{});
 
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-        // Count extra cycle types
-        perf_extra_cycle_tage_update += static_cast<u64>(some_tage_update);
-        perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
-        perf_extra_cycle_bim_update += static_cast<u64>(some_bim_update);
-        perf_extra_cycle_p1_update += static_cast<u64>(some_p1_update);
-        perf_extra_cycle_total += static_cast<u64>(extra_cycle);
-#endif
-#endif
+
 
         need_extra_cycle(extra_cycle);
 
@@ -860,18 +964,98 @@ struct my_bp : predictor {
         // Bimodal update conditions (HCpred-based):
         // 1. No TAGE hit at all (no provider) → always update bimodal
         // 2. HCpred fell back to bimodal (provider weak & wrong) → update bimodal
+        
         for (u64 offset = 0; offset < LINEINST; offset++) {
             val<1> bim_pred = readb[offset];
             val<1> curr_hyst = readb_low[offset];
             val<1> actual_dir = actualdirs[offset];
             val<1> dir_match = bim_pred==actual_dir;
-            val<1> pred_need_update = curr_hyst == val<1>{0} & bim_update_arr[offset] & ~dir_match;
-            execute_if(bim_update_arr[offset], [&](){      
+            //TODO：add is branch
+            val<1> pred_need_update = (curr_hyst == val<1>{0}) & bim_update_arr[offset] & ~dir_match;
+            execute_if(bim_update_arr[offset], [&](){
                 bim_low[offset].write(bindex, dir_match, extra_cycle);
             });
             execute_if(pred_need_update, [&](){
                 bim_hi[offset].write(bindex, actual_dir, extra_cycle);
             });
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+            // Record bim update trace for this offset if update triggered
+            if (static_cast<bool>(is_branch[offset]) && static_cast<bool>(bim_update_arr[offset])) {
+                // find PC for this offset
+                u64 pc_for_offset = 0;
+                u64 dir_for_offset = 0;
+                for (u64 bi = 0; bi < num_branch; bi++) {
+                    if (static_cast<u64>(branch_offset[bi]) == offset) {
+                        pc_for_offset  = static_cast<u64>(branch_pc[bi]);
+                        dir_for_offset = static_cast<u64>(branch_dir[bi]);
+                        break;
+                    }
+                }
+                // recompute no_hit and cond_extra_bim for this offset
+                u64 no_hit_val = 1;
+                for (u64 w = 0; w < NUMWAYS; w++) {
+                    if (static_cast<u64>(val<NUMG>{match_provider[w][offset]}) != 0) {
+                        no_hit_val = 0; break;
+                    }
+                }
+                // hc_is_bim: any way has hc_pred_type==0
+                u64 hc_is_bim_val = 0;
+                for (u64 w = 0; w < NUMWAYS; w++) {
+                    if (static_cast<u64>(val<2>{hc_pred_type[w][offset]}) == 0) {
+                        hc_is_bim_val = 1; break;
+                    }
+                }
+                // prov_weak_wrong: use match_provider[w][offset] (per-offset)
+                u64 prov_weak_wrong_val = 0;
+                u64 prov_pred_val = 0;
+                u64 prov_ctr_val = 0;
+                for (u64 w = 0; w < NUMWAYS; w++) {
+                    u64 pmask = static_cast<u64>(val<NUMG>{match_provider[w][offset]});
+                    if (pmask != 0) {
+                        prov_pred_val = static_cast<u64>(provider[w][offset]);
+                        for (u64 j = 0; j < NUMG; j++) {
+                            if (pmask & (u64(1)<<j)) {
+                                prov_ctr_val = static_cast<u64>(readctr_cnt[w][j]);
+                                break;
+                            }
+                        }
+                        u64 prov_wrong = (prov_pred_val != dir_for_offset) ? 1 : 0;
+                        // is_weak: ctr at weak boundary (0 for taken, max for not-taken)
+                        u64 max_ctr = (u64(1) << (CTRBIT-1)) - 1;
+                        u64 prov_weak = (prov_pred_val == 1) ? (prov_ctr_val == 0 ? 1 : 0)
+                                                              : (prov_ctr_val == max_ctr ? 1 : 0);
+                        if (prov_weak && prov_wrong) prov_weak_wrong_val = 1;
+                        break;
+                    }
+                }
+                BimUpdateRecord br;
+                br.seq            = bim_trace_seq++;
+                br.cycle          = static_cast<u64>(panel.cycle);
+                br.pc             = pc_for_offset;
+                br.offset         = offset;
+                br.bim_index      = static_cast<u64>(bindex);
+                br.old_pred       = static_cast<u64>(bim_pred);
+                br.old_hyst       = static_cast<u64>(curr_hyst);
+                br.actual_dir     = dir_for_offset;
+                br.hyst_written   = 1;
+                u64 dir_match_val = (static_cast<u64>(bim_pred) == dir_for_offset) ? 1 : 0;
+                br.new_hyst       = dir_match_val;
+                u64 pred_need_val = (static_cast<u64>(curr_hyst) == 0) && !dir_match_val ? 1 : 0;
+                br.pred_written   = pred_need_val;
+                br.new_pred       = pred_need_val ? dir_for_offset : static_cast<u64>(bim_pred);
+                br.no_hit         = no_hit_val;
+                br.cond_extra_bim = hc_is_bim_val & prov_weak_wrong_val;
+                br.hc_is_bim      = hc_is_bim_val;
+                br.prov_weak_wrong = prov_weak_wrong_val;
+                br.prov_pred      = prov_pred_val;
+                br.prov_ctr       = prov_ctr_val;
+                bim_update_trace.push_back(br);
+                
+            }
+#endif
+#endif
         }
 
         // ==================== TAGE Allocation ====================
@@ -930,15 +1114,6 @@ struct my_bp : predictor {
         // Update uctr: increment normally, reset to 0 when threshold reached
         uctr = select(should_reset, val<UCTRBITS>{0}, select(alloc_fail,val<UCTRBITS>{uctr + 1}, uctr));
         should_reset.fanout(hard<NUMWAYS*NUMG>{});
-
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-        perf_tage_skip_alloc_total += static_cast<u64>(skip_alloc);
-        // Increment ubit reset counter
-        perf_tage_ubit_resets_total += static_cast<u64>(should_reset);
-        perf_tage_alloc_fail_total += static_cast<u64>(alloc_fail);
-#endif
-#endif
 #endif
 
 
@@ -950,18 +1125,7 @@ struct my_bp : predictor {
         val<NUMG> collamask_final = select(val<2>{static_cast<u64>(std::rand())%2}==hard<0>{}, collamask_high.fo1(), collamask_low);
         arr<val<1>,NUMG> allocate = collamask_final.reverse().make_array(val<1>{});
         // allocate.fanout(hard<1>{});
-#ifdef CHEATING_MODE
-        if (num_branch > 0 && static_cast<u64>(mispredict)) {
-            u64 last_branch_pc = static_cast<u64>(val<64>{branch_pc[num_branch-1]});
-            record_mispred_branch_pc(last_branch_pc);
-            if(last_branch_pc == 15588712){
-                std::cout << "act dir " << std::bitset<1>(static_cast<u64>(branch_dir[num_branch-1])) 
-                          << " ,cand " << std::bitset<NUMG>(static_cast<u64>(candallocmask)) 
-                          << " prov hit " << std::bitset<NUMG>(static_cast<u64>(last_match.fold_or())) 
-                          << " alloc " << std::bitset<NUMG>(static_cast<u64>(collamask_final.reverse())) << std::endl;
-            }
-        }
-#endif
+
 
         u64 way_sel = static_cast<u64>(std::rand()) % NUMWAYS;
 
@@ -1044,7 +1208,7 @@ struct my_bp : predictor {
                 // Compute actual direction for this table j
                 // For allocation: use last_offset branch direction
                 // For existing entry: use the branch direction from the offset that matched this table
-// #ifdef HASH_TAG
+
                 // With HASH_TAG, we need to find which offset matched this table
                 arr<val<1>,LINEINST> offset_match = [&](u64 offset){
                     val<1> j_matches = match[w][offset].make_array(val<1>{})[j];
@@ -1054,15 +1218,7 @@ struct my_bp : predictor {
                     return select(offset_match[offset], actualdirs[offset], val<1>{0});
                 };
                 val<1> matched_dir = offset_dir.fo1().fold_or();
-// #else
-//                 // // Without HASH_TAG, extract offset from tag
-//                 val<LOGLINEINST> tag_offset = readt[w][j] >> HTAGBITS;
-//                 arr<val<1>,LINEINST> offset_match = [&](u64 offset){
-//                     val<1> j_matches = match[w][offset].make_array(val<1>{})[j];
-//                     return is_branch[offset] & j_matches;
-//                 };
-//                 val<1> matched_dir = (offset_match.fo1().concat() & actualdirs.concat()) != hard<0>{};
-// #endif
+
                 val<1> last_dir = branch_dir[num_branch-1];
                 val<1> actual_val = select(do_alloc, last_dir, matched_dir);
 
@@ -1071,7 +1227,10 @@ struct my_bp : predictor {
                 val<UBIT> cur_u = readu[w][j];
 
                 // CTR update: increment if correct, decrement if wrong, init on alloc
-                val<CTRBIT> init_ctr = concat(actual_val,val<CTRBIT-1>{0});
+                val<CTRBIT> weak_taken = val<CTRBIT>{1 << (CTRBIT - 1)};
+                val<CTRBIT> weak_not_taken = val<CTRBIT>{(1 << (CTRBIT - 1)) - 1};
+                
+                val<CTRBIT> init_ctr = select(actual_val, weak_taken, weak_not_taken);
                 val<CTRBIT> updated_ctr = update_ctr(current_ctr, actual_val);
                 val<CTRBIT> new_ctr = select(do_alloc, init_ctr, updated_ctr);
 
@@ -1082,59 +1241,7 @@ struct my_bp : predictor {
                 val<UBIT> new_u = select(cur_u == hard<cur_u.maxval>{}, cur_u, val<UBIT>{cur_u + 1});
                 val<UBIT> final_u = select(do_alloc, val<UBIT>{0}, new_u);
 
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-                // Count per-offset: provider used / alt used / correct, and confidence distribution at hit
-                // We iterate over all LINEINST slots so we can use per-offset match/direction data.
-                for (u64 offset = 0; offset < LINEINST; offset++) {
-                    val<1> is_br = is_branch[offset];
-                    if (!static_cast<bool>(is_br)) continue;
 
-                    // Check if table j is the provider (longest match) for this offset
-                    // val<1> is_prov_j = val<NUMG>{match_provider[w][offset]}.make_array(val<1>{})[j];
-                    // Check if table j is the HC prediction source (hc_pred_source encodes the one-hot table)
-                    val<1> is_hc_src_j = val<NUMG>{hc_pred_source[w][offset]}.make_array(val<1>{})[j];
-                    // hc_pred_type==1: provider used as HC; hc_pred_type==2: alt used as HC
-                    val<2> hc_type = val<2>{hc_pred_type[w][offset]};
-                    // Table j is provider-HC: is_hc_src_j && hc_type==1
-                    val<1> j_as_prov_hc = is_hc_src_j & (hc_type == val<2>{1});
-                    // Table j is alt-HC: is_hc_src_j && hc_type==2
-                    val<1> j_as_alt_hc  = is_hc_src_j & (hc_type == val<2>{2});
-
-                    val<1> actual_dir = actualdirs[offset];
-                    val<1> pred_dir   = readctr_pred[w][j]; // CTR MSB = prediction
-
-                    perf_tage_provider_used[w][j]    += static_cast<u64>(j_as_prov_hc);
-                    perf_tage_provider_correct[w][j] += static_cast<u64>(j_as_prov_hc & (pred_dir == actual_dir));
-                    perf_tage_alt_used[w][j]         += static_cast<u64>(j_as_alt_hc);
-                    perf_tage_alt_correct[w][j]      += static_cast<u64>(j_as_alt_hc  & (pred_dir == actual_dir));
-
-                    // Confidence distribution: record CTR value when table j hits for this offset
-                    // val<1> hits_j = val<NUMG>{match_provider[w][offset]}.make_array(val<1>{})[j]
-                    //               | (val<NUMG>{match[w][offset]} ^ val<NUMG>{match_provider[w][offset]}).make_array(val<1>{})[j];
-                    // (match[w][offset] covers all hits; match_provider is just the longest-match one)
-                    // Simpler: any bit j set in match[w][offset] means table j hit for this offset
-                    val<1> any_hit_j = val<NUMG>{match[w][offset]}.make_array(val<1>{})[j];
-                    if (static_cast<bool>(any_hit_j & is_br)) {
-                        // Full CTR = concat(pred, cnt) — value in [0, 2^CTRBIT)
-                        u64 ctr_val = static_cast<u64>(concat(readctr_pred[w][j], readctr_cnt[w][j]));
-                        // For CTRBIT=3: values 0-7. Map to 4 confidence levels (0=low, 3=high)
-                        // Confidence = ctr_val >> (CTRBIT - 2)  maps [0,1]->0, [2,3]->1, [4,5]->2, [6,7]->3
-                        u64 conf_idx = ctr_val >> (CTRBIT - 2);
-                        if (conf_idx < 4) perf_tage_conf[w][j][conf_idx]++;
-                    }
-                }
-
-                // Count CTR and UBIT updates (aggregate, not per-offset)
-                val<1> ctr_update_cond = was_used | do_alloc;
-                val<1> ubit_update_cond = do_alloc | inc_useful;
-                perf_tage_ctr_updates[w][j]   += static_cast<u64>(ctr_update_cond);
-                perf_tage_useful_updates[w][j] += static_cast<u64>(ubit_update_cond);
-                perf_useful_alloc += static_cast<u64>(do_alloc);   
-                perf_useful_inc  += static_cast<u64>(inc_useful);
-                perf_useful_reset+= static_cast<u64>(should_reset);
-#endif
-#endif
 
                 // Merge writes: CTR write when used or allocated
                 execute_if(was_used | do_alloc, [&](){
@@ -1166,23 +1273,20 @@ struct my_bp : predictor {
 #endif
             }
         }
-#ifdef CHEATING_MODE
-        assert(allocate.concat().ones()<=1);
-#endif
-        //TODO:fix it
+
+
 #ifdef USE_ALT_PRED
         // USE_ALT_ON_NA update - aggregate conditions using arrays
 
-        // Helper lambda to compute common USE_ALT_PRED conditions
+        // // Helper lambda to compute common USE_ALT_PRED conditions
         auto compute_use_alt_conditions = [&](u64 w){
             struct Conditions {
                 val<1> has_provider;
                 val<1> provider_is_weak;
                 val<1> provider_pred;
-                val<1> alt_pred;
+                val<1> hc_pred;
                 val<1> actual_dir;
             };
-
             arr<val<1>,NUMG> primary_bits = primary_mask[w].make_array(val<1>{});
             arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
                 return select(primary_bits[j], readctr_cnt[w][j], val<CTRBIT-1>{0});
@@ -1194,38 +1298,30 @@ struct my_bp : predictor {
             };
             val<1> provider_pred = prov_pred.fold_or();
 
-            arr<val<1>,LINEINST> alt_pred_arr = [&](u64 offset){
-                return is_branch[offset] & alt[w][offset];
+            arr<val<1>,LINEINST> hc_pred_arr = [&](u64 inst){
+                return select(match_provider[w][inst]!=val<NUMG>{0},hc_pred_val[w][inst],val<1>{0});
             };
-            val<1> alt_pred = alt_pred_arr.fold_or();
+            val<1> hc_pred = hc_pred_arr.fold_or();
 
-            // arr<val<1>,LINEINST> base_arr = [&](u64 offset){
-            //     return is_branch[offset] & readb[offset];
-            // };
-            // val<1> base_pred = base_arr.fo1().fold_or();
-
-            // arr<val<NUMG>,LINEINST> alt_mask = [&](u64 offset){
-            //     return select(is_branch[offset], val<NUMG>{match_alt[w][offset]}, val<NUMG>{0});
-            // };
-            // val<1> has_alt = alt_mask.fo1().fold_or() != hard<0>{};
-            // val<1> alt_or_base = select(has_alt, alt_pred, base_pred);
-            val<1> actual_dir = actualdirs.concat() != hard<0>{};
+            arr<val<1>,LINEINST> actual_dir_arr = [&](u64 inst){
+                return select(match_provider[w][inst]!=val<NUMG>{0},actualdirs[inst],val<1>{0});
+            };
 
             val<1> has_provider = primary_mask[w] != hard<0>{};
             val<1> provider_is_weak = is_weak(provider_pred, prov_ctr);
             // removed unused alt_or_base_match
 
-            return Conditions{has_provider, provider_is_weak, provider_pred, alt_pred, actual_dir};
+            return Conditions{has_provider, provider_is_weak, provider_pred, hc_pred, actual_dir_arr.fold_or()};
         };
 
         arr<val<1>,NUMWAYS> inc_use_alt_arr = [&](u64 w){
             auto cond = compute_use_alt_conditions(w);
-            return cond.has_provider & cond.provider_is_weak & (cond.alt_pred != cond.provider_pred) & (cond.alt_pred == cond.actual_dir);
+            return cond.has_provider & cond.provider_is_weak & (cond.hc_pred != cond.provider_pred) & (cond.hc_pred == cond.actual_dir);
         };
 
         arr<val<1>,NUMWAYS> dec_use_alt_arr = [&](u64 w){
             auto cond = compute_use_alt_conditions(w);
-            return cond.has_provider & cond.provider_is_weak & (cond.alt_pred != cond.provider_pred) & (cond.alt_pred != cond.actual_dir);
+            return cond.has_provider & cond.provider_is_weak & (cond.hc_pred != cond.provider_pred) & (cond.hc_pred != cond.actual_dir);
         };
 
         val<1> any_inc_use_alt = inc_use_alt_arr.fo1().fold_or();
@@ -1257,8 +1353,141 @@ struct my_bp : predictor {
                 table1_hyst[offset].write(index1, ~disagree[offset],extra_cycle);
             });
         }
+
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
+    // Count extra cycle types
+    perf_extra_cycle_tage_update += static_cast<u64>(some_tage_update);
+    perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
+    perf_extra_cycle_bim_update += static_cast<u64>(some_bim_update);
+    perf_extra_cycle_p1_update += static_cast<u64>(some_p1_update);
+    perf_extra_cycle_total += static_cast<u64>(extra_cycle);
+
+    // Build execution flow trace: one record per branch in this block
+    {
+        u64 is_misp = static_cast<u64>(mispredict);
+
+        // Find alloc event: which table/index/tag was allocated (way_sel only)
+        u64 alloc_found = 0, alloc_table = 0, alloc_gindex = 0, alloc_tag = 0;
+        for (u64 j = 0; j < NUMG; j++) {
+            val<1> do_alloc = (way_sel < NUMWAYS) ? allocate[j] : val<1>{0};
+            if (static_cast<bool>(do_alloc)) {
+                alloc_found  = 1;
+                alloc_table  = j;
+                alloc_gindex = static_cast<u64>(gindex[j]);
+#ifdef HASH_TAG
+                alloc_tag = static_cast<u64>(htag[j] ^ val<HTAGBITS>{last_offset});
+#else
+                alloc_tag = static_cast<u64>(concat(val<LOGLINEINST>{last_offset}, htag[j]));
+#endif
+                break;
+            }
+        }
+
+        for (u64 i = 0; i < num_branch; i++) {
+            u64 pc_val  = static_cast<u64>(branch_pc[i]);
+            u64 dir_val = static_cast<u64>(branch_dir[i]);
+            u64 idx     = static_cast<u64>(branch_offset[i]);
+            u64 pred_val = static_cast<u64>((p2 >> idx) & val<LINEINST>{1});
+
+            // Find provider hit for this branch offset
+            u64 hit_found = 0, hit_table = NUMG, hit_gtag = 0, hit_gindex = 0;
+            for (u64 w = 0; w < NUMWAYS && !hit_found; w++) {
+                u64 pmask = static_cast<u64>(val<NUMG>{match_provider[w][idx]});
+                if (pmask != 0) {
+                    for (u64 j = 0; j < NUMG; j++) {
+                        if ((pmask >> j) & 1) {
+                            hit_found  = 1;
+                            hit_table  = j;
+                            hit_gtag   = static_cast<u64>(readt[w][j]);
+                            hit_gindex = static_cast<u64>(gindex[j]);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Determine prediction source from hc_pred_type/hc_pred_source (way 0)
+            u64 pred_source = 0; // 0=bimodal
+            u64 pred_table  = NUMG;
+            {
+                u64 hc_type = static_cast<u64>(val<2>{hc_pred_type[0][idx]});
+                if (hc_type == 1 || hc_type == 2) {
+                    pred_source = hc_type; // 1=provider, 2=alt
+                    u64 src_mask = static_cast<u64>(val<NUMG>{hc_pred_source[0][idx]});
+                    for (u64 j = 0; j < NUMG; j++) {
+                        if ((src_mask >> j) & 1) { pred_table = j; break; }
+                    }
+                }
+            }
+
+            // alloc only applies to the last branch (the mispredicted one)
+            u64 is_last = (i == num_branch - 1);
+            ExecRecord er;
+            er.cycle         = static_cast<u64>(panel.cycle);
+            er.pc            = pc_val;
+            er.offset        = idx; // instruction offset within block
+            er.actual_dir    = dir_val;
+            er.predicted_dir = pred_val;
+            er.mispredict    = is_misp & is_last;
+            er.pred_source   = pred_source;
+            er.pred_table    = pred_table;
+            er.bim_index     = static_cast<u64>(bindex); // bindex is block-level, same for all offsets
+            er.hit           = hit_found;
+            er.hit_table     = hit_table;
+            er.hit_gtag      = hit_gtag;
+            er.hit_gindex    = hit_gindex;
+            er.alloc         = is_misp & is_last & alloc_found;
+            er.alloc_table   = alloc_table;
+            er.alloc_gindex  = alloc_gindex;
+            er.alloc_tag     = alloc_tag;
+            exec_trace.push_back(er);
+
+            // update mispred_db for top-20 summary
+            if (is_misp && is_last) {
+                auto &rec = mispred_db[pc_val];
+                rec.count++;
+                rec.actual_dir  = dir_val;
+                rec.hit         = hit_found;
+                rec.hit_table   = hit_table;
+                rec.hit_gtag    = hit_gtag;
+                rec.hit_gindex  = hit_gindex;
+            }
+        }
+    }
+        perf_tage_skip_alloc_total += static_cast<u64>(skip_alloc);
+        // Increment ubit reset counter
+        perf_tage_ubit_resets_total += static_cast<u64>(should_reset);
+        perf_tage_alloc_fail_total += static_cast<u64>(alloc_fail);
+        for (u64 w = 0; w < NUMWAYS; w++) {
+            for (u64 j = 0; j < NUMG; j++) {
+                // Count per-offset: provider used / alt used / correct, and confidence distribution at hit
+                for (u64 offset = 0; offset < LINEINST; offset++) {
+                    val<1> is_br = is_branch[offset];
+                    if (!static_cast<bool>(is_br)) continue;
+
+                    val<1> is_hc_src_j = val<NUMG>{hc_pred_source[w][offset]}.make_array(val<1>{})[j];
+                    val<2> hc_type = val<2>{hc_pred_type[w][offset]};
+                    val<1> j_as_prov_hc = is_hc_src_j & (hc_type == val<2>{1});
+                    val<1> j_as_alt_hc  = is_hc_src_j & (hc_type == val<2>{2});
+
+                    val<1> actual_dir = actualdirs[offset];
+                    val<1> pred_dir   = readctr_pred[w][j];
+
+                    perf_tage_provider_used[w][j]    += static_cast<u64>(j_as_prov_hc);
+                    perf_tage_provider_correct[w][j] += static_cast<u64>(j_as_prov_hc & (pred_dir == actual_dir));
+                    perf_tage_alt_used[w][j]         += static_cast<u64>(j_as_alt_hc);
+                    perf_tage_alt_correct[w][j]      += static_cast<u64>(j_as_alt_hc  & (pred_dir == actual_dir));
+
+                    val<1> any_hit_j = val<NUMG>{match[w][offset]}.make_array(val<1>{})[j];
+                    if (static_cast<bool>(any_hit_j & is_br)) {
+                        u64 ctr_val = static_cast<u64>(concat(readctr_pred[w][j], readctr_cnt[w][j]));
+                        u64 conf_idx = ctr_val >> (CTRBIT - 2);
+                        if (conf_idx < 4) perf_tage_conf[w][j][conf_idx]++;
+                    }
+                }
+            }
+        }
         // Count P1 predictions and correct predictions
         perf_p1_predictions += num_branch;
 
@@ -1376,8 +1605,8 @@ struct my_bp : predictor {
         num_branch = 0;
     }
     ~my_bp() {
+
 #ifdef CHEATING_MODE
-        dump_mispred_branch_db_csv();
 #ifdef PERF_COUNTERS
         print_perf_counters();
 #endif

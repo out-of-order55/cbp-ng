@@ -7,6 +7,12 @@
 #include "../harcom.hpp"
 #include "common.hpp"
 #include <iomanip>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 using namespace hcm;
 
@@ -75,6 +81,7 @@ struct tage : predictor {
     u64 block_size = 0;
     arr<reg<LOGLINEINST>,LINEINST> branch_offset;
     arr<reg<1>,LINEINST> branch_dir;
+    arr<reg<64>,LINEINST> branch_pc;
     reg<LINEINST> block_entry; // one-hot vector
 
 #ifdef PERF_COUNTERS
@@ -99,6 +106,17 @@ struct tage : predictor {
 
     // Allocation failures
     u64 perf_alloc_failures = 0;
+
+    // Misprediction trace
+    struct MispredRecord {
+        u64 count = 0;
+        u64 actual_dir = 0;
+        u64 hit = 0;
+        u64 hit_table = 0;
+        u64 hit_gtag = 0;
+        u64 hit_gindex = 0;
+    };
+    std::unordered_map<u64, MispredRecord> mispred_db;
 
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
@@ -255,6 +273,46 @@ struct tage : predictor {
         else
             std::cerr << "✗ FAIL (" << total_all << " vs " << perf_predictions << ")    │\n";
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+        // Write full mispred trace to file + top-20 to stderr
+        {
+            std::ofstream tf("mispred_trace_tage.csv");
+            tf << "pc,count,last_actual_dir,last_hit,last_hit_table,last_hit_gtag,last_hit_gindex\n";
+            std::vector<std::pair<u64,MispredRecord>> sorted_db(mispred_db.begin(), mispred_db.end());
+            std::sort(sorted_db.begin(), sorted_db.end(),
+                [](const auto &a, const auto &b){ return a.second.count > b.second.count; });
+            for (auto &[pc, rec] : sorted_db) {
+                tf << "0x" << std::hex << pc << std::dec << ","
+                   << rec.count << ","
+                   << rec.actual_dir << ","
+                   << rec.hit << ","
+                   << (rec.hit ? std::to_string(rec.hit_table) : "N/A") << ","
+                   << (rec.hit ? ("0x" + [&]{ std::ostringstream s; s << std::hex << rec.hit_gtag; return s.str(); }()) : "N/A") << ","
+                   << (rec.hit ? std::to_string(rec.hit_gindex) : "N/A") << "\n";
+            }
+
+            std::cerr << "\n┌─ Top 20 Most Mispredicted PCs (full trace -> mispred_trace_tage.csv) ──────────────────────┐\n";
+            std::cerr << "│ Rank │       PC       │ Mispreds │ Dir │ Hit │ Tbl │    GTTag     │  GIndex  │\n";
+            std::cerr << "├──────┼────────────────┼──────────┼─────┼─────┼─────┼──────────────┼──────────┤\n";
+            u64 rank = 0;
+            for (auto &[pc, rec] : sorted_db) {
+                if (rank >= 20) break;
+                std::cerr << "│ " << std::setw(4) << std::right << (rank+1) << " │ ";
+                std::cerr << "0x" << std::hex << std::setw(12) << std::setfill('0') << pc << std::dec << std::setfill(' ') << " │ ";
+                std::cerr << std::setw(8) << rec.count << " │ ";
+                std::cerr << std::setw(3) << rec.actual_dir << " │ ";
+                std::cerr << std::setw(3) << rec.hit << " │ ";
+                if (rec.hit) {
+                    std::cerr << std::setw(3) << rec.hit_table << " │ ";
+                    std::cerr << "0x" << std::hex << std::setw(10) << std::setfill('0') << rec.hit_gtag << std::dec << std::setfill(' ') << " │ ";
+                    std::cerr << std::setw(8) << rec.hit_gindex << " │\n";
+                } else {
+                    std::cerr << "N/A │          N/A │      N/A │\n";
+                }
+                rank++;
+            }
+            std::cerr << "└──────┴────────────────┴─���────────┴─────┴─────┴─────┴──────────────┴──────────┘\n";
+        }
     }
 #endif
 
@@ -437,11 +495,12 @@ struct tage : predictor {
         return taken;
     }
 
-    void update_condbr(val<64> branch_pc, val<1> taken, [[maybe_unused]] val<64> next_pc)
+    void update_condbr(val<64> branch_pc_in, val<1> taken, [[maybe_unused]] val<64> next_pc)
     {
         assert(num_branch < LINEINST);
-        branch_offset[num_branch] = branch_pc.fo1() >> 2;
+        branch_offset[num_branch] = branch_pc_in >> 2;
         branch_dir[num_branch] = taken.fo1();
+        branch_pc[num_branch] = branch_pc_in.fo1();
         num_branch++;
     }
 
@@ -852,6 +911,34 @@ struct tage : predictor {
                 perf_bimodal_correct++;
             }
             #endif
+        }
+
+        // Misprediction trace
+        if (!static_cast<bool>(correct)) {
+            u64 pc_val  = static_cast<u64>(branch_pc[offset]);
+            u64 dir_val = static_cast<u64>(actual);
+
+            // match1 is NUMG+1 bits: bits 0..NUMG-1 = TAGE tables, bit NUMG = bimodal
+            u64 hit_found = 0, hit_table = NUMG, hit_gtag = 0, hit_gindex = 0;
+            u64 pmask = static_cast<u64>(match1[offset]) & ((1ULL << NUMG) - 1); // mask out bimodal bit
+            if (pmask != 0) {
+                for (u64 j = 0; j < NUMG; j++) {
+                    if ((pmask >> j) & 1) {
+                        hit_found  = 1;
+                        hit_table  = j;
+                        hit_gtag   = static_cast<u64>(readt[j]);
+                        hit_gindex = static_cast<u64>(gindex[j]);
+                        break;
+                    }
+                }
+            }
+            auto &rec = mispred_db[pc_val];
+            rec.count++;
+            rec.actual_dir  = dir_val;
+            rec.hit         = hit_found;
+            rec.hit_table   = hit_table;
+            rec.hit_gtag    = hit_gtag;
+            rec.hit_gindex  = hit_gindex;
         }
     }
 #endif
