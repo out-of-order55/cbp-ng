@@ -22,7 +22,7 @@ using namespace hcm;
     struct energy_monitor monitor;
 #endif
 // #define PERF_COUNTERS
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6
 , u64 NUMBANKS=4,u64 NUMWAYS=1,u64 CTRBIT=3,u64 UBIT=2>
 struct my_bp : predictor {
     static_assert(LOGLB>2);
@@ -664,7 +664,7 @@ struct my_bp : predictor {
             }
         }
 
-        arr<val<NUMG+1>,NUMWAYS> gpreds = [&](u64 w){ return readctr_pred[w].concat(); };
+        arr<val<NUMG>,NUMWAYS> gpreds = [&](u64 w){ return readctr_pred[w].concat(); };
         gpreds.fanout(hard<2>{});
         //30ps
         for (u64 w=0; w<NUMWAYS; w++) {
@@ -735,17 +735,17 @@ struct my_bp : predictor {
                 val<1> has_hc_alt = hc_alt_cand.fold_or();
                 val<1> hc_alt_pred_val = (hc_alt_mask & gpreds[w]) != hard<0>{};
 
-                val<1> use_alt_hc = ~use_provider_hc & has_hc_alt.fo1();
-                use_alt_hc.fanout(hard<2>{});
+                val<1> use_hcpred = ~use_provider_hc & has_hc_alt.fo1();
+                use_hcpred.fanout(hard<2>{});
 #ifdef USE_ALT_PRED
                 // Final HCpred value and source
                 val<1> hc_val = select(use_provider_hc, provider[w][inst],
-                                select(use_alt_hc,     hc_alt_pred_val.fo1(),readb[inst]));
+                                select(use_hcpred,     hc_alt_pred_val.fo1(),readb[inst]));
                 val<NUMG> hc_src = select(use_provider_hc, val<NUMG>{match_provider[w][inst]},
-                                   select(use_alt_hc,      hc_alt_mask,
+                                   select(use_hcpred,      hc_alt_mask,
                                                             val<NUMG>{0}));
                 val<2> hc_type = select(use_provider_hc, val<2>{1},   // provider
-                                 select(use_alt_hc,       val<2>{2},   // alternate
+                                 select(use_hcpred,       val<2>{2},   // alternate
                                                            val<2>{0})); // bimodal
 #else
                        // Final HCpred value and source
@@ -766,8 +766,11 @@ struct my_bp : predictor {
 
         // p2 now uses HCpred: strongest non-weak entry (provider > longest non-weak alt > bimodal)
         p2 = arr<val<1>,LINEINST>{[&](u64 offset){
+            arr<val<1>,NUMWAYS> pred_use_tage = [&](u64 w){
+                return hc_pred_source[w][offset] != val<NUMG>{0};
+            };
             arr<val<1>,NUMWAYS> final_pred = [&](u64 w){
-                return val<1>{hc_pred_val[w][offset]};
+                return select(pred_use_tage[w], val<1>{hc_pred_val[w][offset]}, val<1>{0});
             };
             return final_pred.fo1().fold_or();
         }}.concat();
@@ -1153,24 +1156,11 @@ struct my_bp : predictor {
             };
             val<NUMG> provider_hit = provider_mask.fo1().fold_or();
 
-            // Compute provider weak & wrong condition for extra alt updates
-            arr<val<1>,LINEINST> prov_correct_arr = [&](u64 offset){
-                return is_branch[offset] & (provider[w][offset]==actualdirs[offset]);
-            };
-            val<1> provider_correct = prov_correct_arr.fold_or();
 
             // Provider weak check (reuse from existing logic)
             arr<val<1>,NUMG> primary_bits = primary_mask[w].make_array(val<1>{});
-            arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
-                return select(primary_bits[j], readctr_cnt[w][j], val<CTRBIT-1>{0});
-            };
-            val<CTRBIT-1> prov_ctr = prov_ctrs.fold_or();
-            arr<val<1>,LINEINST> prov_pred_arr = [&](u64 offset){
-                return is_branch[offset] & provider[w][offset];
-            };
-            val<1> provider_pred = prov_pred_arr.fold_or();
-            val<1> provider_is_weak = is_weak(provider_pred, prov_ctr);
-            val<1> provider_wrong = ~provider_correct;
+
+
 
             // All alt hits (not just match_alt which is one-hot)
             arr<val<NUMG>,LINEINST> alt_mask = [&](u64 offset){
@@ -1179,21 +1169,29 @@ struct my_bp : predictor {
             };
             val<NUMG> alt_hits = alt_mask.fo1().fold_or();
 
-            // Extra alt update condition: provider weak & wrong
-            val<1> base_cond = provider_is_weak & provider_wrong;
-            // val<NUMG> extra_alt_update = select(extra_alt_cond, alt_hits, val<NUMG>{0});
-
             arr<val<1>,NUMG> hc_used_bits = hc_used.make_array(val<1>{});
             arr<val<1>,NUMG> prov_hit_bits = provider_hit.make_array(val<1>{});
             arr<val<1>,NUMG> extra_alt_bits = alt_hits.make_array(val<1>{});
 
-            // Compute provider_correct and alt_wrong for ubit update
-            arr<val<1>,LINEINST> alt_wrong_arr = [&](u64 offset){
-                return is_branch[offset] & (select(alt_hits!=val<NUMG>{0},alt[w][offset]!=actualdirs[offset], readb[offset] != actualdirs[offset]));
-            };
-            val<1> alt_wrong = alt_wrong_arr.fold_or();
-
             for (u64 j=0; j<NUMG; j++) {
+
+                arr<val<1>,LINEINST> prov_correct_arr = [&](u64 offset){
+                    val<1> j_hit = match_provider[w][offset].make_array(val<1>{})[j];
+                    return is_branch[offset] & j_hit & (provider[w][offset] == actualdirs[offset]);
+                };
+                //which offset weak in this table
+                arr<val<1>,LINEINST> prov_weak_arr = [&](u64 offset){
+                    val<1> j_hit = match_provider[w][offset].make_array(val<1>{})[j];
+                    return is_branch[offset] & j_hit & is_weak(provider[w][offset], readctr_cnt[w][j]);
+                };
+                arr<val<1>,LINEINST> alt_wrong_arr = [&](u64 offset){
+                    val<1> j_hit = match_alt[w][offset].make_array(val<1>{})[j];
+                    return is_branch[offset] & select(j_hit, (alt[w][offset] != actualdirs[offset]),readb[offset] != actualdirs[offset]);
+                };
+                val<1> prov_correct = prov_correct_arr.fo1().fold_or();
+                val<1> prov_weak    = prov_weak_arr.fo1().fold_or();
+                val<1> base_cond    = prov_weak & ~prov_correct;
+                val<1> alt_wrong    = alt_wrong_arr.fo1().fold_or();
                 // Update conditions:
                 // - HCpred used this table
                 // - Provider hit (always update longest match)
@@ -1236,7 +1234,7 @@ struct my_bp : predictor {
 
                 // UBIT: alloc -> 0, provider right & alt wrong -> +1
                 val<1> has_provider = primary_bits[j];
-                val<1> inc_useful = has_provider & provider_correct & alt_wrong;
+                val<1> inc_useful = has_provider & prov_correct & alt_wrong;
 
                 val<UBIT> new_u = select(cur_u == hard<cur_u.maxval>{}, cur_u, val<UBIT>{cur_u + 1});
                 val<UBIT> final_u = select(do_alloc, val<UBIT>{0}, new_u);
