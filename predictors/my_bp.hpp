@@ -7,11 +7,9 @@
 #include <vector>
 #include <array>
 #include <algorithm>
-#include <fstream>
-#include <sstream>
 #include <string>
+#include <sqlite3.h>
 #define USE_ALT_PRED
-#define RESET_UBITS
 #define HASH_TAG
 #include "../cbp.hpp"
 #include "../harcom.hpp"
@@ -29,7 +27,7 @@ struct my_bp : predictor {
     static_assert(NUMG>0);
     static constexpr u64 MINHIST = 4;
     static constexpr u64 USE_ALT_PRED_BITS = 4;
-    static constexpr u64 UCTRBITS = 8;
+    static constexpr u64 UCTRBITS = 4;
     static constexpr u64 PATHBITS = 11;
 
     static constexpr u64 LOGLINEINST = LOGLB-2;
@@ -97,9 +95,9 @@ struct my_bp : predictor {
     reg<USE_ALT_PRED_BITS> use_alt_on_na;
 
 
-#ifdef RESET_UBITS
+
     reg<UCTRBITS> uctr;
-#endif
+
 
 #ifdef PERF_COUNTERS
     // Performance counters (CHEATING_MODE only)
@@ -139,65 +137,133 @@ struct my_bp : predictor {
     u64 perf_useful_inc= 0;
     u64 perf_useful_reset= 0;
 
-    // Misprediction trace: per-PC record (for top-20 stderr summary)
-    struct MispredRecord {
-        u64 count = 0;
-        u64 actual_dir = 0;
-        u64 hit = 0;
-        u64 hit_table = 0;
-        u64 hit_gtag = 0;
-        u64 hit_gindex = 0;
-    };
-    std::unordered_map<u64, MispredRecord> mispred_db;
 
-    // Branch execution flow trace (one entry per branch execution)
-    struct ExecRecord {
-        u64 cycle = 0;        // simulation cycle
-        u64 pc = 0;
-        u64 offset = 0;       // instruction offset within block (bits [LOGLB-1:2] of PC)
-        u64 actual_dir = 0;
-        u64 predicted_dir = 0;
-        u64 mispredict = 0;
-        // prediction source: 0=bimodal, 1=tage_provider, 2=tage_alt
-        u64 pred_source = 0;
-        u64 pred_table = NUMG; // which TAGE table gave the prediction (NUMG=bimodal)
-        u64 bim_index = 0;    // bimodal table index (bindex) for this branch
-        u64 hit = 0;          // provider hit?
-        u64 hit_table = 0;    // provider table index
-        u64 hit_gtag = 0;     // provider tag
-        u64 hit_gindex = 0;   // provider gindex
-        // alloc event (on mispredict)
-        u64 alloc = 0;        // was an entry allocated?
-        u64 alloc_table = 0;  // which table
-        u64 alloc_gindex = 0; // which index
-        u64 alloc_tag = 0;    // tag written
-    };
-    std::vector<ExecRecord> exec_trace;
+    // SQLite streaming trace (no in-memory vectors)
+    sqlite3      *trace_db   = nullptr;
+    sqlite3_stmt *exec_stmt  = nullptr;  // INSERT into exec_trace
+    sqlite3_stmt *bim_stmt   = nullptr;  // INSERT into bim_update_trace
+    u64           trace_seq  = 0;        // global sequence counter
 
-    // Bimodal update trace (independent of mispred trace)
-    struct BimUpdateRecord {
-        u64 seq = 0;          // global sequence number
-        u64 cycle = 0;        // simulation cycle
-        u64 pc = 0;
-        u64 offset = 0;       // instruction offset within block
-        u64 bim_index = 0;    // bindex
-        u64 old_pred = 0;     // bim_hi before update
-        u64 old_hyst = 0;     // bim_low before update
-        u64 actual_dir = 0;   // branch actual direction
-        u64 new_pred = 0;     // bim_hi after update (1=written, else unchanged)
-        u64 new_hyst = 0;     // bim_low after update
-        u64 pred_written = 0; // was bim_hi actually written?
-        u64 hyst_written = 0; // was bim_low actually written?
-        // why update triggered
-        u64 no_hit = 0;           // condition 1: no TAGE hit
-        u64 cond_extra_bim = 0;   // condition 2: hc_is_bim & prov_weak_wrong
-        u64 hc_is_bim = 0;        // HCpred fell back to bimodal
-        u64 prov_weak_wrong = 0;  // provider was weak and wrong
-        u64 prov_pred = 0;        // provider prediction (if any)
-        u64 prov_ctr = 0;         // provider CTR lower bits (if any)
-    };
-    std::vector<BimUpdateRecord> bim_update_trace;
-    u64 bim_trace_seq = 0; // global sequence counter shared with exec_trace
+    void db_exec(const char *sql) {
+        char *errmsg = nullptr;
+        if (sqlite3_exec(trace_db, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+            std::cerr << "SQLite error: " << errmsg << "\n";
+            sqlite3_free(errmsg);
+        }
+    }
+
+    void open_trace_db() {
+        if (sqlite3_open("trace.db", &trace_db) != SQLITE_OK) {
+            std::cerr << "Cannot open trace.db: " << sqlite3_errmsg(trace_db) << "\n";
+            return;
+        }
+        db_exec("PRAGMA journal_mode=WAL;");
+        db_exec("PRAGMA synchronous=NORMAL;");
+        db_exec(
+            "CREATE TABLE IF NOT EXISTS exec_trace ("
+            " seq INTEGER PRIMARY KEY,"
+            " cycle INTEGER, pc INTEGER, offset INTEGER,"
+            " actual_dir INTEGER, predicted_dir INTEGER, mispredict INTEGER,"
+            " pred_source TEXT, pred_table INTEGER, bim_index INTEGER,"
+            " hit INTEGER, hit_table INTEGER, hit_gtag INTEGER, hit_gindex INTEGER,"
+            " alloc INTEGER, alloc_table INTEGER, alloc_gindex INTEGER, alloc_tag INTEGER"
+            ");"
+        );
+        db_exec(
+            "CREATE TABLE IF NOT EXISTS bim_update_trace ("
+            " seq INTEGER PRIMARY KEY,"
+            " cycle INTEGER, pc INTEGER, offset INTEGER, bim_index INTEGER,"
+            " old_pred INTEGER, old_hyst INTEGER, actual_dir INTEGER,"
+            " pred_written INTEGER, new_pred INTEGER,"
+            " hyst_written INTEGER, new_hyst INTEGER,"
+            " no_hit INTEGER, cond_extra_bim INTEGER,"
+            " hc_is_bim INTEGER, prov_weak_wrong INTEGER,"
+            " prov_pred INTEGER, prov_ctr INTEGER"
+            ");"
+        );
+        db_exec("BEGIN;");
+
+        sqlite3_prepare_v2(trace_db,
+            "INSERT INTO exec_trace VALUES"
+            "(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18);",
+            -1, &exec_stmt, nullptr);
+        sqlite3_prepare_v2(trace_db,
+            "INSERT INTO bim_update_trace VALUES"
+            "(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18);",
+            -1, &bim_stmt, nullptr);
+    }
+
+    void close_trace_db() {
+        if (!trace_db) return;
+        db_exec("COMMIT;");
+        // Create useful indexes for queries
+        db_exec("CREATE INDEX IF NOT EXISTS idx_exec_pc         ON exec_trace(pc);");
+        db_exec("CREATE INDEX IF NOT EXISTS idx_exec_mispredict ON exec_trace(mispredict);");
+        db_exec("CREATE INDEX IF NOT EXISTS idx_exec_alloc      ON exec_trace(alloc);");
+        db_exec("CREATE INDEX IF NOT EXISTS idx_bim_pc          ON bim_update_trace(pc);");
+        sqlite3_finalize(exec_stmt);  exec_stmt = nullptr;
+        sqlite3_finalize(bim_stmt);   bim_stmt  = nullptr;
+        sqlite3_close(trace_db);      trace_db  = nullptr;
+        std::cerr << "Trace written to trace.db\n";
+    }
+
+    // Insert one exec_trace row directly (no buffering)
+    void insert_exec(u64 cycle, u64 pc, u64 offset,
+                     u64 actual_dir, u64 predicted_dir, u64 mispredict,
+                     const char *pred_source, u64 pred_table, u64 bim_index,
+                     u64 hit, u64 hit_table, u64 hit_gtag, u64 hit_gindex,
+                     u64 alloc, u64 alloc_table, u64 alloc_gindex, u64 alloc_tag) {
+        sqlite3_reset(exec_stmt);
+        sqlite3_bind_int64(exec_stmt,  1, (sqlite3_int64)trace_seq++);
+        sqlite3_bind_int64(exec_stmt,  2, (sqlite3_int64)cycle);
+        sqlite3_bind_int64(exec_stmt,  3, (sqlite3_int64)pc);
+        sqlite3_bind_int64(exec_stmt,  4, (sqlite3_int64)offset);
+        sqlite3_bind_int64(exec_stmt,  5, (sqlite3_int64)actual_dir);
+        sqlite3_bind_int64(exec_stmt,  6, (sqlite3_int64)predicted_dir);
+        sqlite3_bind_int64(exec_stmt,  7, (sqlite3_int64)mispredict);
+        sqlite3_bind_text (exec_stmt,  8, pred_source, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(exec_stmt,  9, (sqlite3_int64)pred_table);
+        sqlite3_bind_int64(exec_stmt, 10, (sqlite3_int64)bim_index);
+        sqlite3_bind_int64(exec_stmt, 11, (sqlite3_int64)hit);
+        sqlite3_bind_int64(exec_stmt, 12, (sqlite3_int64)hit_table);
+        sqlite3_bind_int64(exec_stmt, 13, (sqlite3_int64)hit_gtag);
+        sqlite3_bind_int64(exec_stmt, 14, (sqlite3_int64)hit_gindex);
+        sqlite3_bind_int64(exec_stmt, 15, (sqlite3_int64)alloc);
+        sqlite3_bind_int64(exec_stmt, 16, (sqlite3_int64)alloc_table);
+        sqlite3_bind_int64(exec_stmt, 17, (sqlite3_int64)alloc_gindex);
+        sqlite3_bind_int64(exec_stmt, 18, (sqlite3_int64)alloc_tag);
+        sqlite3_step(exec_stmt);
+    }
+
+    // Insert one bim_update_trace row directly (no buffering)
+    void insert_bim(u64 cycle, u64 pc, u64 offset, u64 bim_index,
+                    u64 old_pred, u64 old_hyst, u64 actual_dir,
+                    u64 pred_written, u64 new_pred,
+                    u64 hyst_written, u64 new_hyst,
+                    u64 no_hit, u64 cond_extra_bim,
+                    u64 hc_is_bim, u64 prov_weak_wrong,
+                    u64 prov_pred, u64 prov_ctr) {
+        sqlite3_reset(bim_stmt);
+        sqlite3_bind_int64(bim_stmt,  1, (sqlite3_int64)trace_seq++);
+        sqlite3_bind_int64(bim_stmt,  2, (sqlite3_int64)cycle);
+        sqlite3_bind_int64(bim_stmt,  3, (sqlite3_int64)pc);
+        sqlite3_bind_int64(bim_stmt,  4, (sqlite3_int64)offset);
+        sqlite3_bind_int64(bim_stmt,  5, (sqlite3_int64)bim_index);
+        sqlite3_bind_int64(bim_stmt,  6, (sqlite3_int64)old_pred);
+        sqlite3_bind_int64(bim_stmt,  7, (sqlite3_int64)old_hyst);
+        sqlite3_bind_int64(bim_stmt,  8, (sqlite3_int64)actual_dir);
+        sqlite3_bind_int64(bim_stmt,  9, (sqlite3_int64)pred_written);
+        sqlite3_bind_int64(bim_stmt, 10, (sqlite3_int64)new_pred);
+        sqlite3_bind_int64(bim_stmt, 11, (sqlite3_int64)hyst_written);
+        sqlite3_bind_int64(bim_stmt, 12, (sqlite3_int64)new_hyst);
+        sqlite3_bind_int64(bim_stmt, 13, (sqlite3_int64)no_hit);
+        sqlite3_bind_int64(bim_stmt, 14, (sqlite3_int64)cond_extra_bim);
+        sqlite3_bind_int64(bim_stmt, 15, (sqlite3_int64)hc_is_bim);
+        sqlite3_bind_int64(bim_stmt, 16, (sqlite3_int64)prov_weak_wrong);
+        sqlite3_bind_int64(bim_stmt, 17, (sqlite3_int64)prov_pred);
+        sqlite3_bind_int64(bim_stmt, 18, (sqlite3_int64)prov_ctr);
+        sqlite3_step(bim_stmt);
+    }
 
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
@@ -404,88 +470,8 @@ struct my_bp : predictor {
         }
         std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
 
-        // Write branch execution flow trace to file, top-20 mispred summary to stderr
-        {
-            std::ofstream tf("mispred_trace.csv");
-            tf << "seq,cycle,pc,offset,actual_dir,predicted_dir,mispredict,pred_source,pred_table,bim_index,hit,hit_table,hit_gtag,hit_gindex,alloc,alloc_table,alloc_gindex,alloc_tag\n";
-            for (u64 i = 0; i < exec_trace.size(); i++) {
-                auto &r = exec_trace[i];
-                std::string src_str = (r.pred_source == 0) ? "bimodal" :
-                                      (r.pred_source == 1) ? "tage_prov" : "tage_alt";
-                tf << i << ","
-                   << r.cycle << ","
-                   << "0x" << std::hex << r.pc << std::dec << ","
-                   << r.offset << ","
-                   << r.actual_dir << ","
-                   << r.predicted_dir << ","
-                   << r.mispredict << ","
-                   << src_str << ","
-                   << (r.pred_source != 0 ? std::to_string(r.pred_table) : "N/A") << ","
-                   << r.bim_index << ","
-                   << r.hit << ","
-                   << (r.hit ? std::to_string(r.hit_table) : "N/A") << ","
-                   << (r.hit ? ("0x" + [&]{ std::ostringstream s; s << std::hex << r.hit_gtag; return s.str(); }()) : "N/A") << ","
-                   << (r.hit ? std::to_string(r.hit_gindex) : "N/A") << ","
-                   << r.alloc << ","
-                   << (r.alloc ? std::to_string(r.alloc_table) : "N/A") << ","
-                   << (r.alloc ? std::to_string(r.alloc_gindex) : "N/A") << ","
-                   << (r.alloc ? ("0x" + [&]{ std::ostringstream s; s << std::hex << r.alloc_tag; return s.str(); }()) : "N/A") << "\n";
-            }
-
-            // Write bimodal update trace to separate file
-            {
-                std::ofstream bf("bim_update_trace.csv");
-                bf << "seq,cycle,pc,offset,bim_index,old_pred,old_hyst,actual_dir,pred_written,new_pred,hyst_written,new_hyst,no_hit,cond_extra_bim,hc_is_bim,prov_weak_wrong,prov_pred,prov_ctr\n";
-                for (auto &b : bim_update_trace) {
-                    bf << b.seq << ","
-                       << b.cycle << ","
-                       << "0x" << std::hex << b.pc << std::dec << ","
-                       << b.offset << ","
-                       << b.bim_index << ","
-                       << b.old_pred << ","
-                       << b.old_hyst << ","
-                       << b.actual_dir << ","
-                       << b.pred_written << ","
-                       << b.new_pred << ","
-                       << b.hyst_written << ","
-                       << b.new_hyst << ","
-                       << b.no_hit << ","
-                       << b.cond_extra_bim << ","
-                       << b.hc_is_bim << ","
-                       << b.prov_weak_wrong << ","
-                       << b.prov_pred << ","
-                       << b.prov_ctr << "\n";
-                }
-            }
-
-            // top-20 mispred summary (stderr unchanged)
-            std::vector<std::pair<u64,MispredRecord>> sorted_db(mispred_db.begin(), mispred_db.end());
-            std::sort(sorted_db.begin(), sorted_db.end(),
-                [](const auto &a, const auto &b){ return a.second.count > b.second.count; });
-
-            // Top-20 summary to stderr
-            std::cerr << "\n┌─ Top 20 Most Mispredicted PCs (full trace -> mispred_trace.csv) ─────────────────────────┐\n";
-            std::cerr << "│ Rank │       PC       │ Mispreds │ Dir │ Hit │ Tbl │    GTTag     │  GIndex  │\n";
-            std::cerr << "├──────┼────────────────┼──────────┼─────┼─────┼─────┼──────────────┼──────────┤\n";
-            u64 rank = 0;
-            for (auto &[pc, rec] : sorted_db) {
-                if (rank >= 20) break;
-                std::cerr << "│ " << std::setw(4) << std::right << (rank+1) << " │ ";
-                std::cerr << "0x" << std::hex << std::setw(12) << std::setfill('0') << pc << std::dec << std::setfill(' ') << " │ ";
-                std::cerr << std::setw(8) << rec.count << " │ ";
-                std::cerr << std::setw(3) << rec.actual_dir << " │ ";
-                std::cerr << std::setw(3) << rec.hit << " │ ";
-                if (rec.hit) {
-                    std::cerr << std::setw(3) << rec.hit_table << " │ ";
-                    std::cerr << "0x" << std::hex << std::setw(10) << std::setfill('0') << rec.hit_gtag << std::dec << std::setfill(' ') << " │ ";
-                    std::cerr << std::setw(8) << rec.hit_gindex << " │\n";
-                } else {
-                    std::cerr << "N/A │          N/A │      N/A │\n";
-                }
-                rank++;
-            }
-            std::cerr << "└──────┴────────────────┴──────────┴─────┴─────┴─────┴──────────────┴──────────┘\n";
-        }
+        // Commit and close the SQLite trace database
+        close_trace_db();
 
         std::cerr << "\n";
     }
@@ -534,6 +520,11 @@ struct my_bp : predictor {
         std::cerr << std::endl;
         std::cerr << "Total storage: " << total_bits << " bits (" << (total_bits / 8192.0) << " KB)" << std::endl;
 #endif
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        open_trace_db();
+#endif
+#endif
     }
 
 
@@ -541,7 +532,7 @@ struct my_bp : predictor {
     {
         val<LOGLINEINST> offset = inst_pc.fo1() >> 2;
         inst_oh = offset.fo1().decode().concat();
-        inst_oh.fanout(hard<6*LINEINST>{});
+        inst_oh.fanout(hard<6*LINEINST+1>{});
         block_size = 1;
     }
 
@@ -552,14 +543,13 @@ struct my_bp : predictor {
         // val<std::max(P1INDEXBITS+BANKBITS,GHIST1)> lineaddr = inst_pc >> (LOGLB);
         // val<BANKBITS> bankid = inst_pc >> (LOGLB);
         val<index1_bits> raw_index = inst_pc >> (LOGLB);
-
-        
+        raw_index.fanout(hard<2>{});
         if constexpr (GHIST1 <= index1_bits) {
             index1 = raw_index ^ (val<index1_bits>{path_history}<<(index1_bits-GHIST1));
         } else {
             index1 = path_history.make_array(val<index1_bits>{}).append(raw_index).fold_xor();
         }
-        index1.fanout(hard<LINEINST>{});
+        index1.fanout(hard<LINEINST+1>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
             readp1[offset] = table1_pred[offset].read(index1);
         }
@@ -580,8 +570,8 @@ struct my_bp : predictor {
 
     val<1> predict2(val<64> inst_pc)
     {
-        val<HTAGBITS>   raw_tag = inst_pc >> (2+LOGG);
-        val<LOGG>       raw_gindex = inst_pc >> 2;
+        val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB+LOGG);
+        val<LOGG>       raw_gindex = inst_pc >> LOGLB;
 
         val<bindex_bits> raw_bindex = inst_pc >> (LOGLB);
 
@@ -709,7 +699,7 @@ struct my_bp : predictor {
                 val<1> prov_is_weak = is_weak(provider[w][inst], prov_ctr) & 
                 (match_provider[w][inst] & (notumask.fold_or()!=val<NUMG>{0}));
                 prov_is_weak.fanout(hard<2>{});
-#ifdef USE_ALT_PRED
+#ifndef SC
                 use_provider[w][inst] = prov_oh.fold_or() &
                 select(alt_oh.fo1().fold_or(),(~prov_is_weak | ~use_alt_on_na_pos_dup[inst]),val<1>{1});
 #else
@@ -737,7 +727,6 @@ struct my_bp : predictor {
 
                 val<1> use_hcpred = ~use_provider_hc & has_hc_alt.fo1();
                 use_hcpred.fanout(hard<2>{});
-#ifdef USE_ALT_PRED
                 // Final HCpred value and source
                 val<1> hc_val = select(use_provider_hc, provider[w][inst],
                                 select(use_hcpred,     hc_alt_pred_val.fo1(),readb[inst]));
@@ -747,24 +736,16 @@ struct my_bp : predictor {
                 val<2> hc_type = select(use_provider_hc, val<2>{1},   // provider
                                  select(use_hcpred,       val<2>{2},   // alternate
                                                            val<2>{0})); // bimodal
-#else
-                       // Final HCpred value and source
-                val<1> hc_val = select(prov_oh.fold_or(), provider[w][inst],
-                                readb[inst]);
-                val<NUMG> hc_src = select(prov_oh.fold_or(), val<NUMG>{match_provider[w][inst]},
-                                   val<NUMG>{0});         
-                val<2> hc_type = select(prov_oh.fold_or(), val<2>{1},   // provider
-                                                           val<2>{0}); // bimodal
-#endif
                 hc_pred_val[w][inst]    = hc_val.fo1();
                 hc_pred_source[w][inst] = hc_src.fo1();
 
                 hc_pred_type[w][inst] = hc_type;
             }
         }
-        // hc_pred_val is used once in p2 computation - no fanout needed (FO=1)
 
         // p2 now uses HCpred: strongest non-weak entry (provider > longest non-weak alt > bimodal)
+#ifndef SC
+        // timing is bad (If tage is 3 cycle,this may be used)
         p2 = arr<val<1>,LINEINST>{[&](u64 offset){
             arr<val<1>,NUMWAYS> pred_use_tage = [&](u64 w){
                 return hc_pred_source[w][offset] != val<NUMG>{0};
@@ -772,10 +753,20 @@ struct my_bp : predictor {
             arr<val<1>,NUMWAYS> final_pred = [&](u64 w){
                 return select(pred_use_tage[w], val<1>{hc_pred_val[w][offset]}, val<1>{0});
             };
-            return final_pred.fo1().fold_or();
+            return select(pred_use_tage.fold_or(), final_pred.fo1().fold_or(), hc_pred_val[0][offset]);
+        }}.concat();
+#else
+        p2 = arr<val<1>,LINEINST>{[&](u64 offset){
+            arr<val<1>,NUMWAYS> pred_use_tage = [&](u64 w){
+                return match_provider[w][offset] != val<NUMG>{0};
+            };
+            arr<val<1>,NUMWAYS> final_pred = [&](u64 w){
+                return select(pred_use_tage[w], val<1>{provider[w][offset]}, val<1>{0});
+            };
+            return select(pred_use_tage.fold_or(), final_pred.fo1().fold_or(), readb[offset]);
         }}.concat();
 
-
+#endif
 
         p2.fanout(hard<LINEINST>{});
         val<1> taken = (inst_oh & p2) != hard<0>{};
@@ -844,7 +835,7 @@ struct my_bp : predictor {
 
 
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
-        last_offset.fanout(hard<4*NUMG+2>{});
+        last_offset.fanout(hard<2*NUMG*NUMWAYS>{});
 
         u64 update_valid = (u64(1)<<num_branch)-1;
         arr<val<LINEINST>,LINEINST> update_mask = [&](u64 offset){
@@ -1033,28 +1024,21 @@ struct my_bp : predictor {
                         break;
                     }
                 }
-                BimUpdateRecord br;
-                br.seq            = bim_trace_seq++;
-                br.cycle          = static_cast<u64>(panel.cycle);
-                br.pc             = pc_for_offset;
-                br.offset         = offset;
-                br.bim_index      = static_cast<u64>(bindex);
-                br.old_pred       = static_cast<u64>(bim_pred);
-                br.old_hyst       = static_cast<u64>(curr_hyst);
-                br.actual_dir     = dir_for_offset;
-                br.hyst_written   = 1;
+                // Compute bim update outcome before inserting
                 u64 dir_match_val = (static_cast<u64>(bim_pred) == dir_for_offset) ? 1 : 0;
-                br.new_hyst       = dir_match_val;
                 u64 pred_need_val = (static_cast<u64>(curr_hyst) == 0) && !dir_match_val ? 1 : 0;
-                br.pred_written   = pred_need_val;
-                br.new_pred       = pred_need_val ? dir_for_offset : static_cast<u64>(bim_pred);
-                br.no_hit         = no_hit_val;
-                br.cond_extra_bim = hc_is_bim_val & prov_weak_wrong_val;
-                br.hc_is_bim      = hc_is_bim_val;
-                br.prov_weak_wrong = prov_weak_wrong_val;
-                br.prov_pred      = prov_pred_val;
-                br.prov_ctr       = prov_ctr_val;
-                bim_update_trace.push_back(br);
+                // Stream directly into SQLite
+                insert_bim(
+                    static_cast<u64>(panel.cycle), pc_for_offset, offset,
+                    static_cast<u64>(bindex),
+                    static_cast<u64>(bim_pred), static_cast<u64>(curr_hyst),
+                    dir_for_offset,
+                    pred_need_val, pred_need_val ? dir_for_offset : static_cast<u64>(bim_pred),
+                    1, dir_match_val,
+                    no_hit_val, hc_is_bim_val & prov_weak_wrong_val,
+                    hc_is_bim_val, prov_weak_wrong_val,
+                    prov_pred_val, prov_ctr_val
+                );
                 
             }
 #endif
@@ -1085,7 +1069,7 @@ struct my_bp : predictor {
             val<1> has = last_prov_mask != hard<0>{};
 
             arr<val<1>,LINEINST> used_for_last = [&](u64 offset){
-                return (branch_offset[num_branch-1] == offset) & use_provider[w][offset];
+                return (branch_offset[num_branch-1] == offset) & use_provider[w][offset].fo1();
             };
             val<1> used = used_for_last.fo1().fold_or();
 
@@ -1108,7 +1092,6 @@ struct my_bp : predictor {
 
 
 
-#ifdef RESET_UBITS
         // ==================== TAGE UBIT Reset Counter ====================
         // Increment uctr and check if reset is needed
         val<UCTRBITS> uctr_threshold = val<UCTRBITS>{1 << (UCTRBITS - 1)};
@@ -1117,7 +1100,6 @@ struct my_bp : predictor {
         // Update uctr: increment normally, reset to 0 when threshold reached
         uctr = select(should_reset, val<UCTRBITS>{0}, select(alloc_fail,val<UCTRBITS>{uctr + 1}, uctr));
         should_reset.fanout(hard<NUMWAYS*NUMG>{});
-#endif
 
 
         val<NUMG> collamask = candallocmask.reverse();
@@ -1257,18 +1239,12 @@ struct my_bp : predictor {
                 });
 
                 // UBIT write when allocated or incremented
-#ifdef RESET_UBITS
                 // When reset is triggered, write 0 to all u-bits; otherwise write normal value
                 val<UBIT> ubit_value = select(should_reset, val<UBIT>{0}, final_u);
-                // execute_if(should_reset,[&](){ubit[w][j].reset();});
+                execute_if(should_reset,[&](){ubit[w][j].reset();});
                 execute_if(do_alloc | inc_useful | should_reset, [&](){
                     ubit[w][j].write(gindex[j], ubit_value, extra_cycle);
                 });
-#else
-                execute_if(do_alloc | inc_useful, [&](){
-                    ubit[w][j].write(gindex[j], final_u, extra_cycle);
-                });
-#endif
             }
         }
 
@@ -1421,36 +1397,19 @@ struct my_bp : predictor {
 
             // alloc only applies to the last branch (the mispredicted one)
             u64 is_last = (i == num_branch - 1);
-            ExecRecord er;
-            er.cycle         = static_cast<u64>(panel.cycle);
-            er.pc            = pc_val;
-            er.offset        = idx; // instruction offset within block
-            er.actual_dir    = dir_val;
-            er.predicted_dir = pred_val;
-            er.mispredict    = is_misp & is_last;
-            er.pred_source   = pred_source;
-            er.pred_table    = pred_table;
-            er.bim_index     = static_cast<u64>(bindex); // bindex is block-level, same for all offsets
-            er.hit           = hit_found;
-            er.hit_table     = hit_table;
-            er.hit_gtag      = hit_gtag;
-            er.hit_gindex    = hit_gindex;
-            er.alloc         = is_misp & is_last & alloc_found;
-            er.alloc_table   = alloc_table;
-            er.alloc_gindex  = alloc_gindex;
-            er.alloc_tag     = alloc_tag;
-            exec_trace.push_back(er);
-
-            // update mispred_db for top-20 summary
-            if (is_misp && is_last) {
-                auto &rec = mispred_db[pc_val];
-                rec.count++;
-                rec.actual_dir  = dir_val;
-                rec.hit         = hit_found;
-                rec.hit_table   = hit_table;
-                rec.hit_gtag    = hit_gtag;
-                rec.hit_gindex  = hit_gindex;
-            }
+            // Stream directly into SQLite (no in-memory buffer)
+            const char *src_str = (pred_source == 0) ? "bimodal"
+                                : (pred_source == 1) ? "tage_prov" : "tage_alt";
+            insert_exec(
+                static_cast<u64>(panel.cycle), pc_val, idx,
+                dir_val, pred_val,
+                (u64)(is_misp & is_last),
+                src_str, pred_table,
+                static_cast<u64>(bindex),
+                hit_found, hit_table, hit_gtag, hit_gindex,
+                (u64)(is_misp & is_last & alloc_found),
+                alloc_table, alloc_gindex, alloc_tag
+            );
         }
     }
         perf_tage_skip_alloc_total += static_cast<u64>(skip_alloc);
@@ -1550,10 +1509,10 @@ struct my_bp : predictor {
 
                 // Check which source was used in this way
                 val<1> prov_hit = (val<NUMG>{match_provider[w][offset]} != hard<0>{});
-                val<1> alt_hit = (val<NUMG>{match_alt[w][offset]} != hard<0>{});
+                val<1> hc_src_hit = (val<NUMG>{hc_pred_source[w][offset]} != hard<0>{});
 
                 val<1> is_prov = (hc_t == val<2>{1}) & prov_hit;
-                val<1> is_alt = (hc_t == val<2>{2}) & alt_hit;
+                val<1> is_alt = (hc_t == val<2>{2}) & hc_src_hit;
 
                 // Check if prediction was correct
                 val<1> hc_correct = val<1>{hc_pred_val[w][offset]} == actualdirs[offset];
