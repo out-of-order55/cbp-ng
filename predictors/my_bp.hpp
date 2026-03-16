@@ -141,6 +141,22 @@ struct my_bp : predictor {
     u64 perf_useful_inc= 0;
     u64 perf_useful_reset= 0;
 
+    // Update condition counters for pred, hyst, uctr
+    u64 perf_gpred_update_prov_weak_wrong[NUMWAYS][NUMG] = {};
+    u64 perf_gpred_update_hc_weak_wrong[NUMWAYS][NUMG] = {};
+    u64 perf_gpred_update_alt_weak_wrong[NUMWAYS][NUMG] = {};
+    u64 perf_gpred_update_alloc[NUMWAYS][NUMG] = {};
+    u64 perf_ghyst_update_prov_hit[NUMWAYS][NUMG] = {};
+    u64 perf_ghyst_update_hc_used[NUMWAYS][NUMG] = {};
+    u64 perf_ghyst_update_alt_hit[NUMWAYS][NUMG] = {};
+    u64 perf_ghyst_update_alloc[NUMWAYS][NUMG] = {};
+    u64 perf_uctr_update_inc[NUMWAYS][NUMG] = {};
+    u64 perf_uctr_update_alloc[NUMWAYS][NUMG] = {};
+    u64 perf_uctr_update_reset[NUMWAYS][NUMG] = {};
+    u64 perf_bim_pred_update_weak_wrong = 0;
+    u64 perf_bim_hyst_update_total = 0;
+    u64 perf_p1_pred_update_disagree_weak = 0;
+    u64 perf_p1_hyst_update_total = 0;
 
     // SQLite streaming trace (no in-memory vectors)
     sqlite3      *trace_db   = nullptr;
@@ -473,6 +489,66 @@ struct my_bp : predictor {
             std::cerr << "    N/A │     N/A │\n";
         }
         std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
+
+        // Update Condition Statistics
+        std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
+        std::cerr << "║           UPDATE CONDITION BREAKDOWN STATISTICS                 ║\n";
+        std::cerr << "╚════════════════════════════════════════════════════════════════╝\n";
+
+        for (u64 w=0; w<NUMWAYS; w++) {
+            std::cerr << "\n┌─ TAGE Way " << w << " Update Conditions ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+            std::cerr << "│ Tbl │ HistLen │ Pred Updates                                    │ Hyst Updates                                    │ Uctr Updates                    │\n";
+            std::cerr << "│     │         │ ProvWW │ HcWW │ AltWW │ Alloc │ Total │ HystUpd │ ProvHit │ HcUse │ AltHit │ Alloc │ Total │ Inc │ Alloc │ Reset │ Total │\n";
+            std::cerr << "├─────┼─────────┼────────┼──────┼───────┼───────┼───────┼─────────┼─────────┼───────┼────────┼───────┼───────┼─────┼───────┼───────┼───────┤\n";
+
+            for (u64 j=0; j<NUMG; j++) {
+                u64 pred_prov_ww = perf_gpred_update_prov_weak_wrong[w][j];
+                u64 pred_hc_ww = perf_gpred_update_hc_weak_wrong[w][j];
+                u64 pred_alt_ww = perf_gpred_update_alt_weak_wrong[w][j];
+                u64 pred_alloc = perf_gpred_update_alloc[w][j];
+                u64 pred_total = pred_prov_ww + pred_hc_ww + pred_alt_ww + pred_alloc;
+
+                u64 hyst_prov = perf_ghyst_update_prov_hit[w][j];
+                u64 hyst_hc = perf_ghyst_update_hc_used[w][j];
+                u64 hyst_alt = perf_ghyst_update_alt_hit[w][j];
+                u64 hyst_alloc = perf_ghyst_update_alloc[w][j];
+                u64 hyst_total = hyst_prov + hyst_hc + hyst_alt + hyst_alloc;
+
+                u64 uctr_inc = perf_uctr_update_inc[w][j];
+                u64 uctr_alloc = perf_uctr_update_alloc[w][j];
+                u64 uctr_reset = perf_uctr_update_reset[w][j];
+                u64 uctr_total = uctr_inc + uctr_alloc + uctr_reset;
+
+                std::cerr << "│ " << std::setw(3) << std::left << j << " │ ";
+                std::cerr << std::setw(7) << std::right << gfolds.HLEN[j] << " │ ";
+                std::cerr << std::setw(6) << std::right << pred_prov_ww << " │ ";
+                std::cerr << std::setw(4) << std::right << pred_hc_ww << " │ ";
+                std::cerr << std::setw(5) << std::right << pred_alt_ww << " │ ";
+                std::cerr << std::setw(5) << std::right << pred_alloc << " │ ";
+                std::cerr << std::setw(5) << std::right << pred_total << " │ ";
+                std::cerr << std::setw(7) << std::right << hyst_total << " │ ";
+                std::cerr << std::setw(7) << std::right << hyst_prov << " │ ";
+                std::cerr << std::setw(5) << std::right << hyst_hc << " │ ";
+                std::cerr << std::setw(6) << std::right << hyst_alt << " │ ";
+                std::cerr << std::setw(5) << std::right << hyst_alloc << " │ ";
+                std::cerr << std::setw(5) << std::right << hyst_total << " │ ";
+                std::cerr << std::setw(3) << std::right << uctr_inc << " │ ";
+                std::cerr << std::setw(5) << std::right << uctr_alloc << " │ ";
+                std::cerr << std::setw(5) << std::right << uctr_reset << " │ ";
+                std::cerr << std::setw(5) << std::right << uctr_total << " │\n";
+            }
+            std::cerr << "└─────┴─────────┴────────┴──────┴───────┴───────┴───────┴─────────┴─────────┴───────┴────────┴───────┴───────┴─────┴───────┴───────┴───────┘\n";
+        }
+
+        std::cerr << "\n┌─ Bimodal Update Conditions ─────────────────────────────────────┐\n";
+        std::cerr << "│ Pred Updates (weak & wrong): " << std::setw(31) << std::left << perf_bim_pred_update_weak_wrong << "│\n";
+        std::cerr << "│ Hyst Updates (total):        " << std::setw(31) << std::left << perf_bim_hyst_update_total << "│\n";
+        std::cerr << "└──────────────────────────────────────────────────────────────────┘\n";
+
+        std::cerr << "\n┌─ P1 Update Conditions ──────────────────────────────────────────┐\n";
+        std::cerr << "│ Pred Updates (disagree & weak): " << std::setw(28) << std::left << perf_p1_pred_update_disagree_weak << "│\n";
+        std::cerr << "│ Hyst Updates (total):           " << std::setw(28) << std::left << perf_p1_hyst_update_total << "│\n";
+        std::cerr << "└──────────────────────────────────────────────────────────────────┘\n";
 
         // Commit and close the SQLite trace database
         close_trace_db();
@@ -982,6 +1058,14 @@ struct my_bp : predictor {
             execute_if(pred_need_update.fo1(), [&](){
                 bim_hi[offset].write(bindex, actual_dir, extra_cycle);
             });
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+            if (static_cast<bool>(is_branch[offset])) {
+                if (static_cast<bool>(bim_update_arr[offset])) perf_bim_hyst_update_total++;
+                if (static_cast<bool>(pred_need_update)) perf_bim_pred_update_weak_wrong++;
+            }
+#endif
+#endif
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
@@ -1290,7 +1374,6 @@ struct my_bp : predictor {
             arr<val<1>,NUMG> inc_dir = inc_useful[w].make_array(val<1>{});
             for (u64 j=0; j<NUMG; j++) {
                 val<1> final_gdir = select(do_alloc_arr[j],last_dir, dir_arr[j]);
-                
                 val<CTRBIT-1> correct_hyst = update_ctr(dir_arr[j],readctr_cnt[w][j]);
                 val<CTRBIT-1> final_ghyst = select(do_alloc_arr[j],val<CTRBIT-1>{0}, correct_hyst);
                 val<TAGW> final_gtag = htag[j] ^ val<HTAGBITS>{last_offset};
@@ -1308,6 +1391,25 @@ struct my_bp : predictor {
                 execute_if(do_alloc_arr[j] | inc_dir[j] | should_reset, [&](){
                     ubit[w][j].write(gindex[j], final_uctr, extra_cycle);
                 });
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+                if (static_cast<bool>(prov_gpred_need_update[w].make_array(val<1>{})[j])) perf_gpred_update_prov_weak_wrong[w][j]++;
+#ifdef UPDATEALTONWEAKMISP
+                if (static_cast<bool>(hc_gpred_need_update[w].make_array(val<1>{})[j])) perf_gpred_update_hc_weak_wrong[w][j]++;
+                if (static_cast<bool>(alt_gpred_need_update[w].make_array(val<1>{})[j])) perf_gpred_update_alt_weak_wrong[w][j]++;
+#endif
+                if (static_cast<bool>(do_alloc_arr[j])) perf_gpred_update_alloc[w][j]++;
+                if (static_cast<bool>(prov_ghyst_need_update[w].make_array(val<1>{})[j])) perf_ghyst_update_prov_hit[w][j]++;
+#ifdef UPDATEALTONWEAKMISP
+                if (static_cast<bool>(hc_ghyst_need_update[w].make_array(val<1>{})[j])) perf_ghyst_update_hc_used[w][j]++;
+                if (static_cast<bool>(alt_ghyst_need_update[w].make_array(val<1>{})[j])) perf_ghyst_update_alt_hit[w][j]++;
+#endif
+                if (static_cast<bool>(do_alloc_arr[j])) perf_ghyst_update_alloc[w][j]++;
+                if (static_cast<bool>(inc_dir[j])) perf_uctr_update_inc[w][j]++;
+                if (static_cast<bool>(do_alloc_arr[j])) perf_uctr_update_alloc[w][j]++;
+                if (static_cast<bool>(should_reset)) perf_uctr_update_reset[w][j]++;
+#endif
+#endif
             }
         }
 
@@ -1391,6 +1493,16 @@ struct my_bp : predictor {
                 table1_hyst[offset].write(index1, ~disagree[offset],extra_cycle);
             });
         }
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            if (static_cast<bool>(is_branch[offset])) {
+                if (static_cast<bool>(p1_weak[offset])) perf_p1_pred_update_disagree_weak++;
+                perf_p1_hyst_update_total++;
+            }
+        }
+#endif
+#endif
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
