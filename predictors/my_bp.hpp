@@ -10,7 +10,7 @@
 #include <string>
 #include <sqlite3.h>
 
-#define SC
+// #define SC
 #ifndef SC
 #define USE_ALT_PRED
 #endif
@@ -500,7 +500,6 @@ struct my_bp : predictor {
     rwram<TAGW,NUMGTSETS,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
     // ram<val<TAGW>,(1<<LOGG)> gtag[NUMWAYS][NUMG] {"tags"}; // tags
     //183ps
-    rwram<CTRBIT,NUMGTSETS,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
     rwram<1,NUMGTSETS,NUMBANKS> gpred[NUMWAYS][NUMG] {"gpred"};
     //
     rwram<UBIT,NUMGTSETS,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
@@ -610,11 +609,10 @@ struct my_bp : predictor {
         for (u64 w=0; w<NUMWAYS; w++) {
             for(u64 j=0; j<NUMG; j++){
                 //146ps
-                arr<val<1>,CTRBIT> ctr_val = gctr[w][j].read(gindex[j]).make_array(val<1>{});
                 readt[w][j] = gtag[w][j].read(gindex[j]);
                 readu[w][j] = ubit[w][j].read(gindex[j]);
-                readctr_pred[w][j] = ctr_val[CTRBIT-1];
-                readctr_cnt[w][j] = val<CTRBIT-1>{ctr_val.concat()};
+                readctr_pred[w][j] = gpred[w][j].read(gindex[j]);
+                readctr_cnt[w][j] = ghyst[w][j].read(gindex[j]);
             }
         }
 
@@ -703,7 +701,7 @@ struct my_bp : predictor {
                 };
                 val<CTRBIT-1> prov_ctr  = prov_ctrs.fo1().fold_or();
                 // provider & alt
-                val<1> prov_is_weak = is_weak(provider[w][inst], prov_ctr) & 
+                val<1> prov_is_weak = (prov_ctr == val<CTRBIT-1>{0}) & 
                 (match_provider[w][inst] & (notumask.fold_or()!=val<NUMG>{0}));
                 prov_is_weak.fanout(hard<2>{});
 #ifndef SC
@@ -721,7 +719,7 @@ struct my_bp : predictor {
                 val<NUMG> all_alt_hits = val<NUMG>{match[w][inst]} ^ val<NUMG>{match_provider[w][inst]};
                 arr<val<1>,NUMG> hc_alt_cand = [&](u64 j){
                     val<1> hit = all_alt_hits.make_array(val<1>{})[j];
-                    val<1> not_weak = ~is_weak(readctr_pred[w][j], readctr_cnt[w][j]);
+                    val<1> not_weak = ~(readctr_cnt[w][j] == val<CTRBIT-1>{0});
                     return hit.fo1() & not_weak.fo1();
                 };
                 hc_alt_cand.fanout(hard<2>{});
@@ -941,7 +939,7 @@ struct my_bp : predictor {
                 val<CTRBIT-1> prov_ctr = prov_ctrs.fo1().fold_or();
                 val<1> prov_pred = provider[w][offset];
                 prov_pred.fanout(hard<2>{});
-                val<1> prov_weak = is_weak(prov_pred, prov_ctr.fo1());
+                val<1> prov_weak = prov_ctr.fo1() == val<CTRBIT-1>{0};
                 val<1> prov_wrong = prov_pred != actual_dir.fo1();
                 return has_provider_arr[w] & prov_weak.fo1() & prov_wrong.fo1();
             };
@@ -1128,135 +1126,187 @@ struct my_bp : predictor {
 
         // ==================== TAGE Update ====================
         // CTR update, tag update, and ubit update
-        // All reads before extra_cycle, all writes after extra_cycle
+        val<1> last_dir = branch_dir[num_branch-1];
 
-        //one pred max 2 way
-        for (u64 w=0; w<NUMWAYS; w++) {
-            // ==================== Derive HCpred-based update masks ====================
-            // For each table j, determine if it should be updated based on:
-            // 1. It was the HCpred source (strongest non-weak entry)
-            // 2. It was the provider (longest match, always update)
-            // 3. It was an alt when provider was weak & wrong
-
-            // Aggregate HCpred source across all branches
+        arr<val<NUMG>,NUMWAYS> hc_used = [&](u64 w){
             arr<val<NUMG>,LINEINST> hc_source_mask = [&](u64 offset){
                 return select(is_branch[offset], val<NUMG>{hc_pred_source[w][offset]}, val<NUMG>{0});
             };
-            val<NUMG> hc_used = hc_source_mask.fo1().fold_or();
+            return hc_source_mask.fo1().fold_or();
+        };
 
-            // Aggregate provider (always update if hit)
+        arr<val<NUMG>,NUMWAYS> provider_hit = [&](u64 w){
             arr<val<NUMG>,LINEINST> provider_mask = [&](u64 offset){
                 return select(is_branch[offset], val<NUMG>{match_provider[w][offset]}, val<NUMG>{0});
             };
-            val<NUMG> provider_hit = provider_mask.fo1().fold_or();
+            return provider_mask.fo1().fold_or();
+        };
 
-
-            // Provider weak check (reuse from existing logic)
-            arr<val<1>,NUMG> primary_bits = primary_mask[w].make_array(val<1>{});
-
-
-
-            // All alt hits (not just match_alt which is one-hot)
+        arr<val<NUMG>,NUMWAYS> alt_hits = [&](u64 w){
             arr<val<NUMG>,LINEINST> alt_mask = [&](u64 offset){
-                
                 return select(is_branch[offset], match_alt[w][offset], val<NUMG>{0});
             };
-            val<NUMG> alt_hits = alt_mask.fo1().fold_or();
+            return alt_mask.fo1().fold_or();
+        };
 
-            arr<val<1>,NUMG> hc_used_bits = hc_used.make_array(val<1>{});
-            arr<val<1>,NUMG> prov_hit_bits = provider_hit.make_array(val<1>{});
-            arr<val<1>,NUMG> extra_alt_bits = alt_hits.make_array(val<1>{});
-
-            for (u64 j=0; j<NUMG; j++) {
-
+        arr<val<NUMG>,NUMWAYS> prov_correct = [&](u64 w){
+            arr<val<1>,NUMG> prov_correct_tmp = [&](u64 num){
                 arr<val<1>,LINEINST> prov_correct_arr = [&](u64 offset){
-                    val<1> j_hit = match_provider[w][offset].make_array(val<1>{})[j];
+                    val<1> j_hit = match_provider[w][offset].make_array(val<1>{})[num];
                     return is_branch[offset] & j_hit & (provider[w][offset] == actualdirs[offset]);
                 };
-                //which offset weak in this table
+                return prov_correct_arr.fo1().fold_or();
+            };
+            return prov_correct_tmp.fo1().concat();
+        };
+
+        arr<val<NUMG>,NUMWAYS> prov_weak = [&](u64 w){
+            arr<val<1>,NUMG> prov_weak_tmp = [&](u64 num){
                 arr<val<1>,LINEINST> prov_weak_arr = [&](u64 offset){
-                    val<1> j_hit = match_provider[w][offset].make_array(val<1>{})[j];
-                    return is_branch[offset] & j_hit & is_weak(provider[w][offset], readctr_cnt[w][j]);
+                    val<1> j_hit = match_provider[w][offset].make_array(val<1>{})[num];
+                    return is_branch[offset] & j_hit & (readctr_cnt[w][num] == val<CTRBIT-1>{0});
                 };
+                return prov_weak_arr.fo1().fold_or();
+            };
+            return prov_weak_tmp.fo1().concat();
+        };
+
+        arr<val<NUMG>,NUMWAYS> alt_wrong = [&](u64 w){
+            arr<val<1>,NUMG> alt_wrong_tmp = [&](u64 num){
                 arr<val<1>,LINEINST> alt_wrong_arr = [&](u64 offset){
-                    val<1> j_hit = match_alt[w][offset].make_array(val<1>{})[j];
+                    val<1> j_hit = match_alt[w][offset].make_array(val<1>{})[num];
                     return is_branch[offset] & select(j_hit, (alt[w][offset] != actualdirs[offset]),readb[offset] != actualdirs[offset]);
                 };
-                val<1> prov_correct = prov_correct_arr.fo1().fold_or();
-                val<1> prov_weak    = prov_weak_arr.fo1().fold_or();
-                val<1> base_cond    = prov_weak & ~prov_correct;
-                val<1> alt_wrong    = alt_wrong_arr.fo1().fold_or();
-                // Update conditions:
-                // - HCpred used this table
-                // - Provider hit (always update longest match)
-                // - Extra alt update (provider weak & wrong & this is an alt)
-#ifdef UPDATEALTONWEAKMISP
-                val<1> was_used = ((hc_used_bits[j] | extra_alt_bits[j]) & base_cond) | prov_hit_bits[j];
-#else
-                val<1> was_used = prov_hit_bits[j];
-#endif
-                val<1> do_alloc = (w == way_sel) ? allocate[j] : val<1>{0};
-                do_alloc.fanout(hard<6>{});
-                // Compute actual direction for this table j
-                // For allocation: use last_offset branch direction
-                // For existing entry: use the branch direction from the offset that matched this table
+                return alt_wrong_arr.fo1().fold_or();
+            };
+            return alt_wrong_tmp.fo1().concat();
+        };
 
-                // With HASH_TAG, we need to find which offset matched this table
+        arr<val<NUMG>,NUMWAYS> base_cond = [&](u64 w){
+
+            arr<val<1>,NUMG> base_cond_tmp = [&](u64 num){
+                return prov_weak[w].make_array(val<1>{})[num] & (~prov_correct[w].make_array(val<1>{})[num]);
+            };
+            return base_cond_tmp.fo1().concat();
+        };
+
+        // gpred update cond
+        arr<val<NUMG>,NUMWAYS> prov_gpred_need_update = [&](u64 w){
+            arr<val<1>,NUMG> prov_gpred_need_update_tmp = [&](u64 num){
+                return base_cond[w].make_array(val<1>{})[num] & (provider_hit[w].make_array(val<1>{})[num]);
+            };
+            return prov_gpred_need_update_tmp.fo1().concat();
+        };
+#ifdef UPDATEALTONWEAKMISP
+        arr<val<NUMG>,NUMWAYS> hc_gpred_need_update = [&](u64 w){
+            arr<val<1>,NUMG> hc_gpred_need_update_tmp = [&](u64 num){
+                arr<val<1>,LINEINST> hc_mispred_weak_arr = [&](u64 offset){
+                    val<1> j_hit = hc_pred_source[w][offset].make_array(val<1>{})[num];
+                    return is_branch[offset] & j_hit & (hc_pred_val[w][offset] != actualdirs[offset]) & (readctr_cnt[w][num] == val<CTRBIT-1>{0});
+                };
+                return hc_mispred_weak_arr.fo1().fold_or() ;
+            };
+            return hc_gpred_need_update_tmp.fo1().concat()& base_cond[w];
+        };
+
+        arr<val<NUMG>,NUMWAYS> alt_gpred_need_update = [&](u64 w){
+            arr<val<1>,NUMG> alt_gpred_need_update_tmp = [&](u64 num){
+                arr<val<1>,LINEINST> alt_mispred_weak_arr = [&](u64 offset){
+                    val<1> j_hit = match_alt[w][offset].make_array(val<1>{})[num];
+                    return is_branch[offset] & j_hit & (alt[w][offset] != actualdirs[offset]) & (readctr_cnt[w][num] == val<CTRBIT-1>{0});
+                };
+                return alt_mispred_weak_arr.fo1().fold_or();
+            };
+            return alt_gpred_need_update_tmp.fo1().concat() & base_cond[w];
+        };
+#endif
+
+        val<CTRBIT-1> ghyst_max = ghyst_max.maxval;
+        // ghyst update cond !(weak&mispred | correct&sat) & hit
+        arr<val<NUMG>,NUMWAYS> prov_ghyst_need_update = [&](u64 w){
+            return provider_hit[w] & (~prov_gpred_need_update[w]);
+        };
+#ifdef UPDATEALTONWEAKMISP
+        arr<val<NUMG>,NUMWAYS> hc_ghyst_need_update = [&](u64 w){
+            return hc_used[w] & (~hc_gpred_need_update[w]);
+        };
+        arr<val<NUMG>,NUMWAYS> alt_ghyst_need_update = [&](u64 w){
+            return alt_hits[w] & (~alt_gpred_need_update[w]);
+        };
+#endif
+
+        arr<val<NUMG>,NUMWAYS> do_alloc = [&](u64 w){
+            return (w == way_sel) ? allocate.concat() : val<NUMG>{0};
+        };
+        arr<val<NUMG>,NUMWAYS> matched_dir = [&](u64 w){
+            arr<val<1>,NUMG> matched_dir_tmp = [&](u64 num){
                 arr<val<1>,LINEINST> offset_match = [&](u64 offset){
-                    val<1> j_matches = match[w][offset].make_array(val<1>{})[j];
+                    val<1> j_matches = match[w][offset].make_array(val<1>{})[num];
                     return is_branch[offset] & j_matches;
                 };
                 arr<val<1>,LINEINST> offset_dir = [&](u64 offset){
                     return select(offset_match[offset], actualdirs[offset], val<1>{0});
                 };
-                val<1> matched_dir = offset_dir.fo1().fold_or();
-
-                val<1> last_dir = branch_dir[num_branch-1];
-                val<1> actual_val = select(do_alloc, last_dir, matched_dir);
-                actual_val.fanout(hard<2>{});
-                // Use stored CTR and UBIT values from predict phase
-                val<CTRBIT> current_ctr = concat(readctr_pred[w][j], readctr_cnt[w][j]);
-                val<UBIT> cur_u = readu[w][j];
-                cur_u.fanout(hard<3>{});
-
-                // CTR update: increment if correct, decrement if wrong, init on alloc
-                val<CTRBIT> weak_taken = val<CTRBIT>{1 << (CTRBIT - 1)};
-                val<CTRBIT> weak_not_taken = val<CTRBIT>{(1 << (CTRBIT - 1)) - 1};
-                
-                val<CTRBIT> init_ctr = select(actual_val, weak_taken, weak_not_taken);
-                val<CTRBIT> updated_ctr = update_ctr(current_ctr, actual_val);
-                val<CTRBIT> new_ctr = select(do_alloc, init_ctr, updated_ctr);
-
-                // UBIT: alloc -> 0, provider right & alt wrong -> +1
-                val<1> has_provider = primary_bits[j];
-                val<1> inc_useful = has_provider & prov_correct & alt_wrong;
-
-                val<UBIT> new_u = select(cur_u == hard<cur_u.maxval>{}, cur_u, val<UBIT>{cur_u + 1});
-                val<UBIT> final_u = select(do_alloc, val<UBIT>{0}, new_u);
+                return offset_dir.fo1().fold_or();
+            };
+            return matched_dir_tmp.fo1().concat();
+        };
 
 
+        arr<val<NUMG>,NUMWAYS> inc_useful = [&](u64 w){
+            return prov_correct[w] & alt_wrong[w] & provider_hit[w];
+        };
 
-                // Merge writes: CTR write when used or allocated
-                execute_if(was_used | do_alloc, [&](){
-                    gctr[w][j].write(gindex[j], new_ctr, extra_cycle);
-                });
 
-                // TAG write only on allocation
-                execute_if(do_alloc, [&](){
-#ifdef HASH_TAG
-                    val<TAGW> new_tag = htag[j] ^ val<HTAGBITS>{last_offset};
+        // val<UBIT> new_u[NUMWAYS][NUMG];
+        // val<UBIT> final_u[NUMWAYS][NUMG];
+        // for (u64 w=0; w<NUMWAYS; w++) {
+        //     for (u64 j=0; j<NUMG; j++) {
+        //         new_u[w][j] = select(readu[w][j] == hard<new_u.maxval>{}, readu[w][j], val<UBIT>{readu[w][j] + 1});
+        //         final_u[w][j] = select(do_alloc[w][j], val<UBIT>{0}, new_u[w][j]);
+        //     }
+        // }
+
+        // val<UBIT> ubit_value[NUMWAYS][NUMG];
+        // for (u64 w=0; w<NUMWAYS; w++) {
+        //     for (u64 j=0; j<NUMG; j++) {
+        //         ubit_value[w][j] = select(should_reset, val<UBIT>{0}, final_u[w][j]);
+        //     }
+        // }
+
+
+        // ==================== SRAM writes  ====================
+        for (u64 w=0; w<NUMWAYS; w++) {
+#ifdef UPDATEALTONWEAKMISP
+            arr<val<1>,NUMG> gpred_update = (prov_gpred_need_update[w] | hc_gpred_need_update[w] | alt_gpred_need_update[w]).make_array(val<1>{});
+            arr<val<1>,NUMG> ghyst_update = (prov_ghyst_need_update[w] | hc_ghyst_need_update[w] | alt_ghyst_need_update[w]).make_array(val<1>{});
 #else
-                    val<TAGW> new_tag = concat(val<LOGLINEINST>{last_offset},htag[j]);
+            arr<val<1>,NUMG> gpred_update = prov_gpred_need_update[w].make_array(val<1>{});
+            arr<val<1>,NUMG> ghyst_update = prov_ghyst_need_update[w].make_array(val<1>{});
 #endif
-                    gtag[w][j].write(gindex[j], new_tag,extra_cycle);
-                });
+            arr<val<1>,NUMG> do_alloc_arr = do_alloc[w].make_array(val<1>{});
+            arr<val<1>,NUMG> dir_arr = matched_dir[w].make_array(val<1>{});
 
-                // UBIT write when allocated or incremented
-                // When reset is triggered, write 0 to all u-bits; otherwise write normal value
-                val<UBIT> ubit_value = select(should_reset, val<UBIT>{0}, final_u);
-                // execute_if(should_reset,[&](){ubit[w][j].reset();});
-                execute_if(do_alloc | inc_useful | should_reset, [&](){
-                    ubit[w][j].write(gindex[j], ubit_value, extra_cycle);
+            arr<val<1>,NUMG> inc_dir = inc_useful[w].make_array(val<1>{});
+            for (u64 j=0; j<NUMG; j++) {
+                val<1> final_gdir = select(do_alloc_arr[j],last_dir, dir_arr[j]);
+                
+                val<CTRBIT-1> correct_hyst = update_ctr(dir_arr[j],readctr_cnt[w][j]);
+                val<CTRBIT-1> final_ghyst = select(do_alloc_arr[j],val<CTRBIT-1>{0}, correct_hyst);
+                val<TAGW> final_gtag = htag[j] ^ val<HTAGBITS>{last_offset};
+                val<UBIT> update_uctr = update_ctr(inc_dir[j],readu[w][j]);
+                val<UBIT> final_uctr = select(should_reset | do_alloc_arr[j] , val<UBIT>{0}, update_uctr);
+                execute_if(gpred_update[j] | do_alloc_arr[j], [&](){
+                    gpred[w][j].write(gindex[j], final_gdir, extra_cycle);
+                });
+                execute_if(ghyst_update[j] | do_alloc_arr[j], [&](){
+                    ghyst[w][j].write(gindex[j], final_ghyst, extra_cycle);
+                });
+                execute_if(do_alloc_arr[j], [&](){
+                    gtag[w][j].write(gindex[j], final_gtag, extra_cycle);
+                });
+                execute_if(do_alloc_arr[j] | inc_dir[j] | should_reset, [&](){
+                    ubit[w][j].write(gindex[j], final_uctr, extra_cycle);
                 });
             }
         }
