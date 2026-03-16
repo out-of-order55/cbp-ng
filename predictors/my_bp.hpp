@@ -29,6 +29,8 @@ template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHI
 struct my_bp : predictor {
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
+    static constexpr u64 LOGBIAS = 8;
+    static constexpr u64 PERCWIDTH = 6;
     static constexpr u64 MINHIST = 4;
     static constexpr u64 USE_ALT_PRED_BITS = 4;
     static constexpr u64 UCTRBITS = 4;
@@ -88,6 +90,7 @@ struct my_bp : predictor {
     arr<reg<1>,LINEINST> provider[NUMWAYS];
     arr<reg<1>,LINEINST> alt[NUMWAYS];
     reg<LINEINST> p2;
+    reg<LINEINST> tage_p2;
 
     // HCpred: high-confidence prediction (strongest non-weak entry)
     arr<reg<1>,LINEINST> hc_pred_val[NUMWAYS];      // HC predicted direction
@@ -234,24 +237,24 @@ struct my_bp : predictor {
                      u64 hit, u64 hit_table, u64 hit_gtag, u64 hit_gindex,
                      u64 alloc, u64 alloc_table, u64 alloc_gindex, u64 alloc_tag) {
         sqlite3_reset(exec_stmt);
-        sqlite3_bind_int64(exec_stmt,  1, (sqlite3_int64)trace_seq++);
-        sqlite3_bind_int64(exec_stmt,  2, (sqlite3_int64)cycle);
-        sqlite3_bind_int64(exec_stmt,  3, (sqlite3_int64)pc);
-        sqlite3_bind_int64(exec_stmt,  4, (sqlite3_int64)offset);
-        sqlite3_bind_int64(exec_stmt,  5, (sqlite3_int64)actual_dir);
-        sqlite3_bind_int64(exec_stmt,  6, (sqlite3_int64)predicted_dir);
-        sqlite3_bind_int64(exec_stmt,  7, (sqlite3_int64)mispredict);
+        sqlite3_bind_int64(exec_stmt,  1, static_cast<sqlite3_int64>(trace_seq++));
+        sqlite3_bind_int64(exec_stmt,  2, static_cast<sqlite3_int64>(cycle));
+        sqlite3_bind_int64(exec_stmt,  3, static_cast<sqlite3_int64>(pc));
+        sqlite3_bind_int64(exec_stmt,  4, static_cast<sqlite3_int64>(offset));
+        sqlite3_bind_int64(exec_stmt,  5, static_cast<sqlite3_int64>(actual_dir));
+        sqlite3_bind_int64(exec_stmt,  6, static_cast<sqlite3_int64>(predicted_dir));
+        sqlite3_bind_int64(exec_stmt,  7, static_cast<sqlite3_int64>(mispredict));
         sqlite3_bind_text (exec_stmt,  8, pred_source, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(exec_stmt,  9, (sqlite3_int64)pred_table);
-        sqlite3_bind_int64(exec_stmt, 10, (sqlite3_int64)bim_index);
-        sqlite3_bind_int64(exec_stmt, 11, (sqlite3_int64)hit);
-        sqlite3_bind_int64(exec_stmt, 12, (sqlite3_int64)hit_table);
-        sqlite3_bind_int64(exec_stmt, 13, (sqlite3_int64)hit_gtag);
-        sqlite3_bind_int64(exec_stmt, 14, (sqlite3_int64)hit_gindex);
-        sqlite3_bind_int64(exec_stmt, 15, (sqlite3_int64)alloc);
-        sqlite3_bind_int64(exec_stmt, 16, (sqlite3_int64)alloc_table);
-        sqlite3_bind_int64(exec_stmt, 17, (sqlite3_int64)alloc_gindex);
-        sqlite3_bind_int64(exec_stmt, 18, (sqlite3_int64)alloc_tag);
+        sqlite3_bind_int64(exec_stmt,  9, static_cast<sqlite3_int64>(pred_table));
+        sqlite3_bind_int64(exec_stmt, 10, static_cast<sqlite3_int64>(bim_index));
+        sqlite3_bind_int64(exec_stmt, 11, static_cast<sqlite3_int64>(hit));
+        sqlite3_bind_int64(exec_stmt, 12, static_cast<sqlite3_int64>(hit_table));
+        sqlite3_bind_int64(exec_stmt, 13, static_cast<sqlite3_int64>(hit_gtag));
+        sqlite3_bind_int64(exec_stmt, 14, static_cast<sqlite3_int64>(hit_gindex));
+        sqlite3_bind_int64(exec_stmt, 15, static_cast<sqlite3_int64>(alloc));
+        sqlite3_bind_int64(exec_stmt, 16, static_cast<sqlite3_int64>(alloc_table));
+        sqlite3_bind_int64(exec_stmt, 17, static_cast<sqlite3_int64>(alloc_gindex));
+        sqlite3_bind_int64(exec_stmt, 18, static_cast<sqlite3_int64>(alloc_tag));
         sqlite3_step(exec_stmt);
     }
 
@@ -264,24 +267,24 @@ struct my_bp : predictor {
                     u64 hc_is_bim, u64 prov_weak_wrong,
                     u64 prov_pred, u64 prov_ctr) {
         sqlite3_reset(bim_stmt);
-        sqlite3_bind_int64(bim_stmt,  1, (sqlite3_int64)trace_seq++);
-        sqlite3_bind_int64(bim_stmt,  2, (sqlite3_int64)cycle);
-        sqlite3_bind_int64(bim_stmt,  3, (sqlite3_int64)pc);
-        sqlite3_bind_int64(bim_stmt,  4, (sqlite3_int64)offset);
-        sqlite3_bind_int64(bim_stmt,  5, (sqlite3_int64)bim_index);
-        sqlite3_bind_int64(bim_stmt,  6, (sqlite3_int64)old_pred);
-        sqlite3_bind_int64(bim_stmt,  7, (sqlite3_int64)old_hyst);
-        sqlite3_bind_int64(bim_stmt,  8, (sqlite3_int64)actual_dir);
-        sqlite3_bind_int64(bim_stmt,  9, (sqlite3_int64)pred_written);
-        sqlite3_bind_int64(bim_stmt, 10, (sqlite3_int64)new_pred);
-        sqlite3_bind_int64(bim_stmt, 11, (sqlite3_int64)hyst_written);
-        sqlite3_bind_int64(bim_stmt, 12, (sqlite3_int64)new_hyst);
-        sqlite3_bind_int64(bim_stmt, 13, (sqlite3_int64)no_hit);
-        sqlite3_bind_int64(bim_stmt, 14, (sqlite3_int64)cond_extra_bim);
-        sqlite3_bind_int64(bim_stmt, 15, (sqlite3_int64)hc_is_bim);
-        sqlite3_bind_int64(bim_stmt, 16, (sqlite3_int64)prov_weak_wrong);
-        sqlite3_bind_int64(bim_stmt, 17, (sqlite3_int64)prov_pred);
-        sqlite3_bind_int64(bim_stmt, 18, (sqlite3_int64)prov_ctr);
+        sqlite3_bind_int64(bim_stmt,  1, static_cast<sqlite3_int64>(trace_seq++));
+        sqlite3_bind_int64(bim_stmt,  2, static_cast<sqlite3_int64>(cycle));
+        sqlite3_bind_int64(bim_stmt,  3, static_cast<sqlite3_int64>(pc));
+        sqlite3_bind_int64(bim_stmt,  4, static_cast<sqlite3_int64>(offset));
+        sqlite3_bind_int64(bim_stmt,  5, static_cast<sqlite3_int64>(bim_index));
+        sqlite3_bind_int64(bim_stmt,  6, static_cast<sqlite3_int64>(old_pred));
+        sqlite3_bind_int64(bim_stmt,  7, static_cast<sqlite3_int64>(old_hyst));
+        sqlite3_bind_int64(bim_stmt,  8, static_cast<sqlite3_int64>(actual_dir));
+        sqlite3_bind_int64(bim_stmt,  9, static_cast<sqlite3_int64>(pred_written));
+        sqlite3_bind_int64(bim_stmt, 10, static_cast<sqlite3_int64>(new_pred));
+        sqlite3_bind_int64(bim_stmt, 11, static_cast<sqlite3_int64>(hyst_written));
+        sqlite3_bind_int64(bim_stmt, 12, static_cast<sqlite3_int64>(new_hyst));
+        sqlite3_bind_int64(bim_stmt, 13, static_cast<sqlite3_int64>(no_hit));
+        sqlite3_bind_int64(bim_stmt, 14, static_cast<sqlite3_int64>(cond_extra_bim));
+        sqlite3_bind_int64(bim_stmt, 15, static_cast<sqlite3_int64>(hc_is_bim));
+        sqlite3_bind_int64(bim_stmt, 16, static_cast<sqlite3_int64>(prov_weak_wrong));
+        sqlite3_bind_int64(bim_stmt, 17, static_cast<sqlite3_int64>(prov_pred));
+        sqlite3_bind_int64(bim_stmt, 18, static_cast<sqlite3_int64>(prov_ctr));
         sqlite3_step(bim_stmt);
     }
 
@@ -416,9 +419,9 @@ struct my_bp : predictor {
         std::cerr << "│   Bimodal Update:       " << std::setw(36) << std::left << perf_extra_cycle_bim_update << "│\n";
         std::cerr << "│   P1 Update:            " << std::setw(36) << std::left << perf_extra_cycle_p1_update << "│\n";
         std::cerr << "└───────────────────────────────────────────────────────────────┘\n";
-        printf("Useful Allocations: %lu\n", (unsigned long)perf_useful_alloc);
-        printf("Useful Increments: %lu\n", (unsigned long)perf_useful_inc);
-        printf("Useful Resets: %lu\n", (unsigned long)perf_useful_reset);
+        printf("Useful Allocations: %lu\n", static_cast<unsigned long>(perf_useful_alloc));
+        printf("Useful Increments: %lu\n", static_cast<unsigned long>(perf_useful_inc));
+        printf("Useful Resets: %lu\n", static_cast<unsigned long>(perf_useful_reset));
         // HCpred Source Statistics - merged with TAGE info
         std::cerr << "\n┌─ Prediction Source Distribution (via HCpred) ─────────────────┐\n";
         std::cerr << "│ Source   │ Count │ Correct │ Accuracy │ % of Total │\n";
@@ -584,6 +587,15 @@ struct my_bp : predictor {
     rwram<1,1<<bindex_bits,NUMBANKS> bim_hi[LINEINST] {"bpred"};
 
 
+    #ifdef SC
+    //bias_pc is concat pc and tage
+    //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
+    rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
+    arr<reg<PERCWIDTH>,4> bias_lmap {"Bias LMAP"};
+
+    rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
+    #endif
+
     zone UPDATE_ONLY;
     rwram<1,1<<index1_bits,NUMBANKS> table1_hyst[LINEINST] {"P1 hyst"};
     rwram<1,1<<bindex_bits,NUMBANKS> bim_low[LINEINST] {"bhyst"};
@@ -647,8 +659,7 @@ struct my_bp : predictor {
     val<1> is_weak(val<1> pred, val<CTRBIT-1> ctr){
         return select(pred, ctr==ctr.minval, ctr==ctr.maxval);
     }
-
-    val<1> predict2(val<64> inst_pc)
+    void tage_predict(val<64> inst_pc)
     {
         val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB+LOGG);
         val<LOGG>       raw_gindex = inst_pc >> LOGLB;
@@ -828,7 +839,7 @@ struct my_bp : predictor {
         // p2 now uses HCpred: strongest non-weak entry (provider > longest non-weak alt > bimodal)
 #ifndef SC
         // timing is bad (If tage is 3 cycle,this may be used)
-        p2 = arr<val<1>,LINEINST>{[&](u64 offset){
+        tage_p2 = arr<val<1>,LINEINST>{[&](u64 offset){
             arr<val<1>,NUMWAYS> pred_use_tage = [&](u64 w){
                 return hc_pred_source[w][offset] != val<NUMG>{0};
             };
@@ -838,7 +849,7 @@ struct my_bp : predictor {
             return select(pred_use_tage.fold_or(), final_pred.fo1().fold_or(), hc_pred_val[0][offset]);
         }}.concat();
 #else
-        p2 = arr<val<1>,LINEINST>{[&](u64 offset){
+        tage_p2 = arr<val<1>,LINEINST>{[&](u64 offset){
             arr<val<1>,NUMWAYS> pred_use_tage = [&](u64 w){
                 return match_provider[w][offset] != val<NUMG>{0};
             };
@@ -850,6 +861,14 @@ struct my_bp : predictor {
 
 #endif
 
+    }
+    val<1> predict2(val<64> inst_pc)
+    {
+
+        tage_predict(inst_pc);
+#ifndef SC
+        p2 = tage_p2;
+#endif
         p2.fanout(hard<LINEINST+2>{});
         val<1> taken = (inst_oh & p2) != hard<0>{};
         taken.fanout(hard<2>{});
@@ -1579,11 +1598,11 @@ struct my_bp : predictor {
             insert_exec(
                 static_cast<u64>(panel.cycle), pc_val, idx,
                 dir_val, pred_val,
-                (u64)(is_misp & is_last),
+                static_cast<u64>(is_misp & is_last),
                 src_str, pred_table,
                 static_cast<u64>(bindex),
                 hit_found, hit_table, hit_gtag, hit_gindex,
-                (u64)(is_misp & is_last & alloc_found),
+                static_cast<u64>(is_misp & is_last & alloc_found),
                 alloc_table, alloc_gindex, alloc_tag
             );
         }
