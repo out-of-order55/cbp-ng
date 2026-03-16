@@ -9,7 +9,11 @@
 #include <algorithm>
 #include <string>
 #include <sqlite3.h>
+
+#define SC
+#ifndef SC
 #define USE_ALT_PRED
+#endif
 #define HASH_TAG
 #include "../cbp.hpp"
 #include "../harcom.hpp"
@@ -497,6 +501,7 @@ struct my_bp : predictor {
     // ram<val<TAGW>,(1<<LOGG)> gtag[NUMWAYS][NUMG] {"tags"}; // tags
     //183ps
     rwram<CTRBIT,NUMGTSETS,NUMBANKS> gctr[NUMWAYS][NUMG] {"ctr"};
+    rwram<1,NUMGTSETS,NUMBANKS> gpred[NUMWAYS][NUMG] {"gpred"};
     //
     rwram<UBIT,NUMGTSETS,NUMBANKS> ubit[NUMWAYS][NUMG] {"uctr"};
 
@@ -507,6 +512,7 @@ struct my_bp : predictor {
     zone UPDATE_ONLY;
     rwram<1,1<<index1_bits,NUMBANKS> table1_hyst[LINEINST] {"P1 hyst"};
     rwram<1,1<<bindex_bits,NUMBANKS> bim_low[LINEINST] {"bhyst"};
+    rwram<CTRBIT-1,NUMGTSETS,NUMBANKS> ghyst[NUMWAYS][NUMG] {"ghyst"};
 
     my_bp()
     {
@@ -553,8 +559,7 @@ struct my_bp : predictor {
         for (u64 offset=0; offset<LINEINST; offset++) {
             readp1[offset] = table1_pred[offset].read(index1);
         }
-        readp1.fanout(hard<2>{});
-        p1 = readp1.concat();
+        p1 = readp1.fo1().concat();
         p1.fanout(hard<LINEINST+1>{});
         return (inst_oh & p1) != hard<0>{};
     };
@@ -583,6 +588,7 @@ struct my_bp : predictor {
         bindex = raw_bindex.fo1();
         bindex.fanout(hard<2*LINEINST>{});
 
+        // gfolds 140ps
         for (u64 i=0; i<NUMG; i++) {
             gindex[i] = raw_gindex ^ gfolds.template get<0>(i);
         }
@@ -593,12 +599,14 @@ struct my_bp : predictor {
         }
         // htag.fanout(hard<2>{});
 
+        //150ps
         for (u64 offset=0; offset<LINEINST; offset++) {
             readb[offset] = bim_hi[offset].read(bindex);
             readb_low[offset] = bim_low[offset].read(bindex);
         }
         // readb.fanout(hard<NUMWAYS>{});
 
+        //260ps
         for (u64 w=0; w<NUMWAYS; w++) {
             for(u64 j=0; j<NUMG; j++){
                 //146ps
@@ -624,13 +632,12 @@ struct my_bp : predictor {
             return u.concat();
         };
 
-        //TODO: fix this
         for(u64 way=0;way<NUMWAYS;way++){
             notumask[way] = ~umask[way].fo1();
         }
-        // notumask.fanout(hard<2>{});
+        notumask.fanout(hard<LINEINST*NUMWAYS+1>{});
 
-        //12ps 2000fJ
+        //70ps
         for (u64 w=0; w<NUMWAYS; w++) {
             for (u64 offset=0; offset<LINEINST; offset++) {
 #ifdef HASH_TAG
@@ -647,7 +654,7 @@ struct my_bp : predictor {
         }
         for (u64 w=0; w<NUMWAYS; w++) match[w].fanout(hard<3>{});
 
-        //20ps
+        //50ps
         for (u64 w=0; w<NUMWAYS; w++) {
             for (u64 offset=0; offset<LINEINST; offset++) {
                 match_provider[w][offset] = match[w][offset].one_hot();
@@ -655,7 +662,7 @@ struct my_bp : predictor {
         }
 
         arr<val<NUMG>,NUMWAYS> gpreds = [&](u64 w){ return readctr_pred[w].concat(); };
-        gpreds.fanout(hard<2>{});
+        gpreds.fanout(hard<3*LINEINST>{});
         //30ps
         for (u64 w=0; w<NUMWAYS; w++) {
             for (u64 offset=0; offset<LINEINST; offset++) {
@@ -678,13 +685,14 @@ struct my_bp : predictor {
                 alt[w][offset] = (match_alt[w][offset] & gpreds[w]) != hard<0>{};
             }
         }
-        for (u64 w=0; w<NUMWAYS; w++) alt[w].fanout(hard<2>{});
+        // for (u64 w=0; w<NUMWAYS; w++) alt[w].fanout(hard<2>{});
 
 
-        use_alt_on_na.fanout(hard<2>{});
+        // use_alt_on_na.fanout(hard<2>{});
         arr<val<1>,USE_ALT_PRED_BITS> use_alt_on_na_array = use_alt_on_na.make_array(val<1>{});
         val<1> use_alt_on_na_pos = use_alt_on_na_array[USE_ALT_PRED_BITS-1];
         arr<val<1>,LINEINST> use_alt_on_na_pos_dup = use_alt_on_na_pos.fo1().replicate(hard<LINEINST>{});//reduce fanout
+        use_alt_on_na_pos_dup.fanout(hard<NUMWAYS*2>{});
         for (u64 w=0; w<NUMWAYS; w++) {
             for (u64 inst=0; inst<LINEINST; inst++) {
                 arr<val<1>,NUMG> prov_oh = val<NUMG>{match_provider[w][inst]}.make_array(val<1>{});
@@ -694,7 +702,6 @@ struct my_bp : predictor {
                     return select(prov_oh[j],readctr_cnt[w][j],val<CTRBIT-1>{0});
                 };
                 val<CTRBIT-1> prov_ctr  = prov_ctrs.fo1().fold_or();
-                prov_ctr.fanout(hard<2>{});
                 // provider & alt
                 val<1> prov_is_weak = is_weak(provider[w][inst], prov_ctr) & 
                 (match_provider[w][inst] & (notumask.fold_or()!=val<NUMG>{0}));
@@ -712,7 +719,6 @@ struct my_bp : predictor {
                 use_provider_hc.fanout(hard<3>{});
                 // Alt: from all alt hits (not just one_hot), find longest non-weak
                 val<NUMG> all_alt_hits = val<NUMG>{match[w][inst]} ^ val<NUMG>{match_provider[w][inst]};
-                all_alt_hits.fanout(hard<NUMG>{});
                 arr<val<1>,NUMG> hc_alt_cand = [&](u64 j){
                     val<1> hit = all_alt_hits.make_array(val<1>{})[j];
                     val<1> not_weak = ~is_weak(readctr_pred[w][j], readctr_cnt[w][j]);
@@ -733,13 +739,15 @@ struct my_bp : predictor {
                 val<NUMG> hc_src = select(use_provider_hc, val<NUMG>{match_provider[w][inst]},
                                    select(use_hcpred,      hc_alt_mask,
                                                             val<NUMG>{0}));
+
+                hc_pred_val[w][inst]    = hc_val.fo1();
+                hc_pred_source[w][inst] = hc_src.fo1();
+#ifdef PERF_COUNTERS
                 val<2> hc_type = select(use_provider_hc, val<2>{1},   // provider
                                  select(use_hcpred,       val<2>{2},   // alternate
                                                            val<2>{0})); // bimodal
-                hc_pred_val[w][inst]    = hc_val.fo1();
-                hc_pred_source[w][inst] = hc_src.fo1();
-
                 hc_pred_type[w][inst] = hc_type;
+#endif
             }
         }
 
@@ -768,7 +776,7 @@ struct my_bp : predictor {
 
 #endif
 
-        p2.fanout(hard<LINEINST>{});
+        p2.fanout(hard<LINEINST+2>{});
         val<1> taken = (inst_oh & p2) != hard<0>{};
         taken.fanout(hard<2>{});
         reuse_prediction(~val<1>{inst_oh>>(LINEINST-1)});
@@ -801,7 +809,7 @@ struct my_bp : predictor {
 
         val<1> &mispredict = block_end_info.is_mispredict;
         val<64> &next_pc = block_end_info.next_pc;
-
+        gfolds.fanout(hard<2>{});
         if (num_branch == 0) {
             val<1> line_end = inst_oh >> (LINEINST-block_size);
             val<1> actual_block = ~(true_block & line_end.fo1());
@@ -820,18 +828,18 @@ struct my_bp : predictor {
         val<1> correct_pred = ~mispredict;
         gindex.fanout(hard<3*NUMWAYS>{});
         for (u64 w=0; w<NUMWAYS; w++) {
-            match_provider[w].fanout(hard<8>{});
-            provider[w].fanout(hard<4>{});
-            alt[w].fanout(hard<2>{});
-            readctr_cnt[w].fanout(hard<5>{});
+            match_provider[w].fanout(hard<10>{});
+            provider[w].fanout(hard<5>{});
+            // alt[w].fanout(hard<2>{});
+            readctr_cnt[w].fanout(hard<4>{});
         }
-        branch_offset.fanout(hard<LINEINST+NUMG+1>{});
-        branch_dir.fanout(hard<LINEINST+NUMWAYS>{});
-        gfolds.fanout(hard<2>{});
+        branch_offset.fanout(hard<2*LINEINST+3*NUMWAYS>{});
+        branch_dir.fanout(hard<LINEINST+NUMWAYS*(NUMG+1)+1>{});
+        
         index1.fanout(hard<LINEINST*3>{});
-        readp1.fanout(hard<2>{});
+
         bindex.fanout(hard<LINEINST*3>{});
-        readb.fanout(hard<4>{});
+        readb.fanout(hard<NUMWAYS+1>{});
 
 
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
@@ -847,12 +855,12 @@ struct my_bp : predictor {
         arr<val<1>,LINEINST> is_branch = [&](u64 offset){
             return update_mask[offset] != hard<0>{};
         };
-        is_branch.fanout(hard<20>{});
+        is_branch.fanout(hard<(5+4*NUMG)*NUMWAYS+2>{});
 
         val<LINEINST> branch_mask = is_branch.concat();
 
         // ==================== P1 Disagree Check (before extra_cycle) ====================
-        val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask;
+        val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
         disagree_mask.fanout(hard<2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
@@ -868,7 +876,7 @@ struct my_bp : predictor {
             arr<val<1>,LINEINST> match_offset = [&](u64 i){ return (branch_offset[i] == offset) & branch_dir[i]; };
             return (match_offset.fo1().concat() & update_valid) != val<LINEINST>{0};
         };
-        actualdirs.fanout(hard<7>{});
+        actualdirs.fanout(hard<2+(4*NUMG+1)*NUMWAYS>{});
 
         // Aggregate match_provider across branches (like tage.hpp actual_match1)
         arr<val<NUMG>,NUMWAYS> primary_mask = [&](u64 w){
@@ -878,7 +886,7 @@ struct my_bp : predictor {
             };
             return m.fo1().fold_or();
         };
-        primary_mask.fanout(hard<8>{});
+        primary_mask.fanout(hard<4>{});
 
         /*
         bim update:
@@ -915,10 +923,11 @@ struct my_bp : predictor {
             arr<val<1>,NUMWAYS> has_provider_arr = [&](u64 w){
                 return match_provider[w][offset] != hard<0>{};
             };
+            has_provider_arr.fanout(hard<2>{});
             val<1> no_hit = ~has_provider_arr.fold_or();
             // Condition 2: HCpred fell back to bimodal (hc_pred_type == 0)
             arr<val<1>,NUMWAYS> hc_is_bim_arr = [&](u64 w){
-                return val<2>{hc_pred_type[w][offset]} == hard<0>{};
+                return hc_pred_source[w][offset] == hard<0>{};
             };
             val<1> hc_is_bim = hc_is_bim_arr.fo1().fold_or();
 
@@ -929,26 +938,27 @@ struct my_bp : predictor {
                 arr<val<CTRBIT-1>,NUMG> prov_ctrs = [&](u64 j){
                     return select(prov_bits[j], readctr_cnt[w][j], val<CTRBIT-1>{0});
                 };
-                val<CTRBIT-1> prov_ctr = prov_ctrs.fold_or();
+                val<CTRBIT-1> prov_ctr = prov_ctrs.fo1().fold_or();
                 val<1> prov_pred = provider[w][offset];
-                val<1> prov_weak = is_weak(prov_pred, prov_ctr);
-                val<1> prov_wrong = prov_pred != actual_dir;
-                return has_provider_arr[w] & prov_weak & prov_wrong;
+                prov_pred.fanout(hard<2>{});
+                val<1> prov_weak = is_weak(prov_pred, prov_ctr.fo1());
+                val<1> prov_wrong = prov_pred != actual_dir.fo1();
+                return has_provider_arr[w] & prov_weak.fo1() & prov_wrong.fo1();
             };
             val<1> prov_weak_wrong = prov_weak_wrong_arr.fo1().fold_or();
 
-            val<1> cond_extra_bim = hc_is_bim & prov_weak_wrong;
+            val<1> cond_extra_bim = hc_is_bim.fo1() & prov_weak_wrong.fo1();
 
             // Combined update condition
-            return branch_valid & (no_hit | cond_extra_bim);
+            return branch_valid.fo1() & (no_hit.fo1() | cond_extra_bim.fo1());
         };
 
         bim_update_arr.fanout(hard<3>{});
         val<1> some_bim_update = bim_update_arr.fold_or();
 
         val<1> some_p1_update = (disagree_mask != hard<0>{});
-        val<1> extra_cycle = some_tage_update | mispredict | some_bim_update | some_p1_update;
-        extra_cycle.fanout(hard<7>{});
+        val<1> extra_cycle = some_tage_update | mispredict | some_bim_update | some_p1_update.fo1();
+        extra_cycle.fanout(hard<4*LINEINST+3*NUMWAYS*NUMG>{});
 
 
 
@@ -963,13 +973,15 @@ struct my_bp : predictor {
             val<1> bim_pred = readb[offset];
             val<1> curr_hyst = readb_low[offset];
             val<1> actual_dir = actualdirs[offset];
-            val<1> dir_match = bim_pred==actual_dir;
+            val<1> dir_match = bim_pred.fo1()==actual_dir;
+            actual_dir.fanout(hard<2>{});
+            dir_match.fanout(hard<2>{});
             //TODO：add is branch
-            val<1> pred_need_update = (curr_hyst == val<1>{0}) & bim_update_arr[offset] & ~dir_match;
+            val<1> pred_need_update = (curr_hyst.fo1() == val<1>{0}) & bim_update_arr[offset] & ~dir_match;
             execute_if(bim_update_arr[offset], [&](){
                 bim_low[offset].write(bindex, dir_match, extra_cycle);
             });
-            execute_if(pred_need_update, [&](){
+            execute_if(pred_need_update.fo1(), [&](){
                 bim_hi[offset].write(bindex, actual_dir, extra_cycle);
             });
 
@@ -1048,7 +1060,7 @@ struct my_bp : predictor {
         // ==================== TAGE Allocation ====================
         // Compute allocation mask (only on misprediction)
         val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
-        mispmask.fanout(hard<2>{});
+        // mispmask.fanout(hard<2>{});
 
         arr<val<NUMG>,NUMWAYS> last_match = [&](u64 w){
             arr<val<NUMG>,LINEINST> last = [&](u64 offset){
@@ -1058,7 +1070,7 @@ struct my_bp : predictor {
         };
         
         val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match.append(1).concat().one_hot()-1);
-        postmask.fanout(hard<2>{});
+        // postmask.fanout(hard<2>{});
 
         // Check if provider was not used but correct (to skip allocation)
         arr<val<1>,NUMWAYS> skip_alloc_arr = [&](u64 w){
@@ -1066,7 +1078,7 @@ struct my_bp : predictor {
                 return select(branch_offset[num_branch-1] == offset, val<NUMG>{match_provider[w][offset]}, val<NUMG>{0});
             };
             val<NUMG> last_prov_mask = prov_for_last.fo1().fold_or();
-            val<1> has = last_prov_mask != hard<0>{};
+            val<1> has = last_prov_mask.fo1() != hard<0>{};
 
             arr<val<1>,LINEINST> used_for_last = [&](u64 offset){
                 return (branch_offset[num_branch-1] == offset) & use_provider[w][offset].fo1();
@@ -1079,14 +1091,14 @@ struct my_bp : predictor {
             val<1> pred = pred_for_last.fo1().fold_or();
 
             val<1> actual_last = val<1>{branch_dir[num_branch-1]};
-            val<1> correct = pred == actual_last;
+            val<1> correct = pred.fo1() == actual_last.fo1();
 
-            return has & ~used & correct;
+            return has.fo1() & ~used.fo1() & correct.fo1();
         };
         val<1> skip_alloc = skip_alloc_arr.fo1().fold_or();
 
 
-        val<NUMG> candallocmask = postmask & notumask.fo1().fold_or() & ~(skip_alloc.replicate(hard<NUMG>{}).concat());
+        val<NUMG> candallocmask = postmask.fo1() & notumask.fold_or() & ~(skip_alloc.replicate(hard<NUMG>{}).concat());
         // candallocmask.fanout(hard<1>{});
         val<1> alloc_fail = mispredict & (candallocmask == hard<0>{});
 
@@ -1099,7 +1111,7 @@ struct my_bp : predictor {
 
         // Update uctr: increment normally, reset to 0 when threshold reached
         uctr = select(should_reset, val<UCTRBITS>{0}, select(alloc_fail,val<UCTRBITS>{uctr + 1}, uctr));
-        should_reset.fanout(hard<NUMWAYS*NUMG>{});
+        should_reset.fanout(hard<2*NUMWAYS*NUMG+1>{});
 
 
         val<NUMG> collamask = candallocmask.reverse();
@@ -1184,7 +1196,7 @@ struct my_bp : predictor {
                 val<1> was_used = prov_hit_bits[j];
 #endif
                 val<1> do_alloc = (w == way_sel) ? allocate[j] : val<1>{0};
-
+                do_alloc.fanout(hard<6>{});
                 // Compute actual direction for this table j
                 // For allocation: use last_offset branch direction
                 // For existing entry: use the branch direction from the offset that matched this table
@@ -1201,10 +1213,11 @@ struct my_bp : predictor {
 
                 val<1> last_dir = branch_dir[num_branch-1];
                 val<1> actual_val = select(do_alloc, last_dir, matched_dir);
-
+                actual_val.fanout(hard<2>{});
                 // Use stored CTR and UBIT values from predict phase
                 val<CTRBIT> current_ctr = concat(readctr_pred[w][j], readctr_cnt[w][j]);
                 val<UBIT> cur_u = readu[w][j];
+                cur_u.fanout(hard<3>{});
 
                 // CTR update: increment if correct, decrement if wrong, init on alloc
                 val<CTRBIT> weak_taken = val<CTRBIT>{1 << (CTRBIT - 1)};
@@ -1241,7 +1254,7 @@ struct my_bp : predictor {
                 // UBIT write when allocated or incremented
                 // When reset is triggered, write 0 to all u-bits; otherwise write normal value
                 val<UBIT> ubit_value = select(should_reset, val<UBIT>{0}, final_u);
-                execute_if(should_reset,[&](){ubit[w][j].reset();});
+                // execute_if(should_reset,[&](){ubit[w][j].reset();});
                 execute_if(do_alloc | inc_useful | should_reset, [&](){
                     ubit[w][j].write(gindex[j], ubit_value, extra_cycle);
                 });
@@ -1271,11 +1284,12 @@ struct my_bp : predictor {
                 return is_branch[offset] & provider[w][offset];
             };
             val<1> provider_pred = prov_pred.fold_or();
-
+            provider_pred.fanout(hard<2>{});
             arr<val<1>,LINEINST> hc_pred_arr = [&](u64 inst){
                 return select(match_provider[w][inst]!=val<NUMG>{0},hc_pred_val[w][inst],val<1>{0});
             };
             val<1> hc_pred = hc_pred_arr.fold_or();
+            hc_pred.fanout(hard<2>{});
 
             arr<val<1>,LINEINST> actual_dir_arr = [&](u64 inst){
                 return select(match_provider[w][inst]!=val<NUMG>{0},actualdirs[inst],val<1>{0});
