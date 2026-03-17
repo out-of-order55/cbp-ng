@@ -2,7 +2,9 @@
 
 #define USE_META
 #define RESET_UBITS
-
+#define BANK
+#define SC
+// #define HASH_TAG
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
@@ -15,16 +17,25 @@
 
 using namespace hcm;
 
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6>
-struct tage : predictor {
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 2,u64 LOGBIAS = 11>
+struct my_bp_v1 : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
+
+    static constexpr u64 PERCWIDTH = 6;
+    static constexpr u64 TOTAL_THREBITS = 10;
+    static constexpr u64 GLOBAL_THREBITS = 9;
+    static constexpr u64 PRE_PC_THREBITS = 7;
+    static constexpr u64 LOGTHREBITS = 5;
+
     static constexpr u64 MINHIST = 2;
     static constexpr u64 METABITS = 4;
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 6;
+
+
 #ifdef USE_META
     static constexpr u64 METAPIPE = 2;
 #endif
@@ -35,8 +46,11 @@ struct tage : predictor {
     static constexpr u64 index1_bits = LOGP1-LOGLINEINST;
     static constexpr u64 bindex_bits = LOGB-LOGLINEINST;
     static_assert(TAGW > LOGLINEINST); // the unhashed line offset is part of the tag
+#ifdef  HASH_TAG
+    static constexpr u64 HTAGBITS = TAGW; // hashed tag bits
+#else
     static constexpr u64 HTAGBITS = TAGW-LOGLINEINST; // hashed tag bits
-
+#endif
     geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
     reg<1> true_block = 1;
 
@@ -61,10 +75,16 @@ struct tage : predictor {
     arr<reg<NUMG+1>,LINEINST> match; // all matches for each offset
     arr<reg<NUMG+1>,LINEINST> match1; // longest match for each offset
     arr<reg<NUMG+1>,LINEINST> match2; // second longest match for each offset
+    arr<reg<1>,LINEINST> prov_weak;
+    arr<reg<1>,LINEINST> prov_mid; 
+    arr<reg<1>,LINEINST> prov_sat;  
 
     arr<reg<1>,LINEINST> pred1; // primary P2 prediction for each offset
     arr<reg<1>,LINEINST> pred2; // alternate P2 prediction for each offset
+    arr<reg<1>,LINEINST> use_sc; // alternate P2 prediction for each offset
     reg<LINEINST> p2; // final P2 predictions
+    reg<LINEINST> tage_p2; // final P2 predictions
+    reg<LINEINST> sc_p2; // final P2 predictions
 
 #ifdef USE_META
     arr<reg<METABITS,i64>,METAPIPE> meta; // select between pred1 and pred2
@@ -109,16 +129,53 @@ struct tage : predictor {
     u64 perf_table_hits[NUMG] = {};
     u64 perf_table_alloc[NUMG] = {};
 
-    // Confidence distribution at hit time: 0=low(weak), 1=med-lo, 2=med-hi, 3=high(strong)
-    // TAGE CTR is 3-bit: pred(1) + hyst(2). Confidence = hyst value (0..3)
-    u64 perf_conf[NUMG][4] = {};
-
     // Allocation failures
     u64 perf_alloc_failures = 0;
     u64 perf_alloc_fail_highest = 0;  // already at highest table
     u64 perf_alloc_fail_noubit = 0;   // no ubit=0 victim found
 
-    // Misprediction trace (per-PC summary, kept in memory for top-20 report)
+    // Confidence distribution per table: [table][0..3] = ctr value buckets
+    // 0=weakest(0), 1=weak(1), 2=strong(2), 3=strongest(3)
+    u64 perf_conf[NUMG][4] = {};
+
+    // SQLite streaming trace
+    sqlite3 *trace_db = nullptr;
+    sqlite3_stmt *trace_stmt = nullptr;
+    u64 trace_seq = 0;
+
+    void open_trace_db() {
+        sqlite3_open("trace_v1.db", &trace_db);
+        sqlite3_exec(trace_db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+        sqlite3_exec(trace_db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+        sqlite3_exec(trace_db,
+            "CREATE TABLE IF NOT EXISTS trace("
+            "seq INTEGER, cycle INTEGER, pc INTEGER, offset INTEGER,"
+            "actual_dir INTEGER, predicted_dir INTEGER, mispredict INTEGER,"
+            "pred_source TEXT, pred_table INTEGER, bim_index INTEGER,"
+            "hit INTEGER, hit_table INTEGER, hit_gtag INTEGER, hit_gindex INTEGER,"
+            "alloc INTEGER, alloc_table INTEGER, alloc_gindex INTEGER, alloc_tag INTEGER,"
+            "conf INTEGER"
+            ");",
+            nullptr, nullptr, nullptr);
+        sqlite3_exec(trace_db, "BEGIN;", nullptr, nullptr, nullptr);
+        sqlite3_prepare_v2(trace_db,
+            "INSERT INTO trace VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+            -1, &trace_stmt, nullptr);
+    }
+
+    void flush_trace_db() {
+        sqlite3_exec(trace_db, "COMMIT;", nullptr, nullptr, nullptr);
+        sqlite3_exec(trace_db, "BEGIN;", nullptr, nullptr, nullptr);
+    }
+
+    void close_trace_db() {
+        sqlite3_exec(trace_db, "COMMIT;", nullptr, nullptr, nullptr);
+        sqlite3_finalize(trace_stmt);
+        sqlite3_close(trace_db);
+        trace_db = nullptr; trace_stmt = nullptr;
+    }
+
+    // Misprediction trace
     struct MispredRecord {
         u64 count = 0;
         u64 actual_dir = 0;
@@ -130,82 +187,40 @@ struct tage : predictor {
     std::unordered_map<u64, MispredRecord> mispred_db;
 
     // SQLite streaming trace
-    sqlite3      *trace_db  = nullptr;
-    sqlite3_stmt *exec_stmt = nullptr;
-    u64           trace_seq = 0;
-
-    void db_exec(const char *sql) {
-        char *errmsg = nullptr;
-        if (sqlite3_exec(trace_db, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
-            std::cerr << "SQLite error: " << errmsg << "\n";
-            sqlite3_free(errmsg);
+    void insert_trace(u64 cycle, u64 pc, u64 offset,
+                      u64 actual_dir, u64 predicted_dir, u64 mispredict,
+                      u64 pred_source, u64 pred_table, u64 bim_index,
+                      u64 hit, u64 hit_table, u64 hit_gtag, u64 hit_gindex,
+                      u64 alloc, u64 alloc_table, u64 alloc_gindex, u64 alloc_tag,
+                      u64 conf) {
+        if (!trace_stmt) return;
+        const char *src_str = (pred_source == 0) ? "bimodal" :
+                              (pred_source == 1) ? "tage_prov" : "tage_alt";
+        sqlite3_reset(trace_stmt);
+        sqlite3_bind_int64(trace_stmt,  1, static_cast<i64>(trace_seq++));
+        sqlite3_bind_int64(trace_stmt,  2, static_cast<i64>(cycle));
+        sqlite3_bind_int64(trace_stmt,  3, static_cast<i64>(pc));
+        sqlite3_bind_int64(trace_stmt,  4, static_cast<i64>(offset));
+        sqlite3_bind_int64(trace_stmt,  5, static_cast<i64>(actual_dir));
+        sqlite3_bind_int64(trace_stmt,  6, static_cast<i64>(predicted_dir));
+        sqlite3_bind_int64(trace_stmt,  7, static_cast<i64>(mispredict));
+        sqlite3_bind_text (trace_stmt,  8, src_str, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(trace_stmt,  9, pred_source != 0 ? static_cast<i64>(pred_table) : -1);
+        sqlite3_bind_int64(trace_stmt, 10, static_cast<i64>(bim_index));
+        sqlite3_bind_int64(trace_stmt, 11, static_cast<i64>(hit));
+        sqlite3_bind_int64(trace_stmt, 12, hit ? static_cast<i64>(hit_table)  : -1);
+        sqlite3_bind_int64(trace_stmt, 13, hit ? static_cast<i64>(hit_gtag)   : -1);
+        sqlite3_bind_int64(trace_stmt, 14, hit ? static_cast<i64>(hit_gindex) : -1);
+        sqlite3_bind_int64(trace_stmt, 15, static_cast<i64>(alloc));
+        sqlite3_bind_int64(trace_stmt, 16, alloc ? static_cast<i64>(alloc_table)  : -1);
+        sqlite3_bind_int64(trace_stmt, 17, alloc ? static_cast<i64>(alloc_gindex) : -1);
+        sqlite3_bind_int64(trace_stmt, 18, alloc ? static_cast<i64>(alloc_tag)    : -1);
+        sqlite3_bind_int64(trace_stmt, 19, static_cast<i64>(conf));
+        sqlite3_step(trace_stmt);
+        if (trace_seq % 100000 == 0) {
+            sqlite3_exec(trace_db, "COMMIT;", nullptr, nullptr, nullptr);
+            sqlite3_exec(trace_db, "BEGIN;",  nullptr, nullptr, nullptr);
         }
-    }
-
-    void open_trace_db() {
-        if (sqlite3_open("trace_tage.db", &trace_db) != SQLITE_OK) {
-            std::cerr << "Cannot open trace_tage.db: " << sqlite3_errmsg(trace_db) << "\n";
-            return;
-        }
-        db_exec("PRAGMA journal_mode=WAL;");
-        db_exec("PRAGMA synchronous=NORMAL;");
-        db_exec(
-            "CREATE TABLE IF NOT EXISTS exec_trace ("
-            " seq INTEGER PRIMARY KEY,"
-            " cycle INTEGER, pc INTEGER, offset INTEGER,"
-            " actual_dir INTEGER, predicted_dir INTEGER, mispredict INTEGER,"
-            " pred_source TEXT, pred_table INTEGER, bim_index INTEGER,"
-            " hit INTEGER, hit_table INTEGER, hit_gtag INTEGER, hit_gindex INTEGER,"
-            " alloc INTEGER, alloc_table INTEGER, alloc_gindex INTEGER, alloc_tag INTEGER,"
-            " conf INTEGER, conf_table INTEGER"
-            ");"
-        );
-        db_exec("BEGIN;");
-        sqlite3_prepare_v2(trace_db,
-            "INSERT INTO exec_trace VALUES"
-            "(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20);",
-            -1, &exec_stmt, nullptr);
-    }
-
-    void close_trace_db() {
-        if (!trace_db) return;
-        db_exec("COMMIT;");
-        db_exec("CREATE INDEX IF NOT EXISTS idx_exec_pc         ON exec_trace(pc);");
-        db_exec("CREATE INDEX IF NOT EXISTS idx_exec_mispredict ON exec_trace(mispredict);");
-        db_exec("CREATE INDEX IF NOT EXISTS idx_exec_alloc      ON exec_trace(alloc);");
-        sqlite3_finalize(exec_stmt); exec_stmt = nullptr;
-        sqlite3_close(trace_db);    trace_db  = nullptr;
-        std::cerr << "Trace written to trace_tage.db\n";
-    }
-
-    void insert_exec(u64 cycle, u64 pc, u64 offset,
-                     u64 actual_dir, u64 predicted_dir, u64 mispredict,
-                     const char *pred_source, u64 pred_table, u64 bim_index,
-                     u64 hit, u64 hit_table, u64 hit_gtag, u64 hit_gindex,
-                     u64 alloc, u64 alloc_table, u64 alloc_gindex, u64 alloc_tag,
-                     u64 conf, u64 conf_table) {
-        sqlite3_reset(exec_stmt);
-        sqlite3_bind_int64(exec_stmt,  1, static_cast<sqlite3_int64>(trace_seq++));
-        sqlite3_bind_int64(exec_stmt,  2, static_cast<sqlite3_int64>(cycle));
-        sqlite3_bind_int64(exec_stmt,  3, static_cast<sqlite3_int64>(pc));
-        sqlite3_bind_int64(exec_stmt,  4, static_cast<sqlite3_int64>(offset));
-        sqlite3_bind_int64(exec_stmt,  5, static_cast<sqlite3_int64>(actual_dir));
-        sqlite3_bind_int64(exec_stmt,  6, static_cast<sqlite3_int64>(predicted_dir));
-        sqlite3_bind_int64(exec_stmt,  7, static_cast<sqlite3_int64>(mispredict));
-        sqlite3_bind_text (exec_stmt,  8, pred_source, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(exec_stmt,  9, static_cast<sqlite3_int64>(pred_table));
-        sqlite3_bind_int64(exec_stmt, 10, static_cast<sqlite3_int64>(bim_index));
-        sqlite3_bind_int64(exec_stmt, 11, static_cast<sqlite3_int64>(hit));
-        sqlite3_bind_int64(exec_stmt, 12, static_cast<sqlite3_int64>(hit_table));
-        sqlite3_bind_int64(exec_stmt, 13, static_cast<sqlite3_int64>(hit_gtag));
-        sqlite3_bind_int64(exec_stmt, 14, static_cast<sqlite3_int64>(hit_gindex));
-        sqlite3_bind_int64(exec_stmt, 15, static_cast<sqlite3_int64>(alloc));
-        sqlite3_bind_int64(exec_stmt, 16, static_cast<sqlite3_int64>(alloc_table));
-        sqlite3_bind_int64(exec_stmt, 17, static_cast<sqlite3_int64>(alloc_gindex));
-        sqlite3_bind_int64(exec_stmt, 18, static_cast<sqlite3_int64>(alloc_tag));
-        sqlite3_bind_int64(exec_stmt, 19, static_cast<sqlite3_int64>(conf));
-        sqlite3_bind_int64(exec_stmt, 20, static_cast<sqlite3_int64>(conf_table));
-        sqlite3_step(exec_stmt);
     }
 
     void print_perf_counters() {
@@ -224,10 +239,10 @@ struct tage : predictor {
         }
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
-        // Per-table statistics
-        std::cerr << "\n┌─ TAGE Table Statistics ─────────────────────────────────────────────────────────────────────────────────┐\n";
-        std::cerr << "│ Tbl │ HistLen │ Reads │ Hits │ Hit%  │ Prov │ PrvAcc% │ Alt │ AltAcc% │ Total │ TotAcc% │ Alloc │\n";
-        std::cerr << "├─────┼─────────┼───────┼──────┼───────┼──────┼─────────┼─────┼─────────┼───────┼─────────┼───────┤\n";
+        // Per-table statistics with confidence distribution
+        std::cerr << "\n┌─ TAGE Table Statistics ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+        std::cerr << "│ Tbl │ HistLen │ Reads │ Hits │ Hit%  │ Prov │ PrvAcc% │ Alt │ AltAcc% │ Total │ TotAcc% │ Alloc │ C0(weak) │ C1(mwk) │ C2(mst) │ C3(str) │\n";
+        std::cerr << "├─────┼─────────┼───────┼──────┼───────┼──────┼─────────┼─────┼─────────┼───────┼─────────┼───────┼──────────┼─────────┼─────────┼─────────┤\n";
 
         for (u64 j=0; j<NUMG; j++) {
             u64 reads = perf_table_reads[j];
@@ -239,42 +254,43 @@ struct tage : predictor {
             u64 total = prov + alt;
             u64 total_ok = prov_ok + alt_ok;
             u64 alloc = perf_table_alloc[j];
+            u64 c0=perf_conf[j][0], c1=perf_conf[j][1], c2=perf_conf[j][2], c3=perf_conf[j][3];
+            u64 ct = c0+c1+c2+c3;
 
             std::cerr << "│ " << std::setw(3) << std::left << j << " │ ";
             std::cerr << std::setw(7) << std::right << gfolds.HLEN[j] << " │ ";
             std::cerr << std::setw(5) << std::right << reads << " │ ";
             std::cerr << std::setw(4) << std::right << hits << " │ ";
-
             if (reads > 0)
-                std::cerr << std::fixed << std::setprecision(1) << std::setw(5) << std::right
-                          << (100.0*hits/reads) << "% │ ";
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(5) << std::right << (100.0*hits/reads) << "% │ ";
             else
                 std::cerr << "  N/A │ ";
-
             std::cerr << std::setw(4) << std::right << prov << " │ ";
             if (prov > 0)
-                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right
-                          << (100.0*prov_ok/prov) << "% │ ";
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right << (100.0*prov_ok/prov) << "% │ ";
             else
                 std::cerr << "    N/A │ ";
-
             std::cerr << std::setw(3) << std::right << alt << " │ ";
             if (alt > 0)
-                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right
-                          << (100.0*alt_ok/alt) << "% │ ";
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right << (100.0*alt_ok/alt) << "% │ ";
             else
                 std::cerr << "    N/A │ ";
-
             std::cerr << std::setw(5) << std::right << total << " │ ";
             if (total > 0)
-                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right
-                          << (100.0*total_ok/total) << "% │ ";
+                std::cerr << std::fixed << std::setprecision(1) << std::setw(7) << std::right << (100.0*total_ok/total) << "% │ ";
             else
                 std::cerr << "    N/A │ ";
-
-            std::cerr << std::setw(5) << std::right << alloc << " │\n";
+            std::cerr << std::setw(5) << std::right << alloc << " │ ";
+            if (ct > 0) {
+                std::cerr << std::setw(5) << c0 << "(" << std::fixed << std::setprecision(0) << std::setw(2) << (100.0*c0/ct) << "%) │ ";
+                std::cerr << std::setw(5) << c1 << "(" << std::setw(2) << (100.0*c1/ct) << "%) │ ";
+                std::cerr << std::setw(5) << c2 << "(" << std::setw(2) << (100.0*c2/ct) << "%) │ ";
+                std::cerr << std::setw(5) << c3 << "(" << std::setw(2) << (100.0*c3/ct) << "%) │\n";
+            } else {
+                std::cerr << "     N/A │      N/A │      N/A │      N/A │\n";
+            }
         }
-        std::cerr << "└─────┴─────────┴───────┴──────┴───────┴──────┴─────────┴─────┴─────────┴───────┴─────────┴───────┘\n";
+        std::cerr << "└─────┴─────────┴───────┴──────┴───────┴──────┴─────────┴─────┴─────────┴───────┴─────────┴───────┴──────────┴─────────┴─────────┴─────────┘\n";
 
         // Prediction source distribution
         std::cerr << "\n┌─ Prediction Source Distribution ────────────────────────────────┐\n";
@@ -370,6 +386,8 @@ struct tage : predictor {
 
         // Finalize SQLite trace
         close_trace_db();
+        std::cerr << "│ Full exec trace written to: trace_v1.db                         │\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
         // Write per-PC mispred summary + top-20 to stderr
         {
@@ -377,7 +395,7 @@ struct tage : predictor {
             std::sort(sorted_db.begin(), sorted_db.end(),
                 [](const auto &a, const auto &b){ return a.second.count > b.second.count; });
 
-            std::cerr << "\n┌─ Top 20 Most Mispredicted PCs (full trace -> trace_tage.db) ───────────────────────────────┐\n";
+            std::cerr << "\n┌─ Top 20 Most Mispredicted PCs (full trace -> trace_v1.db) ���────────────────────────────────┐\n";
             std::cerr << "│ Rank │       PC       │ Mispreds │ Dir │ Hit │ Tbl │    GTTag     │  GIndex  │\n";
             std::cerr << "├──────┼────────────────┼──────────┼─────┼─────┼─────┼──────────────┼──────────┤\n";
             u64 rank = 0;
@@ -401,22 +419,52 @@ struct tage : predictor {
         }
     }
 #endif
+// #ifdef BANK
+//     // P1 (gshare)
+//     rwram<1,(1<<index1_bits),1<<LOGBANKS> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
 
+//     // P2 (TAGE)
+//     rwram<TAGW,(1<<LOGG),1<<LOGBANKS> gtag[NUMG] {"tags"}; // tags
+//     // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
+//     rwram<1,(1<<LOGG),1<<LOGBANKS> gpred[NUMG] {"gpred"}; // predictions
+//     rwram<2,(1<<LOGG),1<<LOGBANKS> ghyst[NUMG] {"ghyst"}; // hysteresis
+
+//     rwram<1,(1<<LOGG),1<<LOGBANKS> ubit[NUMG] {"u"}; // "useful" bits
+//     rwram<1,(1<<bindex_bits),1<<LOGBANKS> bim[LINEINST] {"bpred"}; // bimodal prediction bits
+
+//     zone UPDATE_ONLY;
+//     rwram<1,(1<<index1_bits),1<<LOGBANKS> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
+//     rwram<1,(1<<bindex_bits),1<<LOGBANKS> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
+// #else
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
 
     // P2 (TAGE)
     ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
+    // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
     ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
     rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
+
     rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
-    ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
+    rwram<1,(1<<bindex_bits),4> bim[LINEINST] {"bpred"}; // bimodal prediction bits
 
     zone UPDATE_ONLY;
     ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
     ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
+    #ifdef SC
+    //bias_pc is concat pc and tage
+    //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
+    ram<val<PERCWIDTH>,(1<<(LOGBIAS-LOGLINEINST))> bias_pc[LINEINST] {"Bias pc"};
+    arr<reg<PERCWIDTH>,4> bias_lmap;
 
-    tage()
+    arr<reg<PRE_PC_THREBITS>,1<<LOGTHREBITS> thre1;
+    arr<reg<PRE_PC_THREBITS>,1<<LOGTHREBITS> thre2;
+    reg<GLOBAL_THREBITS> global_thre;
+    arr<reg<TOTAL_THREBITS>,LINEINST> sc_sum;
+    // rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
+    #endif
+// #endif
+    my_bp_v1()
     {
 #ifdef TAGE_VERBOSE
         std::cerr << "TAGE history lengths: ";
@@ -426,10 +474,14 @@ struct tage : predictor {
             std::cerr << "WARNING: the tag function and index function are not different enough\n";
         }
 #endif
+        // global_thre = val<GLOBAL_THREBITS>{23};
+#ifdef PERF_COUNTERS
+        open_trace_db();
+#endif
     }
 
 #ifdef PERF_COUNTERS
-    ~tage() {
+    ~my_bp_v1() {
         print_perf_counters();
     }
 #endif
@@ -468,8 +520,7 @@ struct tage : predictor {
         return ((block_entry<<block_size) & p1) != hard<0>{};
     };
 
-    val<1> predict2(val<64> inst_pc)
-    {
+    void tage_pred(val<64> inst_pc){
         val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<1+NUMG*2>{});
         gfolds.fanout(hard<2>{});
@@ -501,7 +552,7 @@ struct tage : predictor {
         }
         readt.fanout(hard<LINEINST+1>{});
         readc.fanout(hard<3>{});
-        readh.fanout(hard<2>{});
+        readh.fanout(hard<6>{});
         readu.fanout(hard<2>{});
         notumask = ~readu.concat();
         notumask.fanout(hard<2>{});
@@ -511,6 +562,14 @@ struct tage : predictor {
         gpreds.fanout(hard<LINEINST>{});
         arr<val<NUMG+1>,LINEINST> preds = [&](u64 offset){return concat(readb[offset],gpreds);};
         preds.fanout(hard<2*LINEINST>{});
+#ifdef HASH_TAG
+        // generate match mask for each offset
+        static_loop<LINEINST>([&]<u64 offset>(){
+            arr<val<1>,NUMG> tagcmp = [&](int i){return readt[i] == (htag[i]^val<HTAGBITS>{offset});};
+            match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() ); // bimodal is default when no match
+        });
+#else
+
 
         // hashed tags comparisons
         arr<val<1>,NUMG> htagcmp_split = [&](int i){return val<HTAGBITS>{readt[i]} == htag[i];};
@@ -521,15 +580,26 @@ struct tage : predictor {
         static_loop<LINEINST>([&]<u64 offset>(){
             arr<val<1>,NUMG> tagcmp = [&](int i){return val<LOGLINEINST>{readt[i]>>HTAGBITS} == hard<offset>{};};
             match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp); // bimodal is default when no match
+
         });
+#endif
         match.fanout(hard<2>{});
 
         // for each offset, find longest match and select primary prediction
         for (u64 offset=0; offset<LINEINST; offset++) {
             match1[offset] = match[offset].one_hot();
+
         }
-        match1.fanout(hard<3>{});
+        match1.fanout(hard<6>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
+
+            arr<val<1>,NUMG> weakctr = [&](int i) {return (readh[i]==hard<0>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
+            arr<val<1>,NUMG> midctr = [&](int i) {return (readh[i]==hard<1>{}|readh[i]==hard<2>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
+            arr<val<1>,NUMG> highctr = [&](int i) {return (readh[i]==hard<3>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
+            prov_weak[offset] = weakctr.fold_or();
+            prov_mid[offset] = midctr.fold_or();
+            prov_sat[offset] = highctr.fold_or();
+
             pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
         }
         pred1.fanout(hard<2>{});
@@ -543,6 +613,7 @@ struct tage : predictor {
             pred2[offset] = (match2[offset] & preds[offset]) != hard<0>{};
         }
         pred2.fanout(hard<2>{});
+
 
 #ifdef USE_META
         meta.fanout(hard<2>{});
@@ -559,15 +630,13 @@ struct tage : predictor {
             arr<val<1>,3> inputs = {metasign, newly_alloc[offset], match2[offset]!=hard<0>{}};
             return inputs.fo1().fold_and();
         };
-        p2 = arr<val<1>,LINEINST> {[&](u64 offset){
+        tage_p2 = arr<val<1>,LINEINST> {[&](u64 offset){
             return select(altsel[offset].fo1(),pred2[offset],pred1[offset]);
         }}.concat();
 #else
-        p2 = pred1.concat();
+        tage_p2 = pred1.concat();
 #endif
-        p2.fanout(hard<LINEINST>{});
-        val<1> taken = (block_entry & p2) != hard<0>{};
-        taken.fanout(hard<2>{});
+        // tage_p2.fanout(hard<2>{});
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
         // Store prediction source for each offset (used in update_cycle)
@@ -588,6 +657,98 @@ struct tage : predictor {
         }
 #endif
 #endif
+    }
+
+    void sc_predict(val<64> inst_pc){
+
+        inst_pc.fanout(hard<5>{});
+        match1.fanout(hard<3>{});
+        pred1.fanout(hard<2>{});
+        prov_weak.fanout(hard<3>{});
+        //bias
+        val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB);
+        bias_pc_high_index.fanout(hard<(LINEINST)>{});
+        arr<val<PERCWIDTH>,LINEINST> bias = [&](u64 offset){
+            return bias_pc[offset].read(bias_pc_high_index);
+        };
+        arr<val<PERCWIDTH>,LINEINST> bias_pc= [&](u64 offset){
+            return bias.select(val<LOGLINEINST>{offset});
+        };
+        //180ps
+        arr<val<PERCWIDTH>,LINEINST> bias_map= [&](u64 offset){
+            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
+            val<1> prov_pred = pred1[offset] & prov_hit;
+            val<1> is_prov_weak =  prov_weak[offset];
+            val<2> tage_info = concat(prov_pred,is_prov_weak);
+            val<LOGLINEINST> final_low_index = val<LOGLINEINST>{offset} ^ val<LOGLINEINST>{tage_info};
+            //90ps
+            return bias.select(final_low_index);
+        };
+        
+        arr<val<PERCWIDTH>,LINEINST> bias_base= [&](u64 offset){
+            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
+            val<1> prov_pred = pred1[offset] & prov_hit;
+            val<1> is_prov_weak =  prov_weak[offset];
+            val<2> tage_info = concat(prov_pred,is_prov_weak);
+            return bias_lmap.select(tage_info);
+        };
+
+        val<LOGTHREBITS> base_idx1 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+2)); 
+        val<LOGTHREBITS> base_idx2 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+5));
+        
+        base_idx1.fanout(hard<LINEINST>{});
+        base_idx2.fanout(hard<LINEINST>{});
+        arr<val<TOTAL_THREBITS>,LINEINST> threshold = [&](u64 offset){
+            val<LOGTHREBITS> idx1 = base_idx1 ^ val<LOGTHREBITS>{offset};
+            val<LOGTHREBITS> idx2 = base_idx2 ^ val<LOGTHREBITS>{offset};
+            return global_thre + thre1.select(idx1) + thre2.select(idx2);
+        };
+        threshold.fanout(hard<3>{});
+        //sum 40ps
+        arr<val<TOTAL_THREBITS>,LINEINST> bias_sum_base = [&](u64 offset){
+            return bias_base[offset] + bias_pc[offset];
+        };
+        //60 ps 2.5 cycle
+        sc_sum = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
+            return bias_sum_base[offset] + bias_map[offset];
+        }};
+        
+        sc_sum.fanout(hard<3>{});
+        //100 ps
+        use_sc = arr<val<1>,LINEINST>{[&](u64 offset){
+            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
+            val<1> is_prov_weak =  prov_weak[offset]; 
+            val<1> is_prov_mid = prov_mid[offset];
+            val<1> is_prov_high = prov_sat[offset];
+            return prov_hit & (
+                    ((is_prov_weak) & (sc_sum[offset]>(threshold[offset]>>3))));
+            // return prov_hit & (((is_prov_high) & (sc_sum[offset]>(threshold[offset]>>1)))|
+            //         ((is_prov_mid) & (sc_sum[offset]>(threshold[offset]>>2)))|
+            //         ((is_prov_weak) & (sc_sum[offset]>(threshold[offset]>>3))));
+        }};
+        //70ps
+        sc_p2 = arr<val<1>,LINEINST> {[&](u64 offset){
+            val<1> tage_pred = tage_p2.make_array(val<1>{})[offset];
+            return select(use_sc[offset],sc_sum[offset] > val<TOTAL_THREBITS>{0},tage_pred);
+        }}.concat();
+        sc_p2.fanout(hard<2>{});
+        
+    }
+    val<1> predict2(val<64> inst_pc)
+    {
+        tage_pred(inst_pc);
+        
+    #ifndef SC
+        p2 = tage_p2;
+    #else
+        sc_predict(inst_pc);
+        p2 = sc_p2;
+    #endif
+        // p2 = tage_p2;
+        p2.fanout(hard<LINEINST>{});
+        val<1> taken = (block_entry & p2) != hard<0>{};
+        taken.fanout(hard<2>{});
+
         reuse_prediction(~val<1>{block_entry>>(LINEINST-1)});
         return taken;
     }
@@ -718,7 +879,11 @@ struct tage : predictor {
 
         // select some candidate entries for allocation
         val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
+#ifdef HASH_TAG
+        arr<val<1>,NUMG> last_tagcmp = [&](int i){return readt[i] == (last_offset^htag[i]);};
+#else
         arr<val<1>,NUMG> last_tagcmp = [&](int i){return readt[i] == concat(last_offset,htag[i]);};
+#endif
         val<NUMG+1> last_match1 = last_tagcmp.fo1().append(1).concat().one_hot();
         last_match1.fanout(hard<2>{});
         val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match1-1);
@@ -745,7 +910,21 @@ struct tage : predictor {
     }
 #endif
 #endif
-
+#ifdef HASH_TAG
+        arr<val<1>,NUMG> bdir = [&](u64 i) {
+            arr<val<1>,LINEINST> tag_oh = [&](u64 offset){
+                return match[offset].make_array(val<1>{})[i];
+            };
+            arr<val<LOGLINEINST>,LINEINST> offset_arr = [&](u64 offset){
+                return select(tag_oh[offset],val<LOGLINEINST>{offset},val<LOGLINEINST>{0});
+            };
+            val<LOGLINEINST> tag_offset = offset_arr.fo1().fold_or();
+            val<LOGLINEINST> offset = select(allocate[i],last_offset,tag_offset.fo1());
+            offset.fanout(hard<LINEINST>{});
+            arr<val<1>,LINEINST> match_offset = [&](u64 j){return branch_offset[j] == offset;};
+            return (match_offset.fo1().concat() & update_valid & actualdirs) != hard<0>{};
+        };
+#else
         // associate a branch direction to each global table
         arr<val<1>,NUMG> bdir = [&](u64 i) {
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
@@ -754,6 +933,7 @@ struct tage : predictor {
             arr<val<1>,LINEINST> match_offset = [&](u64 j){return branch_offset[j] == offset;};
             return (match_offset.fo1().concat() & update_valid & actualdirs) != hard<0>{};
         };
+#endif
         bdir.fanout(hard<2>{});
 
         // tell if global prediction is incorrect
@@ -761,7 +941,31 @@ struct tage : predictor {
             return readc[i] != bdir[i];
         };
         badpred1.fanout(hard<3>{});
+#ifdef HASH_TAG
+        // associate to each global table a bit telling if local prediction differs from secondary prediction
+        arr<val<1>,NUMG> altdiffer = [&](u64 i){
+            arr<val<1>,LINEINST> tag_oh = [&](u64 offset){
+                return match2[offset].make_array(val<1>{})[i];
+            };
+            arr<val<LOGLINEINST>,LINEINST> offset_arr = [&](u64 offset){
+                return select(tag_oh[offset],val<LOGLINEINST>{offset},val<LOGLINEINST>{0});
+            };
+            val<LOGLINEINST> tag_offset = offset_arr.fo1().fold_or();
+            return readc[i] != pred2.select(tag_offset.fo1());
+        };
 
+        // associate to each global table a bit telling if prediction for owning branch is correct
+        arr<val<1>,NUMG> goodpred = [&](u64 i){
+            arr<val<1>,LINEINST> tag_oh = [&](u64 offset){
+                return match[offset].make_array(val<1>{})[i];
+            };
+            arr<val<LOGLINEINST>,LINEINST> offset_arr = [&](u64 offset){
+                return select(tag_oh[offset],val<LOGLINEINST>{offset},val<LOGLINEINST>{0});
+            };
+            val<LOGLINEINST> tag_offset = offset_arr.fo1().fold_or();
+            return (tag_offset.fo1() != last_offset) | correct_pred;
+        };
+#else
         // associate to each global table a bit telling if local prediction differs from secondary prediction
         arr<val<1>,NUMG> altdiffer = [&](u64 i){
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
@@ -773,7 +977,7 @@ struct tage : predictor {
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
             return (tag_offset.fo1() != last_offset) | correct_pred;
         };
-
+#endif
         // do P1 and P2 agree?
         val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
         disagree_mask.fanout(hard<2>{});
@@ -828,12 +1032,17 @@ struct tage : predictor {
         using meta_t = valt<decltype(meta[0])>;
         meta[0] = select(newmeta>meta_t::maxval, meta_t{meta_t::maxval}, select(newmeta<meta_t::minval, meta_t{meta_t::minval}, meta_t{newmeta}));
 #endif
-
+#ifdef HASH_TAG
+        for (u64 i=0; i<NUMG; i++) {
+            execute_if(allocate[i], [&](){gtag[i].write(gindex[i],last_offset^htag[i]);});
+        }
+#else
         // overwrite the tag in the allocated entry (mispredict)
         for (u64 i=0; i<NUMG; i++) {
             execute_if(allocate[i], [&](){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
         }
 
+#endif
         // update the u bits
         arr<val<1>,NUMG> update_u = [&](u64 i){
             return primary[i] & altdiffer[i].fo1();
@@ -881,7 +1090,7 @@ struct tage : predictor {
         // update incorrect bimodal prediction if primary provider and hysteresis is weak
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(b_weak[offset].fo1(), [&](){
-                bim[offset].write(bindex,branch_taken[offset]);
+                bim[offset].write(bindex,branch_taken[offset],extra_cycle);
             });
         }
         // update bimodal hysteresis if bimodal is primary provider
@@ -1032,14 +1241,33 @@ struct tage : predictor {
         }
 
         // Record exec trace entry via SQLite
-        // insert_trace(
-        //     static_cast<u64>(panel.cycle), pc_val, offset,
-        //     static_cast<u64>(actual), static_cast<u64>(predicted),
-        //     is_misp & is_last,
-        //     pred_source, pred_table, static_cast<u64>(bindex),
-        //     hit_found, hit_table, hit_gtag, hit_gindex,
-        //     is_misp & is_last & alloc_found,
-        //     alloc_table, alloc_gindex_val, alloc_tag_val);
+        {
+            u64 conf_val = 0;
+            if (pred_source == 1 || pred_source == 2) {
+                u64 tbl = (pred_source == 1) ? pred_table :
+                          static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
+                if (tbl < NUMG) conf_val = static_cast<u64>(readh[tbl]);
+            }
+            insert_trace(
+                static_cast<u64>(panel.cycle), pc_val, offset,
+                static_cast<u64>(actual), static_cast<u64>(predicted),
+                is_misp & is_last,
+                pred_source, pred_table, static_cast<u64>(bindex),
+                hit_found, hit_table, hit_gtag, hit_gindex,
+                is_misp & is_last & alloc_found,
+                alloc_table, alloc_gindex_val, alloc_tag_val,
+                conf_val);
+        }
+
+        // Confidence distribution: bucket hysteresis of provider table
+        if (pred_source == 1 || pred_source == 2) {
+            u64 tbl = (pred_source == 1) ? pred_table :
+                      static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
+            if (tbl < NUMG) {
+                u64 hval = static_cast<u64>(readh[tbl]);
+                if (hval < 4) perf_conf[tbl][hval]++;
+            }
+        }
 
         // Misprediction trace (per-PC summary)
         if (!static_cast<bool>(correct)) {
