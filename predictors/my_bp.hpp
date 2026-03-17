@@ -10,7 +10,7 @@
 #include <string>
 #include <sqlite3.h>
 
-// #define SC
+#define SC
 #ifndef SC
 #define USE_ALT_PRED
 #endif
@@ -24,13 +24,18 @@ using namespace hcm;
     struct energy_monitor monitor;
 #endif
 // #define PERF_COUNTERS
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6
 , u64 NUMBANKS=4,u64 NUMWAYS=1,u64 CTRBIT=3,u64 UBIT=2>
 struct my_bp : predictor {
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
     static constexpr u64 LOGBIAS = 8;
     static constexpr u64 PERCWIDTH = 6;
+    static constexpr u64 TOTAL_THREBITS = 16;
+    static constexpr u64 GLOBAL_THREBITS = 15;
+    static constexpr u64 PRE_PC_THREBITS = 11;
+    static constexpr u64 LOGTHREBITS = 5;
+
     static constexpr u64 MINHIST = 4;
     static constexpr u64 USE_ALT_PRED_BITS = 4;
     static constexpr u64 UCTRBITS = 4;
@@ -576,8 +581,8 @@ struct my_bp : predictor {
     rwram<1,(1<<index1_bits),NUMBANKS> table1_pred[LINEINST] {"P1 pred"};
 
     //205ps
-    rwram<TAGW,NUMGTSETS,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
-    // ram<val<TAGW>,(1<<LOGG)> gtag[NUMWAYS][NUMG] {"tags"}; // tags
+    // rwram<TAGW,NUMGTSETS,NUMBANKS> gtag[NUMWAYS][NUMG] {"tags"};
+    ram<val<TAGW>,(1<<LOGG)> gtag[NUMWAYS][NUMG] {"tags"}; // tags
     //183ps
     rwram<1,NUMGTSETS,NUMBANKS> gpred[NUMWAYS][NUMG] {"gpred"};
     //
@@ -590,10 +595,13 @@ struct my_bp : predictor {
     #ifdef SC
     //bias_pc is concat pc and tage
     //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
-    rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
+    ram<val<PERCWIDTH>,(1<<(LOGBIAS-2-LOGLINEINST))> bias_pc[LINEINST<<2] {"Bias pc"};
     arr<reg<PERCWIDTH>,4> bias_lmap {"Bias LMAP"};
 
-    rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
+    arr<reg<PRE_PC_THREBITS>,LOGTHREBITS> thre1 {"thre1"};
+    arr<reg<PRE_PC_THREBITS>,LOGTHREBITS> thre2 {"thre2"};
+    reg<GLOBAL_THREBITS> global_thre;
+    // rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
     #endif
 
     zone UPDATE_ONLY;
@@ -659,6 +667,7 @@ struct my_bp : predictor {
     val<1> is_weak(val<1> pred, val<CTRBIT-1> ctr){
         return select(pred, ctr==ctr.minval, ctr==ctr.maxval);
     }
+
     void tage_predict(val<64> inst_pc)
     {
         val<HTAGBITS>   raw_tag = inst_pc >> (LOGLB+LOGG);
@@ -790,7 +799,6 @@ struct my_bp : predictor {
                 // provider & alt
                 val<1> prov_is_weak = (prov_ctr == val<CTRBIT-1>{0}) & 
                 (match_provider[w][inst] & (notumask.fold_or()!=val<NUMG>{0}));
-                prov_is_weak.fanout(hard<2>{});
 #ifndef SC
                 use_provider[w][inst] = prov_oh.fold_or() &
                 select(alt_oh.fo1().fold_or(),(~prov_is_weak | ~use_alt_on_na_pos_dup[inst]),val<1>{1});
@@ -861,6 +869,23 @@ struct my_bp : predictor {
 
 #endif
 
+    }
+    arr<val<LOGBIAS>,LINEINST> bias_hash_idx(val<64> inst_pc){
+        arr<val<LOGBIAS>,LINEINST> bias_pc_full_index = [&](u64 offset){
+            
+            return (concat(inst_pc >> LOGLB,val<LOGLINEINST>{offset}))^((concat(inst_pc >> LOGLB,val<LOGLINEINST>{offset}))>>(LOGBIAS-5));
+        };
+        return bias_pc_full_index;
+    }
+
+    void sc_predict(val<64> inst_pc){
+        
+        val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(2+2+LOGLINEINST);
+        arr<val<PERCWIDTH>,(LINEINST<<2)> bias = [&](u64 offset){
+            return bias_pc[offset].read(bias_pc_high_index);
+        };
+
+        
     }
     val<1> predict2(val<64> inst_pc)
     {
