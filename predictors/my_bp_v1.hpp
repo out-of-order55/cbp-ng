@@ -3,7 +3,8 @@
 #define USE_META
 #define RESET_UBITS
 #define BANK
-#define SC
+// #define GATE
+#define MY_SC
 // #define HASH_TAG
 #include "../cbp.hpp"
 #include "../harcom.hpp"
@@ -25,16 +26,18 @@ struct my_bp_v1 : predictor {
     static_assert(NUMG>0);
 
     static constexpr u64 PERCWIDTH = 6;
-    static constexpr u64 TOTAL_THREBITS = 10;
-    static constexpr u64 GLOBAL_THREBITS = 9;
+    static constexpr u64 TOTAL_THREBITS = 9;
+    static constexpr u64 GLOBAL_THREBITS = 7;
     static constexpr u64 PRE_PC_THREBITS = 7;
-    static constexpr u64 LOGTHREBITS = 5;
+    // static constexpr u64 LOGTHREBITS = 5;
 
     static constexpr u64 MINHIST = 2;
     static constexpr u64 METABITS = 4;
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 6;
 
+    static constexpr u64 LOGGATEBITS = 10;
+    static constexpr u64 TAGGATEBITS = 6;
 
 #ifdef USE_META
     static constexpr u64 METAPIPE = 2;
@@ -85,6 +88,7 @@ struct my_bp_v1 : predictor {
     reg<LINEINST> p2; // final P2 predictions
     reg<LINEINST> tage_p2; // final P2 predictions
     reg<LINEINST> sc_p2; // final P2 predictions
+    
 
 #ifdef USE_META
     arr<reg<METABITS,i64>,METAPIPE> meta; // select between pred1 and pred2
@@ -436,6 +440,15 @@ struct my_bp_v1 : predictor {
 //     rwram<1,(1<<index1_bits),1<<LOGBANKS> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
 //     rwram<1,(1<<bindex_bits),1<<LOGBANKS> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
 // #else
+    // GATE
+#ifdef GATE
+    rwram<TAGGATEBITS,(1<<LOGGATEBITS),4> gate {"gate"};
+    reg<1> gating;
+    reg<TAGGATEBITS> atag[2];
+    // reg<LOGGATEBITS> aidx[2];
+#endif  
+    
+
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
 
@@ -451,18 +464,28 @@ struct my_bp_v1 : predictor {
     zone UPDATE_ONLY;
     ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
     ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
-    #ifdef SC
+
+    #ifdef MY_SC
     //bias_pc is concat pc and tage
     //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
-    ram<val<PERCWIDTH>,(1<<(LOGBIAS-LOGLINEINST))> bias_pc[LINEINST] {"Bias pc"};
+    arr<reg<TOTAL_THREBITS>,LINEINST> threshold;
+    ram<val<PERCWIDTH>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[4][LINEINST] {"Bias pc"};
     arr<reg<PERCWIDTH>,4> bias_lmap;
+    arr<reg<PERCWIDTH>,LINEINST> bias_map;
+    arr<reg<2>,LINEINST> tage_info;
+    reg<LOGBIAS-LOGLINEINST-2> bias_high_idx;
 
-    arr<reg<PRE_PC_THREBITS>,1<<LOGTHREBITS> thre1;
-    arr<reg<PRE_PC_THREBITS>,1<<LOGTHREBITS> thre2;
+    arr<reg<PRE_PC_THREBITS>,LINEINST> thre1;
     reg<GLOBAL_THREBITS> global_thre;
     arr<reg<TOTAL_THREBITS>,LINEINST> sc_sum;
+    // intermediate update signals
+    arr<reg<1>,LINEINST> sc_wrong_arr;
+    arr<reg<1>,LINEINST> do_update_arr;
+    arr<reg<1>,LINEINST> prov_hit_arr;
+    arr<reg<1>,LINEINST> thre_guard_arr;
     // rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
     #endif
+
 // #endif
     my_bp_v1()
     {
@@ -496,6 +519,7 @@ struct my_bp_v1 : predictor {
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
+    
         inst_pc.fanout(hard<2>{});
         new_block(inst_pc);
         val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
@@ -519,11 +543,31 @@ struct my_bp_v1 : predictor {
     {
         return ((block_entry<<block_size) & p1) != hard<0>{};
     };
+#ifdef GATE
+    void gate_predict2([[maybe_unused]] val<64> inst_pc)
+    {
+        inst_pc.fanout(hard<2>{});
+        val<LOGGATEBITS> lineaddr = inst_pc >> LOGLB;
+        val<TAGGATEBITS> tag = inst_pc >> (LOGLB+LOGGATEBITS);
 
+        // aidx[0] = lineaddr;
+        val<TAGGATEBITS> read_tag = gate.read(lineaddr);
+        atag[1] = atag[0];
+        atag[0] = read_tag;
+
+        gating = (atag[1] == tag);
+    };
+#endif
     void tage_pred(val<64> inst_pc){
+        // inst_pc.fanout(hard<2>{});
+#ifdef GATE
+        inst_pc.fanout(hard<2>{});
+        gate_predict2(inst_pc);
+#endif
         val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<1+NUMG*2>{});
         gfolds.fanout(hard<2>{});
+        // val<1> gate = gate_predict2(inst_pc);
 
         // compute indexes
         bindex = lineaddr;
@@ -531,7 +575,7 @@ struct my_bp_v1 : predictor {
         for (u64 i=0; i<NUMG; i++) {
             gindex[i] = lineaddr ^ gfolds.template get<0>(i);
         }
-        gindex.fanout(hard<4>{});
+        
 
         // compute hashed tags
         for (u64 i=0; i<NUMG; i++) {
@@ -544,15 +588,33 @@ struct my_bp_v1 : predictor {
             readb[offset] = bim[offset].read(bindex);
         }
         readb.fanout(hard<2>{});
+        gindex.fanout(hard<4>{});
+#ifdef GATE
+
+            
+            gating.fanout(hard<4>{});
+            for (u64 i=0; i<NUMG; i++) {
+                execute_if(~gating, [&](){
+                readt[i] = gtag[i].read(gindex[i]);
+                readc[i] = gpred[i].read(gindex[i]);
+                readh[i] = ghyst[i].read(gindex[i]);
+                readu[i] = ubit[i].read(gindex[i]);
+                });
+            }
+
+#else
         for (u64 i=0; i<NUMG; i++) {
             readt[i] = gtag[i].read(gindex[i]);
             readc[i] = gpred[i].read(gindex[i]);
             readh[i] = ghyst[i].read(gindex[i]);
             readu[i] = ubit[i].read(gindex[i]);
         }
+#endif
         readt.fanout(hard<LINEINST+1>{});
         readc.fanout(hard<3>{});
-        readh.fanout(hard<6>{});
+#ifdef MY_SC
+        readh.fanout(hard<1+4*LINEINST>{});
+#endif
         readu.fanout(hard<2>{});
         notumask = ~readu.concat();
         notumask.fanout(hard<2>{});
@@ -569,8 +631,6 @@ struct my_bp_v1 : predictor {
             match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() ); // bimodal is default when no match
         });
 #else
-
-
         // hashed tags comparisons
         arr<val<1>,NUMG> htagcmp_split = [&](int i){return val<HTAGBITS>{readt[i]} == htag[i];};
         val<NUMG> htagcmp = htagcmp_split.fo1().concat();
@@ -590,16 +650,20 @@ struct my_bp_v1 : predictor {
             match1[offset] = match[offset].one_hot();
 
         }
-        match1.fanout(hard<6>{});
+#ifdef MY_SC
+        match1.fanout(hard<3+3*NUMG>{});
+#else
+        match1.fanout(hard<3>{});
+#endif
         for (u64 offset=0; offset<LINEINST; offset++) {
-
+#ifdef MY_SC
             arr<val<1>,NUMG> weakctr = [&](int i) {return (readh[i]==hard<0>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
-            arr<val<1>,NUMG> midctr = [&](int i) {return (readh[i]==hard<1>{}|readh[i]==hard<2>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
+            arr<val<1>,NUMG> midctr = [&](int i) {return ((readh[i]==hard<1>{}) | (readh[i]==hard<2>{})) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
             arr<val<1>,NUMG> highctr = [&](int i) {return (readh[i]==hard<3>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
             prov_weak[offset] = weakctr.fold_or();
             prov_mid[offset] = midctr.fold_or();
             prov_sat[offset] = highctr.fold_or();
-
+#endif
             pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
         }
         pred1.fanout(hard<2>{});
@@ -658,87 +722,77 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
     }
-
+#ifdef MY_SC
     void sc_predict(val<64> inst_pc){
 
         inst_pc.fanout(hard<5>{});
-        match1.fanout(hard<3>{});
+        match1.fanout(hard<2>{});
         pred1.fanout(hard<2>{});
-        prov_weak.fanout(hard<3>{});
+        prov_weak.fanout(hard<2>{});
         //bias
-        val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB);
-        bias_pc_high_index.fanout(hard<(LINEINST)>{});
-        arr<val<PERCWIDTH>,LINEINST> bias = [&](u64 offset){
-            return bias_pc[offset].read(bias_pc_high_index);
-        };
-        arr<val<PERCWIDTH>,LINEINST> bias_pc= [&](u64 offset){
-            return bias.select(val<LOGLINEINST>{offset});
-        };
-        //180ps
-        arr<val<PERCWIDTH>,LINEINST> bias_map= [&](u64 offset){
-            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
-            val<1> prov_pred = pred1[offset] & prov_hit;
-            val<1> is_prov_weak =  prov_weak[offset];
-            val<2> tage_info = concat(prov_pred,is_prov_weak);
-            val<LOGLINEINST> final_low_index = val<LOGLINEINST>{offset} ^ val<LOGLINEINST>{tage_info};
-            //90ps
-            return bias.select(final_low_index);
-        };
-        
-        arr<val<PERCWIDTH>,LINEINST> bias_base= [&](u64 offset){
-            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
-            val<1> prov_pred = pred1[offset] & prov_hit;
-            val<1> is_prov_weak =  prov_weak[offset];
-            val<2> tage_info = concat(prov_pred,is_prov_weak);
-            return bias_lmap.select(tage_info);
-        };
+        val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB+2);
+        bias_pc_high_index.fanout(hard<(LINEINST*4+1)>{});
 
-        val<LOGTHREBITS> base_idx1 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+2)); 
-        val<LOGTHREBITS> base_idx2 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+5));
+        bias_map = arr<val<PERCWIDTH>,LINEINST>{[&](u64 offset){
+            arr<val<PERCWIDTH>,4> bank_out = [&](u64 b){ return bias_pc[b][offset].read(bias_pc_high_index); };
+            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
+            val<1> prov_pred = pred1[offset] & prov_hit;
+            val<1> is_prov_weak =  prov_weak[offset];
+            tage_info[offset] = concat(prov_pred,is_prov_weak);
+            val<PERCWIDTH> result = bank_out.select(tage_info[offset]);
+            return result;
+        }};
+        bias_map.fanout(hard<2>{});
+        bias_high_idx = bias_pc_high_index;
+        // val<LOGTHREBITS> base_idx1 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+2)); 
+        // val<LOGTHREBITS> base_idx2 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+5));
         
-        base_idx1.fanout(hard<LINEINST>{});
-        base_idx2.fanout(hard<LINEINST>{});
-        arr<val<TOTAL_THREBITS>,LINEINST> threshold = [&](u64 offset){
-            val<LOGTHREBITS> idx1 = base_idx1 ^ val<LOGTHREBITS>{offset};
-            val<LOGTHREBITS> idx2 = base_idx2 ^ val<LOGTHREBITS>{offset};
-            return global_thre + thre1.select(idx1) + thre2.select(idx2);
-        };
-        threshold.fanout(hard<3>{});
-        //sum 40ps
-        arr<val<TOTAL_THREBITS>,LINEINST> bias_sum_base = [&](u64 offset){
-            return bias_base[offset] + bias_pc[offset];
-        };
-        //60 ps 2.5 cycle
+        // base_idx1.fanout(hard<LINEINST>{});
+        // base_idx2.fanout(hard<LINEINST>{});
+        threshold = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
+            // val<LOGTHREBITS> idx1 = base_idx1 ^ val<LOGTHREBITS>{offset};
+            // val<LOGTHREBITS> idx2 = base_idx2 ^ val<LOGTHREBITS>{offset};
+            return global_thre + thre1[offset];
+        }};
+        threshold.fanout(hard<4>{});
+
+        //100 ps 2.5 cycle
         sc_sum = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
-            return bias_sum_base[offset] + bias_map[offset];
+            val<TOTAL_THREBITS> res =  bias_map[offset];
+            return res;
         }};
         
-        sc_sum.fanout(hard<3>{});
+        sc_sum.fanout(hard<4>{});
         //100 ps
         use_sc = arr<val<1>,LINEINST>{[&](u64 offset){
             val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
             val<1> is_prov_weak =  prov_weak[offset]; 
             val<1> is_prov_mid = prov_mid[offset];
             val<1> is_prov_high = prov_sat[offset];
-            return prov_hit & (
-                    ((is_prov_weak) & (sc_sum[offset]>(threshold[offset]>>3))));
-            // return prov_hit & (((is_prov_high) & (sc_sum[offset]>(threshold[offset]>>1)))|
-            //         ((is_prov_mid) & (sc_sum[offset]>(threshold[offset]>>2)))|
+            // return prov_hit & (
             //         ((is_prov_weak) & (sc_sum[offset]>(threshold[offset]>>3))));
+            return prov_hit & (((is_prov_high) & (sc_sum[offset]>(threshold[offset]>>1)))|
+                    ((is_prov_mid) & (sc_sum[offset]>(threshold[offset]>>2)))|
+                    ((is_prov_weak) & (sc_sum[offset]>(threshold[offset]>>3))));
         }};
+        use_sc.fanout(hard<2>{});
+        arr<val<1>,LINEINST> sc_pred = [&](u64 offset){
+            return sc_sum[offset] > val<TOTAL_THREBITS>{0};
+        };
         //70ps
         sc_p2 = arr<val<1>,LINEINST> {[&](u64 offset){
             val<1> tage_pred = tage_p2.make_array(val<1>{})[offset];
-            return select(use_sc[offset],sc_sum[offset] > val<TOTAL_THREBITS>{0},tage_pred);
+            return select(use_sc[offset],sc_pred[offset],tage_pred);
         }}.concat();
-        sc_p2.fanout(hard<2>{});
+        // sc_p2.fanout(hard<2>{});
         
     }
+#endif
     val<1> predict2(val<64> inst_pc)
     {
         tage_pred(inst_pc);
         
-    #ifndef SC
+    #ifndef MY_SC
         p2 = tage_p2;
     #else
         sc_predict(inst_pc);
@@ -803,7 +857,10 @@ struct my_bp_v1 : predictor {
         readb.fanout(hard<2>{});
         readt.fanout(hard<4>{});
         readc.fanout(hard<2>{});
-        match1.fanout(hard<3>{});
+        readh.fanout(hard<2>{});
+        //SC fix
+        match1.fanout(hard<4>{});
+        
         match2.fanout(hard<2>{});
         pred1.fanout(hard<2>{});
         pred2.fanout(hard<2+NUMG>{});
@@ -826,7 +883,7 @@ struct my_bp_v1 : predictor {
         arr<val<1>,LINEINST> is_branch = [&](u64 offset){
             return update_mask[offset] != hard<0>{};
         };
-        is_branch.fanout(hard<6>{});
+        is_branch.fanout(hard<8>{});
 
         val<LINEINST> branch_mask = is_branch.concat();
 
@@ -860,7 +917,7 @@ struct my_bp_v1 : predictor {
         arr<val<1>,LINEINST> branch_taken = [&](u64 offset){
             return (actualdirs & update_mask[offset]) != hard<0>{};
         };
-        branch_taken.fanout(hard<3>{});
+        branch_taken.fanout(hard<5>{});
 
         arr<val<NUMG+1>,LINEINST> actual_match1 = [&] (u64 offset) {
             return select(is_branch[offset],match1[offset],val<NUMG+1>{0});
@@ -1009,7 +1066,39 @@ struct my_bp_v1 : predictor {
 
         // need extra cycle for modifying prediction bits and for TAGE allocation
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
+#ifdef MY_SC
+        sc_sum.fanout(hard<2>{});
+        // use_sc.fanout(hard<LINEINST*3>{});
+        // match1.fanout(hard<LINEINST*2>{});
+        branch_pc.fanout(hard<LINEINST*2>{});
+        // threshold.fanout(hard<LINEINST>{});
+
+        // compute intermediate signals once, reuse below
+        sc_wrong_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            val<1> sc_pred_bit = sc_sum[offset] > val<TOTAL_THREBITS>{0};
+            return sc_pred_bit != branch_taken[offset];
+        }};
+        do_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            return sc_wrong_arr[offset] | ~use_sc[offset];
+        }};
+        prov_hit_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            return val<NUMG>{match1[offset]} != val<NUMG>{0};
+        }};
+        thre_guard_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            return sc_sum[offset] > (threshold[offset] >> 1);
+        }};
+        sc_wrong_arr.fanout(hard<3>{});
+        do_update_arr.fanout(hard<3>{});
+        prov_hit_arr.fanout(hard<3>{});
+        thre_guard_arr.fanout(hard<2>{});
+
+        val<1> sc_need_update = arr<val<1>,LINEINST>{[&](u64 offset){
+            return is_branch[offset] & do_update_arr[offset];
+        }}.fold_or();
+        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | sc_need_update;
+#else
         val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
+#endif
         extra_cycle.fanout(hard<NUMG*2+1>{});
         need_extra_cycle(extra_cycle);
 
@@ -1138,6 +1227,41 @@ struct my_bp_v1 : predictor {
             global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
             gfolds.update(val<PATHBITS>{next_pc>>2});
         });
+
+
+#ifdef MY_SC
+
+
+        //global_thre: majority vote across all qualifying offsets
+        arr<val<1>,LINEINST> thre_update_en = [&](u64 offset){
+            return is_branch[offset] & do_update_arr[offset] & thre_guard_arr[offset] & prov_hit_arr[offset];
+        };
+        thre_update_en.fanout(hard<2>{});
+        arr<val<1>,LINEINST> thre_wrong_bits = [&](u64 offset){
+            return thre_update_en[offset] & sc_wrong_arr[offset];
+        };
+        
+        // thre_wrong_bits.fanout(hard<1>{});
+
+        
+        bias_high_idx.fanout(hard<LINEINST>{});
+        // per-offset updates: bias_pc and thre1 (no write conflicts)
+        for (u64 offset = 0; offset < LINEINST; offset++) {
+            val<LOGBIAS-LOGLINEINST-2> high_idx = bias_high_idx;
+            val<PERCWIDTH> old_bias = bias_map[offset];
+            val<2> write_tage_info = tage_info[offset];
+            val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
+            val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, ~sc_wrong_arr[offset]);
+
+            for (u64 bank = 0; bank < 4; bank++){
+                execute_if((write_tage_info==val<2>{bank}) & prov_hit_arr[offset] & (is_branch[offset] & do_update_arr[offset]), [&](){
+                    bias_pc[bank][offset].write(high_idx, update_ctr(old_bias, branch_taken[offset]));
+                });
+            }
+            
+            thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
+        }
+#endif
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
@@ -1282,6 +1406,8 @@ struct my_bp_v1 : predictor {
     }
 #endif
 #endif
+
+
 
         num_branch = 0; // done
     }
