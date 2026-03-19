@@ -20,9 +20,9 @@
 #include "common.hpp"
 #include "tutorial/energy_monitor.hpp"
 using namespace hcm;
-#ifdef DEBUG_ENERGY
-    struct energy_monitor monitor;
-#endif
+// #ifdef DEBUG_ENERGY
+//     struct energy_monitor monitor;
+// #endif
 // #define PERF_COUNTERS
 template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=12, u64 GHIST=400, u64 LOGP1=14, u64 GHIST1=6
 , u64 NUMBANKS=4,u64 NUMWAYS=1,u64 CTRBIT=3,u64 UBIT=2>
