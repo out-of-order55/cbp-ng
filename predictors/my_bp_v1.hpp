@@ -2,10 +2,21 @@
 
 #define USE_META
 #define RESET_UBITS
-// #define BANK
+
 // #define GATE
 #define MY_SC
+// #define SC_FGEHL
+// #define SC_DISABLE_BIAS
+// #define SC_DISABLE_GEHL
 // #define HASH_TAG
+
+#if !defined(SC_DISABLE_BIAS)
+#define SC_USE_BIAS
+#endif
+
+#if !defined(SC_DISABLE_GEHL)
+#define SC_USE_GEHL
+#endif
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
@@ -20,17 +31,24 @@ using namespace hcm;
 #ifdef DEBUG_ENERGY
     struct energy_monitor monitor;
 #endif
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=12, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 2,u64 LOGBIAS = 11>
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
 struct my_bp_v1 : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
 
+    //TODO:need review
     static constexpr u64 PERCWIDTH = 6;
-    static constexpr u64 TOTAL_THREBITS = 9;
-    static constexpr u64 GLOBAL_THREBITS = 7;
-    static constexpr u64 PRE_PC_THREBITS = 7;
+    static constexpr u64 NUMGEHL = 2;
+    static constexpr u64 LOGGEHL = 10;
+#ifdef SC_FGEHL
+    static constexpr u64 LOGFGEHL = LOGGEHL;
+    static constexpr u64 FHIST_BITS = 48;
+#endif
+    static constexpr u64 TOTAL_THREBITS = 10;
+    static constexpr u64 GLOBAL_THREBITS = 10;
+    static constexpr u64 PRE_PC_THREBITS = 10;
     // static constexpr u64 LOGTHREBITS = 5;
 
     static constexpr u64 MINHIST = 2;
@@ -38,8 +56,9 @@ struct my_bp_v1 : predictor {
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 6;
 
-    static constexpr u64 LOGGATEBITS = 10;
-    static constexpr u64 TAGGATEBITS = 6;
+    static constexpr u64 LOGGATEBITS = 5;
+    static constexpr u64 TAGGATEBITS = 8;
+    static constexpr u64 CTRGATEBITS = 3;
 
 #ifdef USE_META
     static constexpr u64 METAPIPE = 2;
@@ -48,6 +67,10 @@ struct my_bp_v1 : predictor {
     static constexpr u64 LINEINST = 1<<LOGLINEINST;
     static_assert(LOGP1 > LOGLINEINST);
     static_assert(LOGB > LOGLINEINST);
+    static_assert(LOGGEHL > LOGLINEINST);
+#ifdef SC_FGEHL
+    static_assert(LOGFGEHL > LOGLINEINST);
+#endif
     static constexpr u64 index1_bits = LOGP1-LOGLINEINST;
     static constexpr u64 bindex_bits = LOGB-LOGLINEINST;
     static_assert(TAGW > LOGLINEINST); // the unhashed line offset is part of the tag
@@ -56,7 +79,9 @@ struct my_bp_v1 : predictor {
 #else
     static constexpr u64 HTAGBITS = TAGW-LOGLINEINST; // hashed tag bits
 #endif
+
     geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
+
     reg<1> true_block = 1;
 
     // for P1
@@ -65,33 +90,35 @@ struct my_bp_v1 : predictor {
     arr<reg<1>,LINEINST> readp1; // prediction bits read from P1 table for each offset
     reg<LINEINST> p1; // P1 predictions
 
-    // for P2
-    reg<bindex_bits> bindex; // bimodal table index
-    arr<reg<LOGG>,NUMG> gindex; // global tables indexes
-    arr<reg<HTAGBITS>,NUMG> htag; // computed hashed tags
 
-    arr<reg<1>,LINEINST> readb; // read bimodal prediction bit for each offset
-    arr<reg<TAGW>,NUMG> readt; // read tags
-    arr<reg<1>,NUMG> readc; // read predictions
-    arr<reg<2>,NUMG> readh; // read hysteresis
-    arr<reg<1>,NUMG> readu; // read u bits
-    reg<NUMG> notumask; // read u bits, inverted
 
-    arr<reg<NUMG+1>,LINEINST> match; // all matches for each offset
-    arr<reg<NUMG+1>,LINEINST> match1; // longest match for each offset
-    arr<reg<NUMG+1>,LINEINST> match2; // second longest match for each offset
-    arr<reg<1>,LINEINST> prov_weak;
-    arr<reg<1>,LINEINST> prov_mid; 
-    arr<reg<1>,LINEINST> prov_sat;  
 
-    arr<reg<1>,LINEINST> pred1; // primary P2 prediction for each offset
+
     arr<reg<1>,LINEINST> pred2; // alternate P2 prediction for each offset
     arr<reg<1>,LINEINST> use_sc; // alternate P2 prediction for each offset
     reg<LINEINST> p2; // final P2 predictions
     reg<LINEINST> tage_p2; // final P2 predictions
     reg<LINEINST> sc_p2; // final P2 predictions
     arr<reg<1>,LINEINST> sc_pred;
-    
+    arr<reg<NUMG+1>,LINEINST> match; // all matches for each offset
+    arr<reg<NUMG+1>,LINEINST> match1; // longest match for each offset
+    arr<reg<NUMG+1>,LINEINST> match2; // second longest match for each offset
+    arr<reg<1>,LINEINST> prov_weak;
+    arr<reg<1>,LINEINST> prov_mid; 
+    arr<reg<1>,LINEINST> prov_sat;  
+    // for P2
+    reg<bindex_bits> bindex; // bimodal table index
+    arr<reg<LOGG>,NUMG> gindex; // global tables indexes
+    arr<reg<HTAGBITS>,NUMG> htag; // computed hashed tags
+    arr<reg<1>,LINEINST> readb; // read bimodal prediction bit for each offset
+    arr<reg<TAGW>,NUMG> readt; // read tags
+    arr<reg<1>,NUMG> readc; // read predictions
+    arr<reg<2>,NUMG> readh; // read hysteresis
+    arr<reg<1>,NUMG> readu; // read u bits
+    reg<NUMG> notumask; // read u bits, inverted 
+
+    arr<reg<1>,LINEINST> pred1; // primary P2 prediction for each offset
+
 
 #ifdef USE_META
     arr<reg<METABITS,i64>,METAPIPE> meta; // select between pred1 and pred2
@@ -146,6 +173,12 @@ struct my_bp_v1 : predictor {
     u64 perf_extra_cycle_badpred = 0;   // weak & wrong TAGE prediction
     u64 perf_extra_cycle_mispredict = 0;
     u64 perf_extra_cycle_p1_update = 0; // P1 disagree
+#ifdef GATE
+    u64 perf_gate_count = 0;         // times gating==1 (TAGE skipped, fall back to P1)
+    u64 perf_gate_mispred = 0;       // gating==1 and block mispredicted
+    u64 perf_gate_update_inc = 0;    // gate_inc triggered (no-disagree, correct, hit)
+    u64 perf_gate_update_dec = 0;    // gate_dec triggered (mispred, hit)
+#endif
 #ifdef MY_SC
     u64 perf_extra_cycle_sc_update = 0; // SC needs update
     // SC prediction source counters
@@ -155,6 +188,8 @@ struct my_bp_v1 : predictor {
     u64 perf_thre_update = 0;        // thre1 updated
     u64 perf_thre_update_inc = 0;    // thre1 incremented (sc wrong)
     u64 perf_thre_update_dec = 0;    // thre1 decremented (sc correct)
+    // gate counters
+
 #endif
 
     // Confidence distribution per table: [table][0..3] = ctr value buckets
@@ -396,6 +431,17 @@ struct my_bp_v1 : predictor {
         std::cerr << std::setw(7) << std::right << perf_thre_update_inc << " inc │ ";
         std::cerr << std::setw(7) << std::right << perf_thre_update_dec << " dec │\n";
 #endif
+#ifdef GATE
+        // Gate counters row
+        std::cerr << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
+        std::cerr << "│ Gate cnt │ " << perf_gate_count << " │ ";
+        std::cerr << "misp=" << perf_gate_mispred;
+        if (perf_gate_count > 0)
+            std::cerr << " (" << std::fixed << std::setprecision(1)
+                      << (100.0*perf_gate_mispred/perf_gate_count) << "%)";
+        std::cerr << " │ inc=" << perf_gate_update_inc
+                  << " dec=" << perf_gate_update_dec << " │\n";
+#endif
 
         // Total row
         std::cerr << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
@@ -484,29 +530,26 @@ struct my_bp_v1 : predictor {
 #endif
 
 #ifdef GATE
-    rwram<TAGGATEBITS,(1<<LOGGATEBITS),4> gate {"gate"};
+    // ram<val<TAGGATEBITS>,(1<<LOGGATEBITS)> gate_tag {"gate_tag"};
+    // ram<val<1>,(1<<LOGGATEBITS)> gate_pred {"gate_pred"};
+    // ram<val<CTRGATEBITS-1>,(1<<LOGGATEBITS)> gate_hyst {"gate_hyst"};
+    // reg<1> gating;
+    // reg<TAGGATEBITS> atag[2];
+    // reg<1> apred[2];
+
+    arr<reg<TAGGATEBITS>,(1<<LOGGATEBITS)> gate_tag[3];
+    arr<reg<CTRGATEBITS>,(1<<LOGGATEBITS)> gate_ctr[3];
+    reg<LOGGATEBITS> gate_idx;
+    reg<1> gate_hit;
+    reg<TAGGATEBITS> line_tag;
+    reg<CTRGATEBITS> read_gate_ctr;
     reg<1> gating;
     reg<TAGGATEBITS> atag[2];
-    // reg<LOGGATEBITS> aidx[2];
+    reg<1> apred[2];
+    reg<LOGGATEBITS> aidx[2];//for update
 #endif  
     
-#ifdef BANK
-    // P1 (gshare)
-    rwram<1,(1<<index1_bits),1<<LOGBANKS> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
 
-    // P2 (TAGE)
-    rwram<TAGW,(1<<LOGG),1<<LOGBANKS> gtag[NUMG] {"tags"}; // tags
-    // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
-    rwram<1,(1<<LOGG),1<<LOGBANKS> gpred[NUMG] {"gpred"}; // predictions
-    rwram<2,(1<<LOGG),1<<LOGBANKS> ghyst[NUMG] {"ghyst"}; // hysteresis
-
-    rwram<1,(1<<LOGG),1<<LOGBANKS> ubit[NUMG] {"u"}; // "useful" bits
-    rwram<1,(1<<bindex_bits),1<<LOGBANKS> bim[LINEINST] {"bpred"}; // bimodal prediction bits
-
-    zone UPDATE_ONLY;
-    rwram<1,(1<<index1_bits),1<<LOGBANKS> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
-    rwram<1,(1<<bindex_bits),1<<LOGBANKS> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
-#else
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
 
@@ -517,32 +560,47 @@ struct my_bp_v1 : predictor {
     rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
 
     rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
-    rwram<1,(1<<bindex_bits),4> bim[LINEINST] {"bpred"}; // bimodal prediction bits
-
-    zone UPDATE_ONLY;
-    ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
-    ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
-#endif
+    ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
     #ifdef MY_SC
     //bias_pc is concat pc and tage
     //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
     arr<reg<TOTAL_THREBITS>,LINEINST> threshold;
+#ifdef SC_USE_BIAS
     ram<val<PERCWIDTH,i64>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[4][LINEINST] {"Bias pc"};
     arr<reg<PERCWIDTH,i64>,4> bias_lmap;
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_map;
     arr<reg<2>,LINEINST> tage_info;
     reg<LOGBIAS-LOGLINEINST-2> bias_high_idx;
+#endif
 
     arr<reg<PRE_PC_THREBITS>,LINEINST> thre1;
     reg<GLOBAL_THREBITS> global_thre;
     arr<reg<TOTAL_THREBITS,i64>,LINEINST> sc_sum;
+#ifdef SC_USE_GEHL
+    arr<reg<LOGGEHL-LOGLINEINST>,NUMGEHL> gehl_idx;
+    ram<val<PERCWIDTH,i64>,(1<<(LOGGEHL-LOGLINEINST))> gehl[NUMGEHL][LINEINST] {"GEHL"};
+    arr<reg<PERCWIDTH,i64>,LINEINST> gehl_map[NUMGEHL];
+#endif
+#ifdef SC_FGEHL
+    reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
+    ram<val<PERCWIDTH,i64>,(1<<(LOGFGEHL-LOGLINEINST))> fgehl[LINEINST] {"FGEHL"};
+    arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
+    reg<FHIST_BITS> fhist;
+#endif
     // intermediate update signals
     arr<reg<1>,LINEINST> sc_wrong_arr;
     arr<reg<1>,LINEINST> do_update_arr;
     arr<reg<1>,LINEINST> prov_hit_arr;
     arr<reg<1>,LINEINST> thre_guard_arr;
     // rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
+
+    
     #endif
+    zone UPDATE_ONLY;
+    ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
+    ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
+
+
 
 // #endif
     my_bp_v1()
@@ -582,9 +640,14 @@ struct my_bp_v1 : predictor {
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
+
     
-        inst_pc.fanout(hard<2>{});
+        inst_pc.fanout(hard<3>{});
         new_block(inst_pc);
+#ifdef GATE
+        gate_predict2(inst_pc);
+#endif
+
         val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<2>{});
         if constexpr (GHIST1 <= index1_bits) {
@@ -592,6 +655,7 @@ struct my_bp_v1 : predictor {
         } else {
             index1 = global_history1.make_array(val<index1_bits>{}).append(lineaddr).fold_xor();
         }
+
         index1.fanout(hard<LINEINST>{});
         for (u64 offset=0; offset<LINEINST; offset++) {
             readp1[offset] = table1_pred[offset].read(index1);
@@ -609,24 +673,32 @@ struct my_bp_v1 : predictor {
 #ifdef GATE
     void gate_predict2([[maybe_unused]] val<64> inst_pc)
     {
-        inst_pc.fanout(hard<2>{});
-        val<LOGGATEBITS> lineaddr = inst_pc >> LOGLB;
-        val<TAGGATEBITS> tag = inst_pc >> (LOGLB+LOGGATEBITS);
+        inst_pc.fanout(hard<3>{});
+        gate_idx = inst_pc >> LOGLB;
+        gate_idx.fanout(hard<2*(1<<LOGGATEBITS)>{});
+        line_tag = (inst_pc >> (LOGLB+LOGGATEBITS)) ^ (inst_pc >> (LOGLB+LOGGATEBITS+TAGGATEBITS));
+        val<TAGGATEBITS> tag =  (inst_pc >> (LOGLB+LOGGATEBITS)) ^ (inst_pc >> (LOGLB+LOGGATEBITS+TAGGATEBITS));
 
         // aidx[0] = lineaddr;
-        val<TAGGATEBITS> read_tag = gate.read(lineaddr);
-        atag[1] = atag[0];
-        atag[0] = read_tag;
-
-        gating = (atag[1] == tag);
+        
+        val<TAGGATEBITS> read_tag = arr<val<TAGGATEBITS>,(1<<LOGGATEBITS)>{[&](u64 i){
+            return select(gate_idx == val<LOGGATEBITS>{i}, val<TAGGATEBITS>{gate_tag[2][i]}, val<TAGGATEBITS>{0});
+        }}.fold_or();
+        read_gate_ctr = arr<val<CTRGATEBITS>,(1<<LOGGATEBITS)>{[&](u64 i){
+            return select(gate_idx == val<LOGGATEBITS>{i}, val<CTRGATEBITS>{gate_ctr[2][i]}, val<CTRGATEBITS>{0});
+        }}.fold_or();
+        
+        // atag[1] = atag[0];
+        // apred[1] = apred[0];
+        // apred[0] = read_pred;
+        // atag[0] = read_tag;
+        read_tag.fanout(hard<2>{});
+        tag.fanout(hard<2>{});
+        gate_hit = (read_tag == tag);
+        gating = ((read_tag == tag) & (read_gate_ctr == val<CTRGATEBITS>{7}));
     };
 #endif
     void tage_pred(val<64> inst_pc){
-        // inst_pc.fanout(hard<2>{});
-#ifdef GATE
-        inst_pc.fanout(hard<2>{});
-        gate_predict2(inst_pc);
-#endif
         val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<1+NUMG*2>{});
         gfolds.fanout(hard<2>{});
@@ -638,7 +710,7 @@ struct my_bp_v1 : predictor {
         for (u64 i=0; i<NUMG; i++) {
             gindex[i] = lineaddr ^ gfolds.template get<0>(i);
         }
-        
+      
 
         // compute hashed tags
         for (u64 i=0; i<NUMG; i++) {
@@ -658,26 +730,22 @@ struct my_bp_v1 : predictor {
             gating.fanout(hard<4>{});
             for (u64 i=0; i<NUMG; i++) {
                 execute_if(~gating, [&](){
-                readt[i] = gtag[i].read(gindex[i]);
-                readc[i] = gpred[i].read(gindex[i]);
-                readh[i] = ghyst[i].read(gindex[i]);
-                readu[i] = ubit[i].read(gindex[i]);
+                    readt[i] = gtag[i].read(gindex[i]);
+                    readc[i] = gpred[i].read(gindex[i]);
+                    readh[i] = ghyst[i].read(gindex[i]);
+                    readu[i] = ubit[i].read(gindex[i]);
                 });
             }
 
 #else
-#ifdef DEBUG_ENERGY
-        energy_checkpoint(monitor);
-#endif
+
         for (u64 i=0; i<NUMG; i++) {
             readt[i] = gtag[i].read(gindex[i]);
             readc[i] = gpred[i].read(gindex[i]);
             readh[i] = ghyst[i].read(gindex[i]);
             readu[i] = ubit[i].read(gindex[i]);
         }
-#ifdef DEBUG_ENERGY
-        energy_checkpoint(monitor);
-#endif
+
 #endif
         readt.fanout(hard<LINEINST+1>{});
         readc.fanout(hard<3>{});
@@ -795,10 +863,14 @@ struct my_bp_v1 : predictor {
     void sc_predict(val<64> inst_pc){
 
         // inst_pc.fanout(hard<5>{});
+#if !defined(SC_USE_BIAS) && !defined(SC_USE_GEHL) && !defined(SC_FGEHL)
+        static_cast<void>(inst_pc);
+#endif
         match1.fanout(hard<2>{});
         pred1.fanout(hard<2>{});
         prov_weak.fanout(hard<2>{});
-        //bias
+        // bias
+#ifdef SC_USE_BIAS
         val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB+2);
         bias_pc_high_index.fanout(hard<(LINEINST*4+1)>{});
 #ifdef DEBUG_ENERGY
@@ -818,10 +890,37 @@ struct my_bp_v1 : predictor {
 #endif
         bias_map.fanout(hard<2>{});
         bias_high_idx = bias_pc_high_index;
+#endif
+#ifdef SC_USE_GEHL
+        val<LOGGEHL-LOGLINEINST> gehl_base_index = inst_pc >> LOGLB;
+        gfolds.fanout(hard<NUMGEHL>{});
+        gehl_base_index.fanout(hard<NUMGEHL>{});
+        for (u64 k = 0; k < NUMGEHL; k++) {
+            val<LOGGEHL-LOGLINEINST> idx = gehl_base_index ^ val<LOGGEHL-LOGLINEINST>{gfolds.template get<0>(k+1)};
+            idx.fanout(hard<LINEINST+1>{});
+            gehl_idx[k] = idx;
+            gehl_map[k] = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+                return gehl[k][offset].read(idx);
+            }};
+            gehl_map[k].fanout(hard<2>{});
+        }
+#endif
+#ifdef SC_FGEHL
+        val<LOGFGEHL-LOGLINEINST> fgehl_base_index = inst_pc >> LOGLB;
+        val<FHIST_BITS> fh_mix = val<FHIST_BITS>{fhist} ^ (val<FHIST_BITS>{fhist} >> hard<13>{}) ^ (val<FHIST_BITS>{fhist} >> hard<29>{});
+        val<LOGFGEHL-LOGLINEINST> fidx = fgehl_base_index ^ val<LOGFGEHL-LOGLINEINST>{fh_mix};
+        fidx.fanout(hard<LINEINST+1>{});
+        fgehl_idx = fidx;
+        fgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            return fgehl[offset].read(fidx);
+        }};
+        fgehl_map.fanout(hard<2>{});
+#endif
         // val<LOGTHREBITS> base_idx1 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+2)); 
         // val<LOGTHREBITS> base_idx2 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+5));
         
         // base_idx1.fanout(hard<LINEINST>{});
+
         // base_idx2.fanout(hard<LINEINST>{});
         threshold = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
             // val<LOGTHREBITS> idx1 = base_idx1 ^ val<LOGTHREBITS>{offset};
@@ -832,12 +931,39 @@ struct my_bp_v1 : predictor {
 
         //100 ps 2.5 cycle
         sc_sum = arr<val<TOTAL_THREBITS,i64>,LINEINST>{[&](u64 offset){
-            val<PERCWIDTH> bias = bias_map[offset];
+#if !defined(SC_USE_BIAS) && !defined(SC_USE_GEHL) && !defined(SC_FGEHL)
+            static_cast<void>(offset);
+#endif
+#ifdef SC_USE_BIAS
+            val<PERCWIDTH,i64> bias = bias_map[offset];
             bias.fanout(hard<2>{});
-            val<1> sign_bit = val<1>{bias >> hard<PERCWIDTH-1>{}};
-            // sign_bit.fanout(hard<TOTAL_THREBITS-PERCWIDTH>{});
-            val<TOTAL_THREBITS,i64> res = concat(sign_bit.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bias});
-            return res;
+            val<1> bias_sign = val<1>{bias >> hard<PERCWIDTH-1>{}};
+            val<TOTAL_THREBITS,i64> bias_ext = concat(bias_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bias});
+#else
+            val<TOTAL_THREBITS,i64> bias_ext = val<TOTAL_THREBITS,i64>{0};
+#endif
+#ifdef SC_USE_GEHL
+            val<PERCWIDTH,i64> gehl0 = gehl_map[0][offset];
+            val<PERCWIDTH,i64> gehl1 = gehl_map[1][offset];
+            gehl0.fanout(hard<2>{});
+            gehl1.fanout(hard<2>{});
+            val<1> gehl0_sign = val<1>{gehl0 >> hard<PERCWIDTH-1>{}};
+            val<1> gehl1_sign = val<1>{gehl1 >> hard<PERCWIDTH-1>{}};
+            val<TOTAL_THREBITS,i64> gehl0_ext = concat(gehl0_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{gehl0});
+            val<TOTAL_THREBITS,i64> gehl1_ext = concat(gehl1_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{gehl1});
+#else
+            val<TOTAL_THREBITS,i64> gehl0_ext = val<TOTAL_THREBITS,i64>{0};
+            val<TOTAL_THREBITS,i64> gehl1_ext = val<TOTAL_THREBITS,i64>{0};
+#endif
+#ifdef SC_FGEHL
+            val<PERCWIDTH,i64> fgehl_v = fgehl_map[offset];
+            fgehl_v.fanout(hard<2>{});
+            val<1> fgehl_sign = val<1>{fgehl_v >> hard<PERCWIDTH-1>{}};
+            val<TOTAL_THREBITS,i64> fgehl_ext = concat(fgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{fgehl_v});
+            return bias_ext + gehl0_ext + gehl1_ext + fgehl_ext;
+#else
+            return bias_ext + gehl0_ext + gehl1_ext;
+#endif
         }};
         
         sc_sum.fanout(hard<5>{});
@@ -872,13 +998,23 @@ struct my_bp_v1 : predictor {
     val<1> predict2(val<64> inst_pc)
     {
         tage_pred(inst_pc);
-        
+#ifdef GATE
+    gating.fanout(hard<2>{});
+    p1.fanout(hard<2>{});        
+    #ifndef MY_SC
+        p2 = select(gating,p1,tage_p2);
+    #else
+        sc_predict(inst_pc);
+        p2 = select(gating,p1,sc_p2);
+    #endif
+#else
     #ifndef MY_SC
         p2 = tage_p2;
     #else
         sc_predict(inst_pc);
         p2 = sc_p2;
     #endif
+#endif
         // p2 = tage_p2;
         p2.fanout(hard<LINEINST>{});
         val<1> taken = (block_entry & p2) != hard<0>{};
@@ -927,7 +1063,8 @@ struct my_bp_v1 : predictor {
             });
             return; // stop here
         }
-        mispredict.fanout(hard<NUMG+2>{});
+        //TODO: gate
+        mispredict.fanout(hard<NUMG+2+3>{});
         val<1> correct_pred = ~mispredict;
         correct_pred.fanout(hard<NUMG+2>{});
         index1.fanout(hard<LINEINST*3>{});
@@ -1120,7 +1257,8 @@ struct my_bp_v1 : predictor {
 #endif
         // do P1 and P2 agree?
         val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
-        disagree_mask.fanout(hard<2>{});
+        //TODO:gate
+        disagree_mask.fanout(hard<2+2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
 
@@ -1132,13 +1270,22 @@ struct my_bp_v1 : predictor {
             });
         };
 
+
+
+        //TODO:gate
         // read the bimodal hysteresis if bimodal caused a misprediction
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
             // returns 1 iff cause of misprediction and hysteresis is weak
             val<1> bim_primary = actual_match1[offset] >> NUMG;
+#ifdef GATE
+            return execute_if(bim_primary.fo1() & primary_wrong[offset] & (~gating), [&](){
+                return ~bhyst[offset].read(bindex); // hyst=0 means weak
+            });
+#else
             return execute_if(bim_primary.fo1() & primary_wrong[offset], [&](){
                 return ~bhyst[offset].read(bindex); // hyst=0 means weak
             });
+#endif
         };
 
         // determine which primary global predictions are incorrect with a weak hysteresis
@@ -1146,7 +1293,12 @@ struct my_bp_v1 : predictor {
             // returns 1 iff incorrect primary prediction and hysteresis is weak
             return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
         };
-
+#ifdef GATE
+        arr<val<1>,NUMG> g_sat = [&] (u64 i) -> val<1> {
+            // returns 1 iff incorrect primary prediction and hysteresis is weak
+            return primary[i] & (readh[i]==hard<3>{});
+        };
+#endif
         // need extra cycle for modifying prediction bits and for TAGE allocation
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
 #ifdef MY_SC
@@ -1187,6 +1339,7 @@ struct my_bp_v1 : predictor {
 #else
         val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
 #endif
+
         extra_cycle.fanout(hard<NUMG*2+1>{});
         need_extra_cycle(extra_cycle);
 #ifdef CHEATING_MODE
@@ -1220,17 +1373,19 @@ struct my_bp_v1 : predictor {
         using meta_t = valt<decltype(meta[0])>;
         meta[0] = select(newmeta>meta_t::maxval, meta_t{meta_t::maxval}, select(newmeta<meta_t::minval, meta_t{meta_t::minval}, meta_t{newmeta}));
 #endif
-#ifdef HASH_TAG
-        for (u64 i=0; i<NUMG; i++) {
-            execute_if(allocate[i], [&](){gtag[i].write(gindex[i],last_offset^htag[i]);});
-        }
-#else
-        // overwrite the tag in the allocated entry (mispredict)
-        for (u64 i=0; i<NUMG; i++) {
-            execute_if(allocate[i], [&](){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
-        }
 
-#endif
+        #ifdef HASH_TAG
+                for (u64 i=0; i<NUMG; i++) {
+                    execute_if(allocate[i], [&](){gtag[i].write(gindex[i],last_offset^htag[i]);});
+                }
+        #else
+                // overwrite the tag in the allocated entry (mispredict)
+                for (u64 i=0; i<NUMG; i++) {
+                    execute_if(allocate[i], [&](){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
+                }
+
+        #endif
+
         // update the u bits
         arr<val<1>,NUMG> update_u = [&](u64 i){
             return primary[i] & altdiffer[i].fo1();
@@ -1241,18 +1396,6 @@ struct my_bp_v1 : predictor {
         arr<val<1>,NUMG> uclear = uclearmask.fo1().make_array(val<1>{});
         uclear.fanout(hard<2>{});
 
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-    if (static_cast<bool>(noalloc) && static_cast<bool>(mispredict)) {
-        perf_alloc_failures++;
-        if (static_cast<bool>(postmask == hard<0>{})) {
-            perf_alloc_fail_highest++;
-        } else {
-            perf_alloc_fail_noubit++;
-        }
-    }
-#endif
-#endif
         for (u64 i=0; i<NUMG; i++) {
             execute_if(update_u[i].fo1() | allocate[i] | uclear[i], [&]() {
                 val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i];
@@ -1278,9 +1421,10 @@ struct my_bp_v1 : predictor {
         // update incorrect bimodal prediction if primary provider and hysteresis is weak
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(b_weak[offset].fo1(), [&](){
-                bim[offset].write(bindex,branch_taken[offset],extra_cycle);
+                bim[offset].write(bindex,branch_taken[offset]);
             });
         }
+
         // update bimodal hysteresis if bimodal is primary provider
         for (u64 offset=0; offset<LINEINST; offset++) {
             val<1> bim_primary = match1[offset] >> NUMG;
@@ -1296,9 +1440,10 @@ struct my_bp_v1 : predictor {
                 gpred[i].write(gindex[i],bdir[i]);
             });
         }
+
         // update global prediction hysteresis if primary provider or allocated entry
         for (u64 i=0; i<NUMG; i++) {
-            execute_if(primary[i] | allocate[i], [&](){
+            execute_if((primary[i] | allocate[i]), [&](){
                 // if allocated entry, set hysteresis to 0;
                 // otherwise, increment hysteresis if correct pred, decrement if incorrect
                 val<2> newhyst = select(allocate[i],val<2>{0},update_ctr(readh[i],~badpred1[i]));
@@ -1317,6 +1462,48 @@ struct my_bp_v1 : predictor {
         execute_if(uctrsat,[&](){for (auto &uram : ubit) uram.reset();});
 #endif
 
+#ifdef GATE
+
+        gate_hit.fanout(hard<3>{});
+        
+        val<1> gate_alloc = (disagree_mask == hard<0>{}) & (~mispredict) & (~gating) & (~gate_hit) & g_sat.fold_or();
+        val<1> gate_inc = (disagree_mask == hard<0>{}) & (~mispredict) & gate_hit &  g_sat.fold_or();
+        val<1> gate_dec = mispredict & gate_hit;
+        
+        gate_idx.fanout(hard<(1<<LOGGATEBITS)>{});
+        line_tag.fanout(hard<(1<<LOGGATEBITS)>{});
+        gate_alloc.fanout(hard<(1<<LOGGATEBITS)>{});
+        gate_inc.fanout(hard<(1<<LOGGATEBITS)*2>{});
+        gate_dec.fanout(hard<(1<<LOGGATEBITS)>{});
+        gate_ctr[0].fanout(hard<4>{});
+        gate_ctr[1].fanout(hard<2>{});
+        // gate_ctr[2].fanout(hard<3>{});
+        // gate_inc
+        for (u64 i=0; i<(1<<LOGGATEBITS); i++) {
+            val<1> tag_match = gate_idx == val<LOGGATEBITS>{i};
+            tag_match.fanout(hard<2>{});
+            //one pipe delay
+            gate_tag[2][i] = gate_tag[1][i];
+            gate_ctr[2][i] = gate_ctr[1][i];
+            gate_tag[1][i] = gate_tag[0][i];
+            gate_ctr[1][i] = gate_ctr[0][i];
+            execute_if(tag_match & gate_alloc, [&](){
+                gate_tag[0][i] = line_tag;
+            });
+            execute_if(tag_match & (gate_inc | gate_dec), [&](){
+                gate_ctr[0][i] = select(gate_inc, update_ctr(gate_ctr[0][i], val<1>{1}), gate_ctr[0][i]>>1);
+            });
+        }
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_gate_count      += static_cast<u64>(gating);
+        perf_gate_mispred    += static_cast<u64>(gating & mispredict);
+        perf_gate_update_inc += static_cast<u64>(gate_inc);
+        perf_gate_update_dec += static_cast<u64>(gate_dec);
+#endif
+#endif
+#endif
+
         // update global history
         val<1> line_end = block_entry >> (LINEINST-block_size);
         true_block = correct_pred | branch_dir[num_branch-1] | line_end.fo1();
@@ -1326,6 +1513,19 @@ struct my_bp_v1 : predictor {
             global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
             gfolds.update(val<PATHBITS>{next_pc>>2});
         });
+
+#if defined(MY_SC) && defined(SC_FGEHL)
+        // FGEHL history: use existing framework signals only (last resolved branch + block next_pc)
+        val<64> last_branch_pc = branch_pc[num_branch-1];
+        val<1> last_branch_taken = branch_dir[num_branch-1];
+        val<1> last_forward = next_pc > last_branch_pc;
+        val<FHIST_BITS> next_pc_fold = val<FHIST_BITS>{next_pc >> 2};
+        val<FHIST_BITS> branch_pc_fold = val<FHIST_BITS>{last_branch_pc >> 1};
+        val<FHIST_BITS> new_fhist = (val<FHIST_BITS>{fhist} << hard<3>{}) ^ next_pc_fold ^ branch_pc_fold;
+        execute_if(last_branch_taken & last_forward, [&](){
+            fhist = new_fhist;
+        });
+#endif
 
 
 #ifdef MY_SC
@@ -1343,22 +1543,61 @@ struct my_bp_v1 : predictor {
         // thre_wrong_bits.fanout(hard<1>{});
 
         
+#ifdef SC_USE_BIAS
         bias_high_idx.fanout(hard<LINEINST>{});
+#endif
+#ifdef SC_USE_GEHL
+        for (u64 k = 0; k < NUMGEHL; k++) {
+            gehl_idx[k].fanout(hard<LINEINST>{});
+            gehl_map[k].fanout(hard<LINEINST>{});
+        }
+#endif
+#ifdef SC_FGEHL
+        fgehl_idx.fanout(hard<LINEINST>{});
+        fgehl_map.fanout(hard<LINEINST>{});
+#endif
         //per-offset updates: bias_pc and thre1 (no write conflicts)
         for (u64 offset = 0; offset < LINEINST; offset++) {
+#ifdef SC_USE_BIAS
             val<LOGBIAS-LOGLINEINST-2> high_idx = bias_high_idx;
             val<PERCWIDTH,i64> old_bias = bias_map[offset];
             val<2> write_tage_info = tage_info[offset];
+#endif
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
             val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, sc_wrong_arr[offset]);
+#if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL)
+            val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
+#endif
+#ifdef SC_USE_BIAS
             old_bias.fanout(hard<4>{});
             write_tage_info.fanout(hard<4>{});
             high_idx.fanout(hard<4>{});
             for (u64 bank = 0; bank < 4; bank++){
-                execute_if((write_tage_info==val<2>{bank}) & prov_hit_arr[offset] & (is_branch[offset] & do_update_arr[offset]), [&](){
+                execute_if((write_tage_info==val<2>{bank}) & sc_update_en, [&](){
                     bias_pc[bank][offset].write(high_idx, update_ctr(old_bias, branch_taken[offset]));
                 });
             }
+#endif
+#ifdef SC_USE_GEHL
+            for (u64 k = 0; k < NUMGEHL; k++) {
+                val<LOGGEHL-LOGLINEINST> gehl_write_idx = gehl_idx[k];
+                val<PERCWIDTH,i64> old_gehl = gehl_map[k][offset];
+                gehl_write_idx.fanout(hard<2>{});
+                old_gehl.fanout(hard<2>{});
+                execute_if(sc_update_en, [&](){
+                    gehl[k][offset].write(gehl_write_idx, update_ctr(old_gehl, branch_taken[offset]));
+                });
+            }
+#endif
+#ifdef SC_FGEHL
+            val<LOGFGEHL-LOGLINEINST> fgehl_write_idx = fgehl_idx;
+            val<PERCWIDTH,i64> old_fgehl = fgehl_map[offset];
+            fgehl_write_idx.fanout(hard<2>{});
+            old_fgehl.fanout(hard<2>{});
+            execute_if(sc_update_en, [&](){
+                fgehl[offset].write(fgehl_write_idx, update_ctr(old_fgehl, branch_taken[offset]));
+            });
+#endif
             
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
@@ -1366,6 +1605,14 @@ struct my_bp_v1 : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
+    if (static_cast<bool>(noalloc) && static_cast<bool>(mispredict)) {
+        perf_alloc_failures++;
+        if (static_cast<bool>(postmask == hard<0>{})) {
+            perf_alloc_fail_highest++;
+        } else {
+            perf_alloc_fail_noubit++;
+        }
+    }
     // Track prediction sources and accuracy - only for offsets that have branches
     for (u64 offset=0; offset<LINEINST; offset++) {
         if (!static_cast<bool>(is_branch[offset])) continue;
