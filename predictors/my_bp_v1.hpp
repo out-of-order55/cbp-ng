@@ -5,7 +5,7 @@
 
 // #define GATE
 #define MY_SC
-// #define SC_FGEHL
+#define SC_FGEHL
 // #define SC_DISABLE_BIAS
 // #define SC_DISABLE_GEHL
 // #define HASH_TAG
@@ -16,6 +16,14 @@
 
 #if !defined(SC_DISABLE_GEHL)
 #define SC_USE_GEHL
+#endif
+
+#ifndef SC_GLOBAL_THRE_INIT
+#define SC_GLOBAL_THRE_INIT 23
+#endif
+
+#ifndef SC_GLOBAL_THRE_PIPE_STAGES
+#define SC_GLOBAL_THRE_PIPE_STAGES 2
 #endif
 #include "../cbp.hpp"
 #include "../harcom.hpp"
@@ -42,6 +50,7 @@ struct my_bp_v1 : predictor {
     static constexpr u64 PERCWIDTH = 6;
     static constexpr u64 NUMGEHL = 2;
     static constexpr u64 LOGGEHL = 10;
+    static_assert(SC_GLOBAL_THRE_PIPE_STAGES >= 1);
 #ifdef SC_FGEHL
     static constexpr u64 LOGFGEHL = LOGGEHL;
     static constexpr u64 FHIST_BITS = 48;
@@ -527,6 +536,261 @@ struct my_bp_v1 : predictor {
             std::cerr << "└──────┴────────────────┴──────────┴─────┴─────┴─────┴──────────────┴──────────┘\n";
         }
     }
+
+#ifdef CHEATING_MODE
+#ifdef USE_META
+    void perf_store_prediction_source(val<1> metasign) {
+#else
+    void perf_store_prediction_source() {
+#endif
+        for (u64 offset=0; offset<LINEINST; offset++) {
+#ifdef USE_META
+            val<1> use_alt_o = metasign & newly_alloc[offset] & (match2[offset]!=hard<0>{});
+            val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
+            val<2> src = select(use_alt_o.fo1(), val<2>{2},
+                         select(has_tage, val<2>{1}, val<2>{0}));
+#else
+            val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
+            val<2> src = select(has_tage, val<2>{1}, val<2>{0});
+#endif
+            pred_source_stored[offset] = src;
+            pred_match1_stored[offset] = match1[offset];
+            pred_match2_stored[offset] = match2[offset];
+        }
+    }
+
+    void perf_count_table_reads_hits(arr<val<1>,LINEINST> is_branch) {
+        u64 num_branches = 0;
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            if (static_cast<bool>(is_branch[offset])) num_branches++;
+        }
+
+        for (u64 j=0; j<NUMG; j++) {
+            perf_table_reads[j] += num_branches;
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                if (!static_cast<bool>(is_branch[offset])) continue;
+                val<NUMG> all_hits = val<NUMG+1>{match[offset]} >> 1;
+                val<1> hit_j = (all_hits >> j) & val<1>{1};
+                if (static_cast<bool>(hit_j)) {
+                    perf_table_hits[j]++;
+                }
+            }
+        }
+    }
+
+    void perf_count_table_alloc(arr<val<1>,NUMG> allocate) {
+        for (u64 j=0; j<NUMG; j++) {
+            if (static_cast<bool>(allocate[j])) {
+                perf_table_alloc[j]++;
+            }
+        }
+    }
+
+#ifdef MY_SC
+    void perf_count_extra_cycle(val<1> extra_cycle, val<1> some_badpred1, val<1> mispredict, val<1> p1_update, val<1> sc_need_update) {
+#else
+    void perf_count_extra_cycle(val<1> extra_cycle, val<1> some_badpred1, val<1> mispredict, val<1> p1_update) {
+#endif
+        perf_extra_cycle_total      += static_cast<u64>(extra_cycle);
+        perf_extra_cycle_badpred    += static_cast<u64>(some_badpred1);
+        perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
+        perf_extra_cycle_p1_update  += static_cast<u64>(p1_update);
+#ifdef MY_SC
+        perf_extra_cycle_sc_update  += static_cast<u64>(sc_need_update);
+#endif
+    }
+
+#ifdef GATE
+    void perf_count_gate(val<1> gating_local, val<1> mispredict_local, val<1> gate_inc, val<1> gate_dec) {
+        perf_gate_count      += static_cast<u64>(gating_local);
+        perf_gate_mispred    += static_cast<u64>(gating_local & mispredict_local);
+        perf_gate_update_inc += static_cast<u64>(gate_inc);
+        perf_gate_update_dec += static_cast<u64>(gate_dec);
+    }
+#endif
+
+    void perf_count_end_of_cycle(
+        arr<val<1>,LINEINST> is_branch,
+        arr<val<1>,LINEINST> branch_taken,
+        val<1> mispredict,
+        arr<val<1>,NUMG> allocate,
+        val<NUMG> postmask,
+        val<1> noalloc) {
+        if (static_cast<bool>(noalloc) && static_cast<bool>(mispredict)) {
+            perf_alloc_failures++;
+            if (static_cast<bool>(postmask == hard<0>{})) {
+                perf_alloc_fail_highest++;
+            } else {
+                perf_alloc_fail_noubit++;
+            }
+        }
+
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            if (!static_cast<bool>(is_branch[offset])) continue;
+
+            perf_predictions++;
+
+            u64 src = static_cast<u64>(val<2>{pred_source_stored[offset]});
+            val<NUMG> prov_mask = val<NUMG+1>{pred_match1_stored[offset]} & hard<(1<<NUMG)-1>{};
+            val<NUMG> alt_mask  = val<NUMG+1>{pred_match2_stored[offset]} & hard<(1<<NUMG)-1>{};
+
+            if (src == 2) {
+                for (u64 j=0; j<NUMG; j++) {
+                    if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_used[j]++; break; }
+                }
+            } else if (src == 1) {
+                for (u64 j=0; j<NUMG; j++) {
+                    if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_used[j]++; break; }
+                }
+            } else {
+                perf_bimodal_used++;
+            }
+
+            val<1> actual = branch_taken[offset];
+            val<1> predicted = (p2 >> offset) & val<1>{1};
+            val<1> correct = (predicted == actual);
+
+            if (static_cast<bool>(correct)) {
+                perf_correct++;
+                if (src == 2) {
+                    for (u64 j=0; j<NUMG; j++) {
+                        if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_correct[j]++; break; }
+                    }
+                } else if (src == 1) {
+                    for (u64 j=0; j<NUMG; j++) {
+                        if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_correct[j]++; break; }
+                    }
+                } else {
+                    perf_bimodal_correct++;
+                }
+            }
+
+            u64 pc_val = 0;
+            for (u64 bi = 0; bi < num_branch; bi++) {
+                if (static_cast<u64>(branch_offset[bi]) == offset) {
+                    pc_val = static_cast<u64>(branch_pc[bi]);
+                    break;
+                }
+            }
+
+            u64 hit_found = 0, hit_table = NUMG, hit_gtag = 0, hit_gindex = 0;
+            u64 pmask = static_cast<u64>(val<NUMG+1>{pred_match1_stored[offset]}) & ((1ULL << NUMG) - 1);
+            if (pmask != 0) {
+                for (u64 j = 0; j < NUMG; j++) {
+                    if ((pmask >> j) & 1) {
+                        hit_found  = 1;
+                        hit_table  = j;
+                        hit_gtag   = static_cast<u64>(readt[j]);
+                        hit_gindex = static_cast<u64>(gindex[j]);
+                        break;
+                    }
+                }
+            }
+
+            u64 pred_source = src;
+            u64 pred_table  = NUMG;
+            if (pred_source == 2) {
+                u64 amask = static_cast<u64>(alt_mask);
+                for (u64 j = 0; j < NUMG; j++) {
+                    if ((amask >> j) & 1) { pred_table = j; break; }
+                }
+            } else if (pred_source == 1) {
+                u64 pmask2 = static_cast<u64>(prov_mask);
+                for (u64 j = 0; j < NUMG; j++) {
+                    if ((pmask2 >> j) & 1) { pred_table = j; break; }
+                }
+            }
+
+            u64 is_last = (offset == static_cast<u64>(branch_offset[num_branch-1]));
+            u64 is_misp = static_cast<u64>(mispredict);
+            u64 alloc_found = 0, alloc_table = 0, alloc_gindex_val = 0, alloc_tag_val = 0;
+            if (is_misp && is_last) {
+                for (u64 j = 0; j < NUMG; j++) {
+                    if (static_cast<bool>(allocate[j])) {
+                        alloc_found     = 1;
+                        alloc_table     = j;
+                        alloc_gindex_val = static_cast<u64>(gindex[j]);
+                        alloc_tag_val   = static_cast<u64>(concat(branch_offset[num_branch-1], htag[j]));
+                        break;
+                    }
+                }
+            }
+
+            {
+                u64 conf_val = 0;
+                if (pred_source == 1 || pred_source == 2) {
+                    u64 tbl = (pred_source == 1) ? pred_table :
+                              static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
+                    if (tbl < NUMG) conf_val = static_cast<u64>(readh[tbl]);
+                }
+
+                u64 sc_override_val = 0;
+                i64 sc_dir_val = -1;
+                i64 sc_sum_val = 0;
+                u64 threshold_val = 0;
+#ifdef MY_SC
+                {
+                    u64 p2_bit     = static_cast<u64>((p2     >> offset) & val<1>{1});
+                    u64 tage_p2_bit= static_cast<u64>((tage_p2>> offset) & val<1>{1});
+                    sc_override_val = (p2_bit != tage_p2_bit) ? 1 : 0;
+                    if (sc_override_val) sc_dir_val = static_cast<i64>(p2_bit);
+                    sc_sum_val   = static_cast<i64>(sc_sum[offset]);
+                    threshold_val = static_cast<u64>(threshold[offset]);
+                }
+#endif
+                insert_trace(
+                    static_cast<u64>(panel.cycle), pc_val, offset,
+                    static_cast<u64>(actual), static_cast<u64>(predicted),
+                    is_misp & is_last,
+                    pred_source, pred_table, static_cast<u64>(bindex),
+                    hit_found, hit_table, hit_gtag, hit_gindex,
+                    is_misp & is_last & alloc_found,
+                    alloc_table, alloc_gindex_val, alloc_tag_val,
+                    conf_val, sc_override_val, sc_dir_val, sc_sum_val, threshold_val);
+            }
+
+            if (pred_source == 1 || pred_source == 2) {
+                u64 tbl = (pred_source == 1) ? pred_table :
+                          static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
+                if (tbl < NUMG) {
+                    u64 hval = static_cast<u64>(readh[tbl]);
+                    if (hval < 4) perf_conf[tbl][hval]++;
+                }
+            }
+
+            if (!static_cast<bool>(correct)) {
+                auto &rec = mispred_db[pc_val];
+                rec.count++;
+                rec.actual_dir  = static_cast<u64>(actual);
+                rec.hit         = hit_found;
+                rec.hit_table   = hit_table;
+                rec.hit_gtag    = hit_gtag;
+                rec.hit_gindex  = hit_gindex;
+            }
+        }
+
+#ifdef MY_SC
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            if (!static_cast<bool>(is_branch[offset])) continue;
+            val<1> p2_bit = (p2 >> offset) & val<1>{1};
+            val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
+            val<1> actual = branch_taken[offset];
+            val<1> sc_override = (p2_bit != tage_p2_bit);
+            if (static_cast<bool>(sc_override)) {
+                perf_sc_override++;
+                perf_sc_override_correct += static_cast<u64>(p2_bit == actual);
+            }
+            if (static_cast<bool>(is_branch[offset] & do_update_arr[offset] & thre_guard_arr[offset] & prov_hit_arr[offset])) {
+                perf_thre_update++;
+                if (static_cast<bool>(sc_wrong_arr[offset]))
+                    perf_thre_update_inc++;
+                else
+                    perf_thre_update_dec++;
+            }
+        }
+#endif
+    }
+#endif
 #endif
 
 #ifdef GATE
@@ -574,7 +838,8 @@ struct my_bp_v1 : predictor {
 #endif
 
     arr<reg<PRE_PC_THREBITS>,LINEINST> thre1;
-    reg<GLOBAL_THREBITS> global_thre;
+    reg<GLOBAL_THREBITS> global_thre = val<GLOBAL_THREBITS>{SC_GLOBAL_THRE_INIT};
+    arr<reg<2,i64>,SC_GLOBAL_THRE_PIPE_STAGES> global_thre_pipe;
     arr<reg<TOTAL_THREBITS,i64>,LINEINST> sc_sum;
 #ifdef SC_USE_GEHL
     arr<reg<LOGGEHL-LOGLINEINST>,NUMGEHL> gehl_idx;
@@ -613,7 +878,6 @@ struct my_bp_v1 : predictor {
             std::cerr << "WARNING: the tag function and index function are not different enough\n";
         }
 #endif
-        // global_thre = val<GLOBAL_THREBITS>{23};
 #ifdef PERF_COUNTERS
         open_trace_db();
 #endif
@@ -840,22 +1104,11 @@ struct my_bp_v1 : predictor {
         // tage_p2.fanout(hard<2>{});
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-        // Store prediction source for each offset (used in update_cycle)
-        for (u64 offset=0; offset<LINEINST; offset++) {
 #ifdef USE_META
-            val<1> use_alt_o = metasign & newly_alloc[offset] & (match2[offset]!=hard<0>{});
-            // bimodal is bit NUMG (highest bit), tables are bits 0..NUMG-1
-            val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
-            val<2> src = select(use_alt_o.fo1(), val<2>{2},
-                         select(has_tage, val<2>{1}, val<2>{0}));
+        perf_store_prediction_source(metasign);
 #else
-            val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
-            val<2> src = select(has_tage, val<2>{1}, val<2>{0});
+        perf_store_prediction_source();
 #endif
-            pred_source_stored[offset] = src;
-            pred_match1_stored[offset] = match1[offset];
-            pred_match2_stored[offset] = match2[offset];
-        }
 #endif
 #endif
     }
@@ -916,15 +1169,8 @@ struct my_bp_v1 : predictor {
         }};
         fgehl_map.fanout(hard<2>{});
 #endif
-        // val<LOGTHREBITS> base_idx1 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+2)); 
-        // val<LOGTHREBITS> base_idx2 = concat(val<LOGTHREBITS-LOGLINEINST>{inst_pc>>LOGLB},val<LOGLINEINST>{0}) ^ (inst_pc>>(2+5));
-        
-        // base_idx1.fanout(hard<LINEINST>{});
 
-        // base_idx2.fanout(hard<LINEINST>{});
         threshold = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
-            // val<LOGTHREBITS> idx1 = base_idx1 ^ val<LOGTHREBITS>{offset};
-            // val<LOGTHREBITS> idx2 = base_idx2 ^ val<LOGTHREBITS>{offset};
             return global_thre + thre1[offset];
         }};
         threshold.fanout(hard<5>{});
@@ -1042,6 +1288,24 @@ struct my_bp_v1 : predictor {
         num_branch++;
     }
 
+#ifdef MY_SC
+    void pipe_global_thre_delta(val<2,i64> new_delta)
+    {
+        val<2,i64> apply_delta = global_thre_pipe[SC_GLOBAL_THRE_PIPE_STAGES-1];
+        apply_delta.fanout(hard<2>{});
+        val<1> apply_upd = apply_delta != val<2,i64>{0};
+        val<1> apply_inc = apply_delta > val<2,i64>{0};
+        execute_if(apply_upd, [&](){
+            global_thre = update_ctr(global_thre, apply_inc);
+        });
+        for (u64 i = SC_GLOBAL_THRE_PIPE_STAGES-1; i != 0; i--) {
+            global_thre_pipe[i] = global_thre_pipe[i-1];
+        }
+        global_thre_pipe[0] = new_delta;
+    }
+
+#endif
+
     void update_cycle(instruction_info &block_end_info)
     {
         val<1> &mispredict = block_end_info.is_mispredict;
@@ -1061,6 +1325,9 @@ struct my_bp_v1 : predictor {
                 gfolds.update(val<PATHBITS>{next_pc>>2});
                 true_block = 1;
             });
+#ifdef MY_SC
+            pipe_global_thre_delta(val<2,i64>{0});
+#endif
             return; // stop here
         }
         //TODO: gate
@@ -1110,25 +1377,7 @@ struct my_bp_v1 : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-    // Count table reads and hits
-    u64 num_branches = 0;
-    for (u64 offset=0; offset<LINEINST; offset++) {
-        if (static_cast<bool>(is_branch[offset])) num_branches++;
-    }
-
-    for (u64 j=0; j<NUMG; j++) {
-        perf_table_reads[j] += num_branches;
-
-        // Count hits for this table (any tag match, not just longest)
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            if (!static_cast<bool>(is_branch[offset])) continue;
-            val<NUMG> all_hits = val<NUMG+1>{match[offset]} >> 1; // all tag matches, strip bimodal bit
-            val<1> hit_j = (all_hits >> j) & val<1>{1};
-            if (static_cast<bool>(hit_j)) {
-                perf_table_hits[j]++;
-            }
-        }
-    }
+        perf_count_table_reads_hits(is_branch);
 #endif
 #endif
 
@@ -1179,12 +1428,7 @@ struct my_bp_v1 : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-    // Track allocations per table
-    for (u64 j=0; j<NUMG; j++) {
-        if (static_cast<bool>(allocate[j])) {
-            perf_table_alloc[j]++;
-        }
-    }
+        perf_count_table_alloc(allocate);
 #endif
 #endif
 #ifdef HASH_TAG
@@ -1344,12 +1588,11 @@ struct my_bp_v1 : predictor {
         need_extra_cycle(extra_cycle);
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-        perf_extra_cycle_total      += static_cast<u64>(extra_cycle);
-        perf_extra_cycle_badpred    += static_cast<u64>(some_badpred1);
-        perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
-        perf_extra_cycle_p1_update  += static_cast<u64>(disagree_mask != hard<0>{});
+        val<1> p1_update = disagree_mask != hard<0>{};
 #ifdef MY_SC
-        perf_extra_cycle_sc_update  += static_cast<u64>(sc_need_update);
+        perf_count_extra_cycle(extra_cycle, some_badpred1, mispredict, p1_update, sc_need_update);
+#else
+        perf_count_extra_cycle(extra_cycle, some_badpred1, mispredict, p1_update);
 #endif
 #endif
 #endif
@@ -1496,10 +1739,7 @@ struct my_bp_v1 : predictor {
         }
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-        perf_gate_count      += static_cast<u64>(gating);
-        perf_gate_mispred    += static_cast<u64>(gating & mispredict);
-        perf_gate_update_inc += static_cast<u64>(gate_inc);
-        perf_gate_update_dec += static_cast<u64>(gate_dec);
+        perf_count_gate(gating, mispredict, gate_inc, gate_dec);
 #endif
 #endif
 #endif
@@ -1536,11 +1776,20 @@ struct my_bp_v1 : predictor {
             return is_branch[offset] & do_update_arr[offset] & thre_guard_arr[offset] & prov_hit_arr[offset];
         };
         thre_update_en.fanout(hard<2>{});
-        // arr<val<1>,LINEINST> thre_wrong_bits = [&](u64 offset){
-        //     return thre_update_en[offset] & sc_wrong_arr[offset];
-        // };
-        
-        // thre_wrong_bits.fanout(hard<1>{});
+        // Meta-style signed accumulation:
+        // +1 when SC is wrong, -1 when SC is right, 0 when no update.
+        arr<val<2,i64>,LINEINST> gthre_incr = [&](u64 offset) -> val<2,i64> {
+            val<1> update_en = thre_update_en[offset];
+            val<1> dec_sign = ~sc_wrong_arr[offset]; // 0:+1, 1:-1
+            return select(update_en.fo1(), concat(dec_sign.fo1(), val<1>{1}), val<2>{0});
+        };
+        auto gthre_vote = gthre_incr.fo1().fold_add();
+        val<1> global_thre_upd = gthre_vote != val<decltype(gthre_vote)::size, i64>{0};
+        val<1> global_thre_inc = gthre_vote > val<decltype(gthre_vote)::size, i64>{0};
+        val<1> global_thre_decsign = ~global_thre_inc;
+        global_thre_inc.fanout(hard<2>{});
+        val<2,i64> gthre_delta = select(global_thre_upd.fo1(), concat(global_thre_decsign.fo1(), val<1>{1}), val<2>{0});
+        pipe_global_thre_delta(gthre_delta);
 
         
 #ifdef SC_USE_BIAS
@@ -1605,190 +1854,7 @@ struct my_bp_v1 : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-    if (static_cast<bool>(noalloc) && static_cast<bool>(mispredict)) {
-        perf_alloc_failures++;
-        if (static_cast<bool>(postmask == hard<0>{})) {
-            perf_alloc_fail_highest++;
-        } else {
-            perf_alloc_fail_noubit++;
-        }
-    }
-    // Track prediction sources and accuracy - only for offsets that have branches
-    for (u64 offset=0; offset<LINEINST; offset++) {
-        if (!static_cast<bool>(is_branch[offset])) continue;
-
-        perf_predictions++;
-
-        // Use stored source from predict2() — avoids stale meta issue
-        u64 src = static_cast<u64>(val<2>{pred_source_stored[offset]});
-        // bimodal = bit NUMG, tables = bits 0..NUMG-1
-        val<NUMG> prov_mask = val<NUMG+1>{pred_match1_stored[offset]} & hard<(1<<NUMG)-1>{};
-        val<NUMG> alt_mask  = val<NUMG+1>{pred_match2_stored[offset]} & hard<(1<<NUMG)-1>{};
-
-        if (src == 2) { // alt
-            for (u64 j=0; j<NUMG; j++) {
-                if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_used[j]++; break; }
-            }
-        } else if (src == 1) { // provider
-            for (u64 j=0; j<NUMG; j++) {
-                if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_used[j]++; break; }
-            }
-        } else { // bimodal
-            perf_bimodal_used++;
-        }
-
-        // Check if prediction was correct
-        val<1> actual = branch_taken[offset];
-        val<1> predicted = (p2 >> offset) & val<1>{1};
-        val<1> correct = (predicted == actual);
-
-        if (static_cast<bool>(correct)) {
-            perf_correct++;
-            if (src == 2) {
-                for (u64 j=0; j<NUMG; j++) {
-                    if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_correct[j]++; break; }
-                }
-            } else if (src == 1) {
-                for (u64 j=0; j<NUMG; j++) {
-                    if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_correct[j]++; break; }
-                }
-            } else {
-                perf_bimodal_correct++;
-            }
-        }
-
-        // Look up PC for this offset by scanning branch slots
-        u64 pc_val = 0;
-        for (u64 bi = 0; bi < num_branch; bi++) {
-            if (static_cast<u64>(branch_offset[bi]) == offset) {
-                pc_val = static_cast<u64>(branch_pc[bi]);
-                break;
-            }
-        }
-
-        // match1 is NUMG+1 bits: bits 0..NUMG-1 = TAGE tables, bit NUMG = bimodal
-        u64 hit_found = 0, hit_table = NUMG, hit_gtag = 0, hit_gindex = 0;
-        u64 pmask = static_cast<u64>(val<NUMG+1>{pred_match1_stored[offset]}) & ((1ULL << NUMG) - 1);
-        if (pmask != 0) {
-            for (u64 j = 0; j < NUMG; j++) {
-                if ((pmask >> j) & 1) {
-                    hit_found  = 1;
-                    hit_table  = j;
-                    hit_gtag   = static_cast<u64>(readt[j]);
-                    hit_gindex = static_cast<u64>(gindex[j]);
-                    break;
-                }
-            }
-        }
-
-        // Determine prediction source from stored value
-        u64 pred_source = src; // already computed above from pred_source_stored
-        u64 pred_table  = NUMG;
-        if (pred_source == 2) {
-            u64 amask = static_cast<u64>(alt_mask);
-            for (u64 j = 0; j < NUMG; j++) {
-                if ((amask >> j) & 1) { pred_table = j; break; }
-            }
-        } else if (pred_source == 1) {
-            u64 pmask2 = static_cast<u64>(prov_mask);
-            for (u64 j = 0; j < NUMG; j++) {
-                if ((pmask2 >> j) & 1) { pred_table = j; break; }
-            }
-        }
-
-        // Find alloc event for this branch (only on mispredict, last branch)
-        u64 is_last = (offset == static_cast<u64>(branch_offset[num_branch-1]));
-        u64 is_misp = static_cast<u64>(mispredict);
-        u64 alloc_found = 0, alloc_table = 0, alloc_gindex_val = 0, alloc_tag_val = 0;
-        if (is_misp && is_last) {
-            for (u64 j = 0; j < NUMG; j++) {
-                if (static_cast<bool>(allocate[j])) {
-                    alloc_found     = 1;
-                    alloc_table     = j;
-                    alloc_gindex_val = static_cast<u64>(gindex[j]);
-                    alloc_tag_val   = static_cast<u64>(concat(branch_offset[num_branch-1], htag[j]));
-                    break;
-                }
-            }
-        }
-
-        // Record exec trace entry via SQLite
-        {
-            u64 conf_val = 0;
-            if (pred_source == 1 || pred_source == 2) {
-                u64 tbl = (pred_source == 1) ? pred_table :
-                          static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
-                if (tbl < NUMG) conf_val = static_cast<u64>(readh[tbl]);
-            }
-            // Compute sc_override: p2 differs from tage_p2 for this offset
-            u64 sc_override_val = 0;
-            i64 sc_dir_val = -1;
-            i64 sc_sum_val = 0;
-            u64 threshold_val = 0;
-#ifdef MY_SC
-            {
-                u64 p2_bit     = static_cast<u64>((p2     >> offset) & val<1>{1});
-                u64 tage_p2_bit= static_cast<u64>((tage_p2>> offset) & val<1>{1});
-                sc_override_val = (p2_bit != tage_p2_bit) ? 1 : 0;
-                if (sc_override_val) sc_dir_val = static_cast<i64>(p2_bit);
-                sc_sum_val   = static_cast<i64>(sc_sum[offset]);
-                threshold_val = static_cast<u64>(threshold[offset]);
-            }
-#endif
-            insert_trace(
-                static_cast<u64>(panel.cycle), pc_val, offset,
-                static_cast<u64>(actual), static_cast<u64>(predicted),
-                is_misp & is_last,
-                pred_source, pred_table, static_cast<u64>(bindex),
-                hit_found, hit_table, hit_gtag, hit_gindex,
-                is_misp & is_last & alloc_found,
-                alloc_table, alloc_gindex_val, alloc_tag_val,
-                conf_val, sc_override_val, sc_dir_val, sc_sum_val, threshold_val);
-        }
-
-        // Confidence distribution: bucket hysteresis of provider table
-        if (pred_source == 1 || pred_source == 2) {
-            u64 tbl = (pred_source == 1) ? pred_table :
-                      static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
-            if (tbl < NUMG) {
-                u64 hval = static_cast<u64>(readh[tbl]);
-                if (hval < 4) perf_conf[tbl][hval]++;
-            }
-        }
-
-        // Misprediction trace (per-PC summary)
-        if (!static_cast<bool>(correct)) {
-            auto &rec = mispred_db[pc_val];
-            rec.count++;
-            rec.actual_dir  = static_cast<u64>(actual);
-            rec.hit         = hit_found;
-            rec.hit_table   = hit_table;
-            rec.hit_gtag    = hit_gtag;
-            rec.hit_gindex  = hit_gindex;
-        }
-    }
-#ifdef MY_SC
-    // SC source counters: only track when SC overrides TAGE
-    for (u64 offset=0; offset<LINEINST; offset++) {
-        if (!static_cast<bool>(is_branch[offset])) continue;
-        val<1> p2_bit = (p2 >> offset) & val<1>{1};
-        val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
-        val<1> actual = branch_taken[offset];
-        val<1> sc_override = (p2_bit != tage_p2_bit);
-        if (static_cast<bool>(sc_override)) {
-            perf_sc_override++;
-            perf_sc_override_correct += static_cast<u64>(p2_bit == actual);
-        }
-        // threshold update counters
-        if (static_cast<bool>(is_branch[offset] & do_update_arr[offset] & thre_guard_arr[offset] & prov_hit_arr[offset])) {
-            perf_thre_update++;
-            if (static_cast<bool>(sc_wrong_arr[offset]))
-                perf_thre_update_inc++;
-            else
-                perf_thre_update_dec++;
-        }
-    }
-#endif
+        perf_count_end_of_cycle(is_branch, branch_taken, mispredict, allocate, postmask, noalloc);
 #endif
 #endif
 
