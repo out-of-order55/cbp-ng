@@ -160,12 +160,20 @@ struct my_bp_v1 : predictor {
     // Per-table source tracking
     u64 perf_provider_used[NUMG] = {};
     u64 perf_provider_correct[NUMG] = {};
+    u64 perf_provider_wrong[NUMG] = {};
     u64 perf_alt_used[NUMG] = {};
     u64 perf_alt_correct[NUMG] = {};
+    u64 perf_alt_wrong[NUMG] = {};
 
     // Bimodal tracking
     u64 perf_bimodal_used = 0;
     u64 perf_bimodal_correct = 0;
+    u64 perf_bimodal_wrong = 0;
+
+    // Final misprediction blame (exclusive partition)
+    u64 perf_mispred_blame_tage = 0;
+    u64 perf_mispred_blame_sc = 0;
+    u64 perf_mispred_blame_p1 = 0;
 
     // Table statistics
     u64 perf_table_reads[NUMG] = {};
@@ -193,11 +201,35 @@ struct my_bp_v1 : predictor {
     // SC prediction source counters
     u64 perf_sc_override = 0;        // SC overrode TAGE (p2 != tage_p2)
     u64 perf_sc_override_correct = 0; // SC override was correct
+    u64 perf_sc_use = 0;             // SC selected (use_sc=1)
+    u64 perf_sc_use_correct = 0;     // selected SC prediction correct
+    u64 perf_sc_use_taken = 0;       // selected SC predicted taken
+    u64 perf_sc_use_nottaken = 0;    // selected SC predicted not-taken
+    u64 perf_sc_use_same_as_tage = 0; // use_sc but SC dir == TAGE dir
+    u64 perf_sc_use_flip_tage = 0;   // use_sc and SC dir != TAGE dir
+    u64 perf_sc_use_weak = 0;        // use_sc on weak provider
+    u64 perf_sc_use_mid = 0;         // use_sc on mid provider
+    u64 perf_sc_use_sat = 0;         // use_sc on high-confidence provider
+    u64 perf_sc_stage_prov_hit = 0;  // branch has provider hit
+    u64 perf_sc_stage_do_update = 0; // do_update stage passed
+    u64 perf_sc_stage_candidate = 0; // provider-hit & do_update
+    u64 perf_sc_stage_guard_pass = 0; // candidate & threshold guard
+    u64 perf_sc_skip_no_provider = 0; // blocked by no provider
+    u64 perf_sc_skip_no_do_update = 0; // blocked by do_update=0
+    u64 perf_sc_skip_guard = 0;      // blocked by threshold guard
+    u64 perf_global_thre_update = 0; // delayed global threshold update events
+    u64 perf_global_thre_inc = 0;    // global threshold incremented
+    u64 perf_global_thre_dec = 0;    // global threshold decremented
     // threshold update counters
     u64 perf_thre_update = 0;        // thre1 updated
     u64 perf_thre_update_inc = 0;    // thre1 incremented (sc wrong)
     u64 perf_thre_update_dec = 0;    // thre1 decremented (sc correct)
-    // gate counters
+    // SC misprediction diagnostics
+    u64 perf_mispred_sc_not_used = 0;       // use_sc=0 and final wrong
+    u64 perf_mispred_sc_keep = 0;           // use_sc=1, sc==tage, final wrong
+    u64 perf_mispred_sc_flip = 0;           // use_sc=1, sc!=tage, final wrong
+    u64 perf_mispred_sc_flip_harmful = 0;   // flip, tage correct, sc wrong
+    u64 perf_mispred_sc_flip_both_wrong = 0; // flip, tage wrong, sc wrong
 
 #endif
 
@@ -370,14 +402,18 @@ struct my_bp_v1 : predictor {
 
         u64 total_prov = 0, total_prov_ok = 0;
         u64 total_alt = 0, total_alt_ok = 0;
+        u64 total_prov_wrong = 0, total_alt_wrong = 0;
         for (u64 j=0; j<NUMG; j++) {
             total_prov += perf_provider_used[j];
             total_prov_ok += perf_provider_correct[j];
+            total_prov_wrong += perf_provider_wrong[j];
             total_alt += perf_alt_used[j];
             total_alt_ok += perf_alt_correct[j];
+            total_alt_wrong += perf_alt_wrong[j];
         }
 
         u64 total_all = total_prov + total_alt + perf_bimodal_used;
+        u64 total_mispred = perf_predictions - perf_correct;
 
         // Provider row
         std::cerr << "│ Provider │ " << std::setw(5) << std::right << total_prov << " │ ";
@@ -467,10 +503,55 @@ struct my_bp_v1 : predictor {
         }
         std::cerr << "└──────────┴───────┴─────────┴──────────┴────────────┘\n";
 #ifdef MY_SC
-        std::cerr << "Threshold updates: total=" << perf_thre_update
-                  << "  inc=" << perf_thre_update_inc
-                  << "  dec=" << perf_thre_update_dec << "\n";
+        std::cerr << "\n┌─ SC Usage Statistics ────────────────────────────────────────────┐\n";
+        std::cerr << "│ SC Use Count:           " << std::setw(36) << std::left << perf_sc_use << "│\n";
+        std::cerr << "│ SC Use Correct:         " << std::setw(36) << std::left << perf_sc_use_correct << "│\n";
+        if (perf_sc_use > 0) {
+            std::cerr << "│ SC Use Accuracy:        " << std::setw(35) << std::left
+                      << (std::to_string((100.0 * perf_sc_use_correct / perf_sc_use))).substr(0,5) + "%" << "│\n";
+        } else {
+            std::cerr << "│ SC Use Accuracy:        " << std::setw(36) << std::left << "N/A" << "│\n";
+        }
+        std::cerr << "│ SC Use Taken/NotTaken:  " << std::setw(36) << std::left
+                  << (std::to_string(perf_sc_use_taken) + " / " + std::to_string(perf_sc_use_nottaken)) << "│\n";
+        std::cerr << "│ SC Keep/Flip TAGE:      " << std::setw(36) << std::left
+                  << (std::to_string(perf_sc_use_same_as_tage) + " / " + std::to_string(perf_sc_use_flip_tage)) << "│\n";
+        std::cerr << "│ SC Use Weak/Mid/Sat:    " << std::setw(36) << std::left
+                  << (std::to_string(perf_sc_use_weak) + " / " + std::to_string(perf_sc_use_mid) + " / " + std::to_string(perf_sc_use_sat)) << "│\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+        std::cerr << "\n┌─ SC Update Pipeline ─────────────────────────────────────────────┐\n";
+        std::cerr << "│ Provider Hit:           " << std::setw(36) << std::left << perf_sc_stage_prov_hit << "│\n";
+        std::cerr << "│ do_update Passed:       " << std::setw(36) << std::left << perf_sc_stage_do_update << "│\n";
+        std::cerr << "│ Candidate (hit&update): " << std::setw(36) << std::left << perf_sc_stage_candidate << "│\n";
+        std::cerr << "│ Guard Pass:             " << std::setw(36) << std::left << perf_sc_stage_guard_pass << "│\n";
+        std::cerr << "│ Skip No Provider:       " << std::setw(36) << std::left << perf_sc_skip_no_provider << "│\n";
+        std::cerr << "│ Skip No do_update:      " << std::setw(36) << std::left << perf_sc_skip_no_do_update << "│\n";
+        std::cerr << "│ Skip Guard:             " << std::setw(36) << std::left << perf_sc_skip_guard << "│\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+        std::cerr << "\n┌─ SC Threshold Updates ───────────────────────────────────────────┐\n";
+        std::cerr << "│ Local Threshold (tot/inc/dec): " << std::setw(29) << std::left
+                  << (std::to_string(perf_thre_update) + " / " + std::to_string(perf_thre_update_inc) + " / " + std::to_string(perf_thre_update_dec)) << "│\n";
+        std::cerr << "│ Global Threshold (tot/inc/dec): " << std::setw(28) << std::left
+                  << (std::to_string(perf_global_thre_update) + " / " + std::to_string(perf_global_thre_inc) + " / " + std::to_string(perf_global_thre_dec)) << "│\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 #endif
+
+        std::cerr << "\n┌─ Mispred Reason Statistics ──────────────────────────────────────┐\n";
+        std::cerr << "│ Total Mispred:           " << std::setw(36) << std::left << total_mispred << "│\n";
+        std::cerr << "│ Src Wrong (Prov/Alt/Bim): " << std::setw(35) << std::left
+                  << (std::to_string(total_prov_wrong) + " / " + std::to_string(total_alt_wrong) + " / " + std::to_string(perf_bimodal_wrong)) << "│\n";
+        std::cerr << "│ Blame TAGE/SC/P1:        " << std::setw(36) << std::left
+                  << (std::to_string(perf_mispred_blame_tage) + " / " + std::to_string(perf_mispred_blame_sc) + " / " + std::to_string(perf_mispred_blame_p1)) << "│\n";
+#ifdef MY_SC
+        std::cerr << "│ SC Wrong use_sc=0:       " << std::setw(36) << std::left << perf_mispred_sc_not_used << "│\n";
+        std::cerr << "│ SC Wrong Keep/Flip:      " << std::setw(36) << std::left
+                  << (std::to_string(perf_mispred_sc_keep) + " / " + std::to_string(perf_mispred_sc_flip)) << "│\n";
+        std::cerr << "│ SC Flip Harm/BothWrong:  " << std::setw(36) << std::left
+                  << (std::to_string(perf_mispred_sc_flip_harmful) + " / " + std::to_string(perf_mispred_sc_flip_both_wrong)) << "│\n";
+#endif
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
         // Extra cycle statistics
         std::cerr << "\n┌─ Extra Cycle Statistics ──────────────────────────────────────┐\n";
@@ -500,6 +581,13 @@ struct my_bp_v1 : predictor {
             std::cerr << "✓ PASS                      │\n";
         else
             std::cerr << "✗ FAIL (" << total_all << " vs " << perf_predictions << ")    │\n";
+        std::cerr << "│ Mispred blame sum check:      ";
+        if (total_mispred == (perf_mispred_blame_tage + perf_mispred_blame_sc + perf_mispred_blame_p1))
+            std::cerr << "✓ PASS                      │\n";
+        else
+            std::cerr << "✗ FAIL (" << total_mispred << " vs "
+                      << (perf_mispred_blame_tage + perf_mispred_blame_sc + perf_mispred_blame_p1)
+                      << ")    │\n";
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
         // Finalize SQLite trace
@@ -663,6 +751,52 @@ struct my_bp_v1 : predictor {
                 } else {
                     perf_bimodal_correct++;
                 }
+            } else {
+                if (src == 2) {
+                    for (u64 j=0; j<NUMG; j++) {
+                        if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_wrong[j]++; break; }
+                    }
+                } else if (src == 1) {
+                    for (u64 j=0; j<NUMG; j++) {
+                        if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_wrong[j]++; break; }
+                    }
+                } else {
+                    perf_bimodal_wrong++;
+                }
+
+#ifdef GATE
+                if (static_cast<bool>(gating)) {
+                    perf_mispred_blame_p1++;
+                } else
+#endif
+                {
+#ifdef MY_SC
+                    val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
+                    val<1> use_sc_bit = use_sc[offset];
+                    val<1> sc_pred_bit = sc_pred[offset];
+
+                    if (static_cast<bool>(use_sc_bit)) {
+                        if (static_cast<bool>(sc_pred_bit == tage_p2_bit)) {
+                            perf_mispred_sc_keep++;
+                            perf_mispred_blame_tage++;
+                        } else {
+                            perf_mispred_sc_flip++;
+                            if (static_cast<bool>(tage_p2_bit == actual)) {
+                                perf_mispred_sc_flip_harmful++;
+                                perf_mispred_blame_sc++;
+                            } else {
+                                perf_mispred_sc_flip_both_wrong++;
+                                perf_mispred_blame_tage++;
+                            }
+                        }
+                    } else {
+                        perf_mispred_sc_not_used++;
+                        perf_mispred_blame_tage++;
+                    }
+#else
+                    perf_mispred_blame_tage++;
+#endif
+                }
             }
 
             u64 pc_val = 0;
@@ -776,6 +910,48 @@ struct my_bp_v1 : predictor {
             val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
             val<1> actual = branch_taken[offset];
             val<1> sc_override = (p2_bit != tage_p2_bit);
+            val<1> use_sc_bit = use_sc[offset];
+            val<1> sc_pred_bit = sc_pred[offset];
+            val<1> prov_hit = prov_hit_arr[offset];
+            val<1> do_update = do_update_arr[offset];
+            val<1> thre_guard = thre_guard_arr[offset];
+
+            if (static_cast<bool>(use_sc_bit)) {
+                perf_sc_use++;
+                perf_sc_use_correct += static_cast<u64>(sc_pred_bit == actual);
+                if (static_cast<bool>(sc_pred_bit))
+                    perf_sc_use_taken++;
+                else
+                    perf_sc_use_nottaken++;
+                if (static_cast<bool>(sc_pred_bit == tage_p2_bit))
+                    perf_sc_use_same_as_tage++;
+                else
+                    perf_sc_use_flip_tage++;
+                if (static_cast<bool>(prov_weak[offset]))
+                    perf_sc_use_weak++;
+                if (static_cast<bool>(prov_mid[offset]))
+                    perf_sc_use_mid++;
+                if (static_cast<bool>(prov_sat[offset]))
+                    perf_sc_use_sat++;
+            }
+
+            if (static_cast<bool>(prov_hit))
+                perf_sc_stage_prov_hit++;
+            if (static_cast<bool>(do_update))
+                perf_sc_stage_do_update++;
+            if (static_cast<bool>(prov_hit & do_update))
+                perf_sc_stage_candidate++;
+            if (static_cast<bool>(prov_hit & do_update & thre_guard))
+                perf_sc_stage_guard_pass++;
+
+            if (!static_cast<bool>(prov_hit)) {
+                perf_sc_skip_no_provider++;
+            } else if (!static_cast<bool>(do_update)) {
+                perf_sc_skip_no_do_update++;
+            } else if (!static_cast<bool>(thre_guard)) {
+                perf_sc_skip_guard++;
+            }
+
             if (static_cast<bool>(sc_override)) {
                 perf_sc_override++;
                 perf_sc_override_correct += static_cast<u64>(p2_bit == actual);
@@ -1789,6 +1965,17 @@ struct my_bp_v1 : predictor {
         val<1> global_thre_decsign = ~global_thre_inc;
         global_thre_inc.fanout(hard<2>{});
         val<2,i64> gthre_delta = select(global_thre_upd.fo1(), concat(global_thre_decsign.fo1(), val<1>{1}), val<2>{0});
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        if (static_cast<bool>(global_thre_upd)) {
+            perf_global_thre_update++;
+            if (static_cast<bool>(global_thre_inc))
+                perf_global_thre_inc++;
+            else
+                perf_global_thre_dec++;
+        }
+#endif
+#endif
         pipe_global_thre_delta(gthre_delta);
 
         
