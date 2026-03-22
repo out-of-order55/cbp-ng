@@ -1004,6 +1004,9 @@ struct my_bp_v1 : predictor {
 #ifdef SC_USE_BIAS
     ram<arr<val<PERCWIDTH,i64>,4>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[LINEINST] {"Bias pc"};
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_bank_map[4];
+    arr<reg<1>,LINEINST> bias_wb_valid;
+    arr<reg<LOGBIAS-LOGLINEINST-2>,LINEINST> bias_wb_idx;
+    arr<reg<PERCWIDTH,i64>,LINEINST> bias_wb_data[4];
     arr<reg<PERCWIDTH,i64>,4> bias_lmap;
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_map;
     arr<reg<2>,LINEINST> tage_info;
@@ -2014,10 +2017,15 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_USE_BIAS
             write_tage_info.fanout(hard<5>{});
-            high_idx.fanout(hard<2>{});
+            high_idx.fanout(hard<4>{});
             execute_if(sc_update_en, [&](){
+                val<1> wb_hit = val<1>{bias_wb_valid[offset]} &
+                                (val<LOGBIAS-LOGLINEINST-2>{bias_wb_idx[offset]} == high_idx);
+                wb_hit.fanout(hard<4>{});
                 arr<val<PERCWIDTH,i64>,4> old_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                    return val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
+                    val<PERCWIDTH,i64> wb_lane = val<PERCWIDTH,i64>{bias_wb_data[bank][offset]};
+                    val<PERCWIDTH,i64> ram_lane = val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
+                    return select(wb_hit, wb_lane, ram_lane);
                 }};
                 arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
                     val<PERCWIDTH,i64> old_lane = old_bias_vec[bank];
@@ -2025,6 +2033,11 @@ struct my_bp_v1 : predictor {
                     return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
                 }};
                 bias_pc[offset].write(high_idx, new_bias_vec);
+                for (u64 bank = 0; bank < 4; bank++) {
+                    bias_wb_data[bank][offset] = new_bias_vec[bank];
+                }
+                bias_wb_valid[offset] = val<1>{1};
+                bias_wb_idx[offset] = high_idx;
             });
 #endif
 #ifdef SC_USE_GEHL
