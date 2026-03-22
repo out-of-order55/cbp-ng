@@ -5,9 +5,12 @@
 
 // #define GATE
 #define MY_SC
+#if !defined(SC_DISABLE_FGEHL)
 #define SC_FGEHL
+#endif
 // #define SC_DISABLE_BIAS
 // #define SC_DISABLE_GEHL
+// #define SC_DISABLE_FGEHL
 // #define HASH_TAG
 
 #if !defined(SC_DISABLE_BIAS)
@@ -989,24 +992,18 @@ struct my_bp_v1 : predictor {
     reg<LOGGATEBITS> aidx[2];//for update
 #endif  
     
-
+    // Cluster P1 + bpred + SC tables to reduce dominant SC-path wire distance.
+    zone P1_SC_CLUSTER;
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
-
-    // P2 (TAGE)
-    ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
-    // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
-    ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
-    rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
-
-    rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
     ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
     #ifdef MY_SC
     //bias_pc is concat pc and tage
     //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
     arr<reg<TOTAL_THREBITS>,LINEINST> threshold;
 #ifdef SC_USE_BIAS
-    ram<val<PERCWIDTH,i64>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[4][LINEINST] {"Bias pc"};
+    ram<arr<val<PERCWIDTH,i64>,4>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[LINEINST] {"Bias pc"};
+    arr<reg<PERCWIDTH,i64>,LINEINST> bias_bank_map[4];
     arr<reg<PERCWIDTH,i64>,4> bias_lmap;
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_map;
     arr<reg<2>,LINEINST> tage_info;
@@ -1037,6 +1034,15 @@ struct my_bp_v1 : predictor {
 
     
     #endif
+    // Put TAGE tables in a dedicated cluster.
+    zone TAGE_CLUSTER;
+    // P2 (TAGE)
+    ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
+    // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
+    ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
+    rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
+
+    rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
     zone UPDATE_ONLY;
     ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
     ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
@@ -1301,17 +1307,20 @@ struct my_bp_v1 : predictor {
         // bias
 #ifdef SC_USE_BIAS
         val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB+2);
-        bias_pc_high_index.fanout(hard<(LINEINST*4+1)>{});
+        bias_pc_high_index.fanout(hard<(LINEINST+1)>{});
 #ifdef DEBUG_ENERGY
         energy_checkpoint(monitor);
 #endif
-        bias_map = arr<val<PERCWIDTH>,LINEINST>{[&](u64 offset){
-            arr<val<PERCWIDTH>,4> bank_out = [&](u64 b){ return bias_pc[b][offset].read(bias_pc_high_index); };
+        bias_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            arr<val<PERCWIDTH,i64>,4> bank_out = bias_pc[offset].read(bias_pc_high_index);
+            for (u64 bank = 0; bank < 4; bank++) {
+                bias_bank_map[bank][offset] = bank_out[bank];
+            }
             val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
             val<1> prov_pred = pred1[offset] & prov_hit;
             val<1> is_prov_weak =  prov_weak[offset];
             tage_info[offset] = concat(prov_pred,is_prov_weak);
-            val<PERCWIDTH> result = bank_out.select(tage_info[offset]);
+            val<PERCWIDTH,i64> result = bank_out.select(tage_info[offset]);
             return result;
         }};
 #ifdef DEBUG_ENERGY
@@ -1996,7 +2005,6 @@ struct my_bp_v1 : predictor {
         for (u64 offset = 0; offset < LINEINST; offset++) {
 #ifdef SC_USE_BIAS
             val<LOGBIAS-LOGLINEINST-2> high_idx = bias_high_idx;
-            val<PERCWIDTH,i64> old_bias = bias_map[offset];
             val<2> write_tage_info = tage_info[offset];
 #endif
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
@@ -2005,14 +2013,19 @@ struct my_bp_v1 : predictor {
             val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
 #endif
 #ifdef SC_USE_BIAS
-            old_bias.fanout(hard<4>{});
-            write_tage_info.fanout(hard<4>{});
-            high_idx.fanout(hard<4>{});
-            for (u64 bank = 0; bank < 4; bank++){
-                execute_if((write_tage_info==val<2>{bank}) & sc_update_en, [&](){
-                    bias_pc[bank][offset].write(high_idx, update_ctr(old_bias, branch_taken[offset]));
-                });
-            }
+            write_tage_info.fanout(hard<5>{});
+            high_idx.fanout(hard<2>{});
+            execute_if(sc_update_en, [&](){
+                arr<val<PERCWIDTH,i64>,4> old_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
+                    return val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
+                }};
+                arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
+                    val<PERCWIDTH,i64> old_lane = old_bias_vec[bank];
+                    val<PERCWIDTH,i64> new_lane = update_ctr(old_lane, branch_taken[offset]);
+                    return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
+                }};
+                bias_pc[offset].write(high_idx, new_bias_vec);
+            });
 #endif
 #ifdef SC_USE_GEHL
             for (u64 k = 0; k < NUMGEHL; k++) {
