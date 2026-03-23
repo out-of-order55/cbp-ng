@@ -100,6 +100,512 @@ struct rwram {
 };
 
 
+// write-buffered RAM wrapper
+// read path always goes directly to backend RAM (no WB lookup).
+// write path supports WAW merge (same-address write updates buffered entry).
+// one write request per cycle per instance.
+template<u64 N, u64 M, u64 D = 4, u64 T = 1>
+struct wb_ram {
+    static_assert(std::has_single_bit(M));
+    static constexpr u64 A = std::bit_width(M-1);
+    static_assert(D >= 2);
+    static_assert(std::has_single_bit(D));
+    static_assert(T >= 1 && T <= D);
+    static constexpr u64 Q = std::bit_width(D-1);
+    static constexpr u64 QC = std::bit_width(D);
+
+    ram<val<N>,M> mem;
+
+    arr<reg<1>,D> q_valid;
+    arr<reg<A>,D> q_addr;
+    arr<reg<N>,D> q_data;
+    reg<Q> q_head;
+    reg<Q> q_tail;
+    reg<QC> q_count;
+    reg<4> q_head_wait;
+
+    reg<1> write_stall;
+
+#ifdef PERF_COUNTERS
+    static constexpr u64 WB_LIFETIME_BINS = 64;
+    u64 perf_wb_rd_req = 0;
+    u64 perf_wb_rd_pending_hit = 0;
+    u64 perf_wb_wr_req = 0;
+    u64 perf_wb_wr_hit_merge = 0;
+    u64 perf_wb_wr_enq = 0;
+    u64 perf_wb_wr_drop_full = 0;
+    u64 perf_wb_drain_req = 0;
+    u64 perf_wb_drain_do = 0;
+    u64 perf_wb_drain_block_wr = 0;
+    u64 perf_wb_depth_peak = 0;
+    u64 perf_wb_block_cycles = 0;
+    std::array<u64,D+1> perf_wb_block_depth = {};
+    u64 perf_wb_seq = 0;
+    std::array<u64,D> perf_wb_enq_seq = {};
+    u64 perf_wb_lifetime_samples = 0;
+    u64 perf_wb_lifetime_sum = 0;
+    u64 perf_wb_lifetime_max = 0;
+    std::array<u64,WB_LIFETIME_BINS+1> perf_wb_lifetime_hist = {};
+#endif
+
+    wb_ram(const char *label="") : mem{label} {}
+
+    val<N> read(val<A> addr)
+    {
+#ifdef PERF_COUNTERS
+        perf_wb_rd_req++;
+        bool pending_hit = false;
+        for (u64 i = 0; i < D; i++) {
+            bool v = static_cast<bool>(val<1>{q_valid[i]});
+            bool h = static_cast<bool>(val<A>{q_addr[i]} == addr);
+            pending_hit |= (v & h);
+        }
+        perf_wb_rd_pending_hit += static_cast<u64>(pending_hit);
+#endif
+        return mem.read(addr);
+    }
+
+    // noconflict=1 means no backend read conflict this cycle.
+    // drain is allowed whenever queue is non-empty and noconflict=1.
+    void write(val<A> addr, val<N> data, val<1> we, val<1> noconflict)
+    {
+#ifdef PERF_COUNTERS
+        u64 seq_now = perf_wb_seq++;
+#endif
+        val<1> wr_en = we.fo1();
+        val<1> can_drain = noconflict.fo1();
+        val<1> reach_threshold = q_count >= val<QC>{T};
+        val<1> has_pending = q_count != val<QC>{0};
+        val<1> do_dequeue = has_pending & can_drain & reach_threshold;
+        val<1> wait_active = has_pending & ~do_dequeue;
+        val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
+        q_head_wait = select(wait_active, wait_inc, val<4>{0});
+
+        // only build compare tree when there is an incoming write
+        val<D> hit_mask = execute_if(wr_en, [&](){
+            arr<val<1>,D> hit = arr<val<1>,D>{[&](u64 i){
+                return val<1>{q_valid[i]} & (val<A>{q_addr[i]} == addr);
+            }};
+            return hit.concat();
+        });
+        val<1> has_hit = hit_mask != val<D>{0};
+        val<D> hit_oh = hit_mask.one_hot();
+        arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
+        val<D> head_mask = val<Q>{q_head}.decode().concat();
+        val<1> hit_head = (hit_mask & head_mask) != val<D>{0};
+
+        // independent RAM-drain stage
+        val<A> deq_addr = q_addr.select(q_head);
+        val<N> deq_data_old = q_data.select(q_head);
+        val<N> deq_data = select(hit_head, data, deq_data_old);
+        execute_if(do_dequeue, [&](){
+            mem.write(deq_addr, deq_data);
+        });
+
+        // queue update stage
+        val<1> stall_now = execute_if(wr_en | do_dequeue, [&](){
+            val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
+            val<1> full_after_deq = count_after_deq == val<QC>{D};
+            val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq;
+            val<1> stall_inner = wr_en & ~has_hit & full_after_deq;
+
+#ifdef PERF_COUNTERS
+            perf_wb_wr_req += static_cast<u64>(wr_en);
+            perf_wb_wr_hit_merge += static_cast<u64>(has_hit);
+            perf_wb_wr_enq += static_cast<u64>(do_enqueue);
+            perf_wb_wr_drop_full += static_cast<u64>(stall_inner);
+            perf_wb_drain_req += static_cast<u64>(has_pending & can_drain & reach_threshold);
+            perf_wb_drain_do += static_cast<u64>(do_dequeue);
+            perf_wb_drain_block_wr += static_cast<u64>(has_pending & (~can_drain | ~reach_threshold));
+            if (static_cast<u64>(stall_inner) != 0) {
+                u64 depth_now = static_cast<u64>(q_count);
+                depth_now = std::min(depth_now, D);
+                perf_wb_block_cycles++;
+                perf_wb_block_depth[depth_now]++;
+            }
+            if (static_cast<u64>(do_dequeue) != 0) {
+                u64 head_idx = std::min(static_cast<u64>(q_head), D-1);
+                u64 lifetime = seq_now - perf_wb_enq_seq[head_idx];
+                u64 bin = std::min(lifetime, WB_LIFETIME_BINS);
+                perf_wb_lifetime_samples++;
+                perf_wb_lifetime_sum += lifetime;
+                perf_wb_lifetime_max = std::max(perf_wb_lifetime_max, lifetime);
+                perf_wb_lifetime_hist[bin]++;
+            }
+            if (static_cast<u64>(do_enqueue) != 0) {
+                u64 tail_idx = std::min(static_cast<u64>(q_tail), D-1);
+                perf_wb_enq_seq[tail_idx] = seq_now;
+            }
+#endif
+
+            val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
+            val<Q> q_tail_next = select(do_enqueue, val<Q>{q_tail + val<Q>{1}}, val<Q>{q_tail});
+            val<QC> q_count_next = select(do_enqueue, val<QC>{count_after_deq + val<QC>{1}}, count_after_deq);
+
+#ifdef PERF_COUNTERS
+            u64 depth_now = static_cast<u64>(q_count_next);
+            perf_wb_depth_peak = std::max(perf_wb_depth_peak, depth_now);
+#endif
+
+            q_head = q_head_next;
+            q_tail = q_tail_next;
+            q_count = q_count_next;
+
+            for (u64 i = 0; i < D; i++) {
+                val<1> is_head = q_head == val<Q>{i};
+                val<1> is_tail = q_tail == val<Q>{i};
+                val<1> clear_slot = do_dequeue & is_head;
+                val<1> fill_slot = do_enqueue & is_tail;
+
+                q_valid[i] = select(fill_slot, val<1>{1},
+                             select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
+                q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
+                q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N>{q_data[i]});
+            }
+            return stall_inner;
+        });
+        write_stall = stall_now;
+    }
+
+    val<1> stalled() const
+    {
+        return write_stall;
+    }
+
+    val<1> full() const
+    {
+        return q_count == val<QC>{D};
+    }
+
+    // Head request has waited >8 cycles without draining.
+    val<1> drain_urgent()
+    {
+        return (q_count != val<QC>{0}) & (q_head_wait > hard<8>{});
+    }
+
+#ifdef PERF_COUNTERS
+    u64 wb_rd_req() const { return perf_wb_rd_req; }
+    u64 wb_rd_pending_hit() const { return perf_wb_rd_pending_hit; }
+    u64 wb_wr_req() const { return perf_wb_wr_req; }
+    u64 wb_wr_hit_merge() const { return perf_wb_wr_hit_merge; }
+    u64 wb_wr_enq() const { return perf_wb_wr_enq; }
+    u64 wb_wr_drop_full() const { return perf_wb_wr_drop_full; }
+    u64 wb_drain_req() const { return perf_wb_drain_req; }
+    u64 wb_drain_do() const { return perf_wb_drain_do; }
+    u64 wb_drain_block_wr() const { return perf_wb_drain_block_wr; }
+    u64 wb_depth_peak() const { return perf_wb_depth_peak; }
+    u64 wb_block_cycles() const { return perf_wb_block_cycles; }
+    u64 wb_block_depth(u64 d) const { return (d <= D) ? perf_wb_block_depth[d] : 0; }
+    u64 wb_lifetime_samples() const { return perf_wb_lifetime_samples; }
+    u64 wb_lifetime_sum() const { return perf_wb_lifetime_sum; }
+    u64 wb_lifetime_max() const { return perf_wb_lifetime_max; }
+    u64 wb_lifetime_bin(u64 b) const { return (b <= WB_LIFETIME_BINS) ? perf_wb_lifetime_hist[b] : 0; }
+#endif
+
+    void reset()
+    {
+        mem.reset();
+    }
+};
+
+
+// write-buffered RWRAM wrapper
+// read path always goes directly to backend RWRAM (no WB lookup).
+// write path supports WAW merge (same-address write updates buffered entry).
+// one write request per cycle per instance.
+template<u64 N, u64 M, u64 B, u64 D = 4, u64 T = 1>
+struct wb_rwram {
+    static_assert(std::has_single_bit(M));
+    static constexpr u64 A = std::bit_width(M-1);
+    static_assert(D >= 2);
+    static_assert(std::has_single_bit(D));
+    static_assert(T >= 1 && T <= D);
+    static constexpr u64 Q = std::bit_width(D-1);
+    static constexpr u64 QC = std::bit_width(D);
+
+    rwram<N,M,B> mem;
+
+    arr<reg<1>,D> q_valid;
+    arr<reg<A>,D> q_addr;
+    arr<reg<N>,D> q_data;
+    reg<Q> q_head;
+    reg<Q> q_tail;
+    reg<QC> q_count;
+
+    reg<1> write_stall;
+
+#ifdef PERF_COUNTERS
+    u64 perf_wb_rd_req = 0;
+    u64 perf_wb_rd_pending_hit = 0;
+    u64 perf_wb_wr_req = 0;
+    u64 perf_wb_wr_hit_merge = 0;
+    u64 perf_wb_wr_enq = 0;
+    u64 perf_wb_wr_drop_full = 0;
+    u64 perf_wb_drain_req = 0;
+    u64 perf_wb_drain_do = 0;
+    u64 perf_wb_drain_block_wr = 0;
+    u64 perf_wb_depth_peak = 0;
+#endif
+
+    wb_rwram(const char *label="") : mem{label} {}
+
+    val<N> read(val<A> addr)
+    {
+#ifdef PERF_COUNTERS
+        perf_wb_rd_req++;
+        bool pending_hit = false;
+        for (u64 i = 0; i < D; i++) {
+            bool v = static_cast<bool>(val<1>{q_valid[i]});
+            bool h = static_cast<bool>(val<A>{q_addr[i]} == addr);
+            pending_hit |= (v & h);
+        }
+        perf_wb_rd_pending_hit += static_cast<u64>(pending_hit);
+#endif
+        return mem.read(addr);
+    }
+
+    // noconflict is passed to backend rwram write when dequeuing.
+    // drain is allowed whenever queue is non-empty and noconflict=1.
+    void write(val<A> addr, val<N> data, val<1> we, val<1> noconflict)
+    {
+        val<1> wr_en = we.fo1();
+        val<1> can_drain = noconflict.fo1();
+
+        val<1> has_pending = q_count != val<QC>{0};
+
+        arr<val<1>,D> hit = arr<val<1>,D>{[&](u64 i){
+            return wr_en & val<1>{q_valid[i]} & (val<A>{q_addr[i]} == addr);
+        }};
+        val<D> hit_mask = hit.concat();
+        val<1> has_hit = hit_mask != val<D>{0};
+        val<D> hit_oh = hit_mask.one_hot();
+        arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
+        val<D> head_mask = val<Q>{q_head}.decode().concat();
+        val<1> hit_head = (hit_mask & head_mask) != val<D>{0};
+
+        val<1> reach_threshold = q_count >= val<QC>{T};
+        val<1> do_dequeue = has_pending & can_drain & reach_threshold;
+        val<A> deq_addr = q_addr.select(q_head);
+        val<N> deq_data_old = q_data.select(q_head);
+        val<N> deq_data = select(hit_head, data, deq_data_old);
+        execute_if(do_dequeue, [&](){
+            mem.write(deq_addr, deq_data, noconflict);
+        });
+
+        val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
+        val<1> full_after_deq = count_after_deq == val<QC>{D};
+        val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq;
+        val<1> stall_now = wr_en & ~has_hit & full_after_deq;
+        write_stall = stall_now;
+
+#ifdef PERF_COUNTERS
+        perf_wb_wr_req += static_cast<u64>(wr_en);
+        perf_wb_wr_hit_merge += static_cast<u64>(has_hit);
+        perf_wb_wr_enq += static_cast<u64>(do_enqueue);
+        perf_wb_wr_drop_full += static_cast<u64>(stall_now);
+        perf_wb_drain_req += static_cast<u64>(has_pending & can_drain & reach_threshold);
+        perf_wb_drain_do += static_cast<u64>(do_dequeue);
+        perf_wb_drain_block_wr += static_cast<u64>(has_pending & (~can_drain | ~reach_threshold));
+#endif
+
+        val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
+        val<Q> q_tail_next = select(do_enqueue, val<Q>{q_tail + val<Q>{1}}, val<Q>{q_tail});
+        val<QC> q_count_next = select(do_enqueue, val<QC>{count_after_deq + val<QC>{1}}, count_after_deq);
+
+#ifdef PERF_COUNTERS
+        u64 depth_now = static_cast<u64>(q_count_next);
+        perf_wb_depth_peak = std::max(perf_wb_depth_peak, depth_now);
+#endif
+
+        q_head = q_head_next;
+        q_tail = q_tail_next;
+        q_count = q_count_next;
+
+        for (u64 i = 0; i < D; i++) {
+            val<1> is_head = q_head == val<Q>{i};
+            val<1> is_tail = q_tail == val<Q>{i};
+            val<1> clear_slot = do_dequeue & is_head;
+            val<1> fill_slot = do_enqueue & is_tail;
+
+            q_valid[i] = select(fill_slot, val<1>{1},
+                         select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
+            q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
+            q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N>{q_data[i]});
+        }
+    }
+
+    val<1> stalled() const
+    {
+        return write_stall;
+    }
+
+    val<1> full() const
+    {
+        return q_count == val<QC>{D};
+    }
+
+#ifdef PERF_COUNTERS
+    u64 wb_rd_req() const { return perf_wb_rd_req; }
+    u64 wb_rd_pending_hit() const { return perf_wb_rd_pending_hit; }
+    u64 wb_wr_req() const { return perf_wb_wr_req; }
+    u64 wb_wr_hit_merge() const { return perf_wb_wr_hit_merge; }
+    u64 wb_wr_enq() const { return perf_wb_wr_enq; }
+    u64 wb_wr_drop_full() const { return perf_wb_wr_drop_full; }
+    u64 wb_drain_req() const { return perf_wb_drain_req; }
+    u64 wb_drain_do() const { return perf_wb_drain_do; }
+    u64 wb_drain_block_wr() const { return perf_wb_drain_block_wr; }
+    u64 wb_depth_peak() const { return perf_wb_depth_peak; }
+#endif
+
+    void reset()
+    {
+        mem.reset();
+    }
+};
+
+
+// banked RAM with parameterized buffered writes
+// D controls the pending-write queue depth.
+template<u64 N, u64 M, u64 B, u64 D = 2>
+struct my_rwram {
+    // M entries of N bits (total), B banks
+    static_assert(std::has_single_bit(M)); // number of entries is power of two
+    static constexpr u64 A = std::bit_width(M-1); // address bits
+    static_assert(B>=2 && B<=64);
+    static_assert(std::has_single_bit(B)); // number of banks is power of two
+    static constexpr u64 E = M/B; // entries per bank
+    static_assert(E>1);
+    static constexpr u64 L = std::bit_width(E-1); // local address bits
+    static constexpr u64 I = std::bit_width(B-1); // bank ID bits
+    static_assert(A==L+I);
+
+    static_assert(D>=2);
+    static_assert(std::has_single_bit(D));
+    static constexpr u64 Q = std::bit_width(D-1); // queue index bits
+
+    ram<val<N>,E> bank[B];
+    reg<B> read_bank;
+
+    // pending-write queue
+    arr<reg<1>,D> q_valid;
+    arr<reg<B>,D> q_bank;
+    arr<reg<L>,D> q_localaddr;
+    arr<reg<N>,D> q_data;
+    reg<Q> q_head;
+    reg<Q> q_tail;
+    reg<Q+1> q_count;
+
+    my_rwram(const char *label="") : bank{label} {}
+
+    val<N> read(val<A> addr)
+    {
+        auto [localaddr,bankid] = split<L,I>(addr.fo1());
+        localaddr.fanout(hard<B>{});
+        arr<val<1>,B> banksel = bankid.fo1().decode();
+        banksel.fanout(hard<2>{});
+        arr<val<N>,B> data = [&] (u64 i) -> val<N> {
+            return execute_if(banksel[i],[&](){return bank[i].read(localaddr);});
+        };
+        read_bank = banksel.concat();
+        return data.fo1().fold_or();
+    }
+
+    void write(val<A> addr, val<N> data, val<1> noconflict)
+    {
+        // noconflict=1: write-through for current write.
+        // noconflict=0: queue current write and flush queued write if possible.
+        auto [localaddr,bankid] = split<L,I>(addr.fo1());
+        data.fanout(hard<B+2>{});
+        noconflict.fanout(hard<B+D+6>{});
+
+        val<B> banksel = bankid.fo1().decode().concat();
+        banksel.fanout(hard<4>{});
+        arr<val<1>,B> banksel_split = banksel.make_array(val<1>{});
+        banksel_split.fanout(hard<2>{});
+        arr<val<1>,B> read_bank_split = read_bank.make_array(val<1>{});
+        read_bank_split.fanout(hard<2>{});
+
+        val<1> has_pending = (q_count != hard<0>{});
+        has_pending.fanout(hard<4>{});
+        val<B> head_bank = q_bank.select(q_head);
+        head_bank.fanout(hard<2>{});
+        arr<val<1>,B> head_bank_split = head_bank.make_array(val<1>{});
+        head_bank_split.fanout(hard<2>{});
+        val<L> head_localaddr = q_localaddr.select(q_head);
+        val<N> head_data = q_data.select(q_head);
+        val<1> head_conflict = ((head_bank & read_bank) != hard<0>{});
+        val<1> dequeue = has_pending & ~head_conflict;
+        dequeue.fanout(hard<D+5>{});
+
+        // Write current request (if conflict-free) or flush queue head (if possible).
+        val<1> direct_write = noconflict;
+        direct_write.fanout(hard<B+2>{});
+        for (u64 i=0; i<B; i++) {
+            val<1> do_direct = direct_write & banksel_split[i];
+            val<1> do_flush = dequeue & head_bank_split[i];
+            do_direct.fanout(hard<3>{});
+            do_flush.fanout(hard<2>{});
+            execute_if(do_direct | do_flush, [&](){
+                val<L> waddr = select(do_direct, localaddr, head_localaddr);
+                val<N> wdata = select(do_direct, data, head_data);
+                bank[i].write(waddr.fo1(), wdata.fo1());
+            });
+        }
+
+        // Queue enqueue policy: if full and no dequeue, current write is dropped.
+        val<1> enqueue_req = ~noconflict;
+        val<1> queue_full = (q_count == hard<D>{});
+        val<1> enqueue = enqueue_req & (~queue_full | dequeue);
+        enqueue.fanout(hard<D+4>{});
+
+        // Queue metadata updates.
+        val<Q> qhead_inc = q_head + hard<1>{};
+        val<Q> qtail_inc = q_tail + hard<1>{};
+        val<Q+1> count_after_deq = select(dequeue, val<Q+1>{q_count - hard<1>{}}, val<Q+1>{q_count});
+        q_count = select(enqueue, val<Q+1>{count_after_deq + hard<1>{}}, count_after_deq);
+        q_head = select(dequeue, qhead_inc, val<Q>{q_head});
+        q_tail = select(enqueue, qtail_inc, val<Q>{q_tail});
+
+        // Per-slot state updates.
+        arr<val<1>,D> next_valid = [&](u64 i) -> val<1> {
+            val<1> is_head = has_pending & (q_head == i);
+            val<1> is_tail = enqueue & (q_tail == i);
+            is_head.fanout(hard<2>{});
+            is_tail.fanout(hard<2>{});
+            val<1> clear_slot = dequeue & is_head & ~is_tail;
+            return select(is_tail, val<1>{1},
+                   select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
+        };
+        arr<val<B>,D> next_bank = [&](u64 i) -> val<B> {
+            val<1> is_tail = enqueue & (q_tail == i);
+            return select(is_tail, banksel, val<B>{q_bank[i]});
+        };
+        arr<val<L>,D> next_localaddr = [&](u64 i) -> val<L> {
+            val<1> is_tail = enqueue & (q_tail == i);
+            return select(is_tail, localaddr, val<L>{q_localaddr[i]});
+        };
+        arr<val<N>,D> next_data = [&](u64 i) -> val<N> {
+            val<1> is_tail = enqueue & (q_tail == i);
+            return select(is_tail, data, val<N>{q_data[i]});
+        };
+
+        q_valid = next_valid;
+        q_bank = next_bank;
+        q_localaddr = next_localaddr;
+        q_data = next_data;
+    }
+
+    void reset()
+    {
+        for (u64 i=0; i<B; i++) {
+            bank[i].reset();
+        }
+        // Keep reset behavior aligned with rwram: clear SRAM contents only.
+        // Writing queue registers here can conflict with write() in the same cycle.
+    }
+};
+
+
 // global history updated by shifting left by one bit and then xoring with some branch bits
 // (branch direction, PC bits, target bits, whatever...)
 // N is the history length in bits

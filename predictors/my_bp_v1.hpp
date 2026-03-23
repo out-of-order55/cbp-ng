@@ -1,6 +1,6 @@
 // this is a basic TAGE, not necessarily well optimized
 
-#define USE_META
+#define USE_ALT
 #define RESET_UBITS
 
 // #define GATE
@@ -11,7 +11,6 @@
 // #define SC_DISABLE_BIAS
 // #define SC_DISABLE_GEHL
 // #define SC_DISABLE_FGEHL
-// #define HASH_TAG
 
 #if !defined(SC_DISABLE_BIAS)
 #define SC_USE_BIAS
@@ -42,7 +41,7 @@ using namespace hcm;
 #ifdef DEBUG_ENERGY
     struct energy_monitor monitor;
 #endif
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
 struct my_bp_v1 : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
@@ -59,8 +58,8 @@ struct my_bp_v1 : predictor {
     static constexpr u64 FHIST_BITS = 48;
 #endif
     static constexpr u64 TOTAL_THREBITS = 10;
-    static constexpr u64 GLOBAL_THREBITS = 10;
-    static constexpr u64 PRE_PC_THREBITS = 10;
+    static constexpr u64 GLOBAL_THREBITS = 9;
+    static constexpr u64 PRE_PC_THREBITS = 9;
     // static constexpr u64 LOGTHREBITS = 5;
 
     static constexpr u64 MINHIST = 2;
@@ -72,7 +71,7 @@ struct my_bp_v1 : predictor {
     static constexpr u64 TAGGATEBITS = 8;
     static constexpr u64 CTRGATEBITS = 3;
 
-#ifdef USE_META
+#ifdef USE_ALT
     static constexpr u64 METAPIPE = 2;
 #endif
     static constexpr u64 LOGLINEINST = LOGLB-2;
@@ -86,11 +85,9 @@ struct my_bp_v1 : predictor {
     static constexpr u64 index1_bits = LOGP1-LOGLINEINST;
     static constexpr u64 bindex_bits = LOGB-LOGLINEINST;
     static_assert(TAGW > LOGLINEINST); // the unhashed line offset is part of the tag
-#ifdef  HASH_TAG
-    static constexpr u64 HTAGBITS = TAGW; // hashed tag bits
-#else
+
     static constexpr u64 HTAGBITS = TAGW-LOGLINEINST; // hashed tag bits
-#endif
+
 
     geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
 
@@ -132,7 +129,7 @@ struct my_bp_v1 : predictor {
     arr<reg<1>,LINEINST> pred1; // primary P2 prediction for each offset
 
 
-#ifdef USE_META
+#ifdef USE_ALT
     arr<reg<METABITS,i64>,METAPIPE> meta; // select between pred1 and pred2
     arr<reg<1>,LINEINST> newly_alloc;
 #endif
@@ -539,6 +536,86 @@ struct my_bp_v1 : predictor {
         std::cerr << "│ Global Threshold (tot/inc/dec): " << std::setw(28) << std::left
                   << (std::to_string(perf_global_thre_update) + " / " + std::to_string(perf_global_thre_inc) + " / " + std::to_string(perf_global_thre_dec)) << "│\n";
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+#ifdef SC_FGEHL
+        {
+            constexpr u64 WB_DEPTH = 4;
+            constexpr u64 WB_LIFE_BINS = wb_ram<PERCWIDTH,(1<<(LOGFGEHL-LOGLINEINST)),4,1>::WB_LIFETIME_BINS;
+            std::array<u64,WB_DEPTH+1> depth_hist = {};
+            std::array<u64,WB_LIFE_BINS+1> life_hist = {};
+            u64 wb_wr_req = 0;
+            u64 wb_wr_hit_merge = 0;
+            u64 wb_wr_enq = 0;
+            u64 wb_wr_drop_full = 0;
+            u64 wb_drain_do = 0;
+            u64 wb_block_cycles = 0;
+            u64 wb_life_samples = 0;
+            u64 wb_life_sum = 0;
+            u64 wb_life_max = 0;
+
+            for (u64 offset = 0; offset < LINEINST; offset++) {
+                wb_wr_req += fgehl[offset].wb_wr_req();
+                wb_wr_hit_merge += fgehl[offset].wb_wr_hit_merge();
+                wb_wr_enq += fgehl[offset].wb_wr_enq();
+                wb_wr_drop_full += fgehl[offset].wb_wr_drop_full();
+                wb_drain_do += fgehl[offset].wb_drain_do();
+                wb_block_cycles += fgehl[offset].wb_block_cycles();
+                wb_life_samples += fgehl[offset].wb_lifetime_samples();
+                wb_life_sum += fgehl[offset].wb_lifetime_sum();
+                wb_life_max = std::max(wb_life_max, fgehl[offset].wb_lifetime_max());
+                for (u64 d = 0; d <= WB_DEPTH; d++) {
+                    depth_hist[d] += fgehl[offset].wb_block_depth(d);
+                }
+                for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
+                    life_hist[b] += fgehl[offset].wb_lifetime_bin(b);
+                }
+            }
+
+            std::cerr << "\n┌─ FGEHL WB Blocked-Write Distribution ───────────────────────────┐\n";
+            std::cerr << "│ wr_req/hit_merge/enq/drop: " << std::setw(34) << std::left
+                      << (std::to_string(wb_wr_req) + " / " + std::to_string(wb_wr_hit_merge) + " / "
+                          + std::to_string(wb_wr_enq) + " / " + std::to_string(wb_wr_drop_full)) << "│\n";
+            std::cerr << "│ drain_do:                " << std::setw(36) << std::left << wb_drain_do << "│\n";
+            std::cerr << "│ blocked cycles (total):  " << std::setw(36) << std::left << wb_block_cycles << "│\n";
+            for (u64 d = 0; d <= WB_DEPTH; d++) {
+                std::string line = "depth " + std::to_string(d) + ": " + std::to_string(depth_hist[d]);
+                if (wb_block_cycles > 0) {
+                    double pct = 100.0 * static_cast<double>(depth_hist[d]) / static_cast<double>(wb_block_cycles);
+                    line += " (" + (std::to_string(pct)).substr(0,5) + "%)";
+                }
+                std::cerr << "│   " << std::setw(53) << std::left << line << "│\n";
+            }
+            std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+            std::cerr << "\n┌─ FGEHL WB Request Lifetime (enqueue->RAM write) ───────────────┐\n";
+            std::cerr << "│ samples:                 " << std::setw(36) << std::left << wb_life_samples << "│\n";
+            if (wb_life_samples > 0) {
+                double avg_life = static_cast<double>(wb_life_sum) / static_cast<double>(wb_life_samples);
+                std::cerr << "│ avg lifetime (cycles):   " << std::setw(36) << std::left << avg_life << "│\n";
+                std::cerr << "│ max lifetime (cycles):   " << std::setw(36) << std::left << wb_life_max << "│\n";
+            } else {
+                std::cerr << "│ avg lifetime (cycles):   " << std::setw(36) << std::left << "N/A" << "│\n";
+                std::cerr << "│ max lifetime (cycles):   " << std::setw(36) << std::left << "N/A" << "│\n";
+            }
+            bool printed = false;
+            for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
+                if (life_hist[b] == 0) continue;
+                printed = true;
+                std::string name = (b == WB_LIFE_BINS) ? (">=" + std::to_string(WB_LIFE_BINS) + " cycles") :
+                                                          (std::to_string(b) + " cycles");
+                std::string line = name + ": " + std::to_string(life_hist[b]);
+                if (wb_life_samples > 0) {
+                    double pct = 100.0 * static_cast<double>(life_hist[b]) / static_cast<double>(wb_life_samples);
+                    line += " (" + (std::to_string(pct)).substr(0,5) + "%)";
+                }
+                std::cerr << "│   " << std::setw(53) << std::left << line << "│\n";
+            }
+            if (!printed) {
+                std::cerr << "│   " << std::setw(53) << std::left << "no dequeued samples" << "│\n";
+            }
+            std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+        }
+#endif
 #endif
 
         std::cerr << "\n┌─ Mispred Reason Statistics ──────────────────────────────────────┐\n";
@@ -629,13 +706,13 @@ struct my_bp_v1 : predictor {
     }
 
 #ifdef CHEATING_MODE
-#ifdef USE_META
+#ifdef USE_ALT
     void perf_store_prediction_source(val<1> metasign) {
 #else
     void perf_store_prediction_source() {
 #endif
         for (u64 offset=0; offset<LINEINST; offset++) {
-#ifdef USE_META
+#ifdef USE_ALT
             val<1> use_alt_o = metasign & newly_alloc[offset] & (match2[offset]!=hard<0>{});
             val<1> has_tage = (match1[offset] & hard<(1<<NUMG)-1>{}) != hard<0>{};
             val<2> src = select(use_alt_o.fo1(), val<2>{2},
@@ -1024,7 +1101,7 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_FGEHL
     reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGFGEHL-LOGLINEINST))> fgehl[LINEINST] {"FGEHL"};
+    wb_ram<PERCWIDTH,(1<<(LOGFGEHL-LOGLINEINST)),4,1> fgehl[LINEINST] {"FGEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
     reg<FHIST_BITS> fhist;
 #endif
@@ -1049,8 +1126,6 @@ struct my_bp_v1 : predictor {
     zone UPDATE_ONLY;
     ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
     ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
-
-
 
 // #endif
     my_bp_v1()
@@ -1210,13 +1285,7 @@ struct my_bp_v1 : predictor {
         gpreds.fanout(hard<LINEINST>{});
         arr<val<NUMG+1>,LINEINST> preds = [&](u64 offset){return concat(readb[offset],gpreds);};
         preds.fanout(hard<2*LINEINST>{});
-#ifdef HASH_TAG
-        // generate match mask for each offset
-        static_loop<LINEINST>([&]<u64 offset>(){
-            arr<val<1>,NUMG> tagcmp = [&](int i){return readt[i] == (htag[i]^val<HTAGBITS>{offset});};
-            match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() ); // bimodal is default when no match
-        });
-#else
+
         // hashed tags comparisons
         arr<val<1>,NUMG> htagcmp_split = [&](int i){return val<HTAGBITS>{readt[i]} == htag[i];};
         val<NUMG> htagcmp = htagcmp_split.fo1().concat();
@@ -1228,7 +1297,7 @@ struct my_bp_v1 : predictor {
             match[offset] = concat(val<1>{1}, tagcmp.fo1().concat() & htagcmp); // bimodal is default when no match
 
         });
-#endif
+
         match.fanout(hard<2>{});
 
         // for each offset, find longest match and select primary prediction
@@ -1265,7 +1334,7 @@ struct my_bp_v1 : predictor {
         pred2.fanout(hard<2>{});
 
 
-#ifdef USE_META
+#ifdef USE_ALT
         meta.fanout(hard<2>{});
         arr<val<1>,NUMG> weakctr = [&](int i) {return readh[i]==hard<0>{};};
         val<NUMG> coldctr = notumask & weakctr.fo1().concat();
@@ -1289,7 +1358,7 @@ struct my_bp_v1 : predictor {
         // tage_p2.fanout(hard<2>{});
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-#ifdef USE_META
+#ifdef USE_ALT
         perf_store_prediction_source(metasign);
 #else
         perf_store_prediction_source();
@@ -1301,9 +1370,6 @@ struct my_bp_v1 : predictor {
     void sc_predict(val<64> inst_pc){
 
         // inst_pc.fanout(hard<5>{});
-#if !defined(SC_USE_BIAS) && !defined(SC_USE_GEHL) && !defined(SC_FGEHL)
-        static_cast<void>(inst_pc);
-#endif
         match1.fanout(hard<2>{});
         pred1.fanout(hard<2>{});
         prov_weak.fanout(hard<2>{});
@@ -1353,7 +1419,7 @@ struct my_bp_v1 : predictor {
         fidx.fanout(hard<LINEINST+1>{});
         fgehl_idx = fidx;
         fgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            return fgehl[offset].read(fidx);
+            return val<PERCWIDTH,i64>{fgehl[offset].read(fidx)};
         }};
         fgehl_map.fanout(hard<2>{});
 #endif
@@ -1540,7 +1606,7 @@ struct my_bp_v1 : predictor {
         branch_offset.fanout(hard<LINEINST+NUMG+1>{});
         branch_dir.fanout(hard<2>{});
         gfolds.fanout(hard<2>{});
-#ifdef USE_META
+#ifdef USE_ALT
         meta.fanout(hard<2>{});
 #endif
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
@@ -1593,11 +1659,9 @@ struct my_bp_v1 : predictor {
 
         // select some candidate entries for allocation
         val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
-#ifdef HASH_TAG
-        arr<val<1>,NUMG> last_tagcmp = [&](int i){return readt[i] == (last_offset^htag[i]);};
-#else
+
         arr<val<1>,NUMG> last_tagcmp = [&](int i){return readt[i] == concat(last_offset,htag[i]);};
-#endif
+
         val<NUMG+1> last_match1 = last_tagcmp.fo1().append(1).concat().one_hot();
         last_match1.fanout(hard<2>{});
         val<NUMG> postmask = mispmask.fo1() & val<NUMG>(last_match1-1);
@@ -1619,21 +1683,7 @@ struct my_bp_v1 : predictor {
         perf_count_table_alloc(allocate);
 #endif
 #endif
-#ifdef HASH_TAG
-        arr<val<1>,NUMG> bdir = [&](u64 i) {
-            arr<val<1>,LINEINST> tag_oh = [&](u64 offset){
-                return match[offset].make_array(val<1>{})[i];
-            };
-            arr<val<LOGLINEINST>,LINEINST> offset_arr = [&](u64 offset){
-                return select(tag_oh[offset],val<LOGLINEINST>{offset},val<LOGLINEINST>{0});
-            };
-            val<LOGLINEINST> tag_offset = offset_arr.fo1().fold_or();
-            val<LOGLINEINST> offset = select(allocate[i],last_offset,tag_offset.fo1());
-            offset.fanout(hard<LINEINST>{});
-            arr<val<1>,LINEINST> match_offset = [&](u64 j){return branch_offset[j] == offset;};
-            return (match_offset.fo1().concat() & update_valid & actualdirs) != hard<0>{};
-        };
-#else
+
         // associate a branch direction to each global table
         arr<val<1>,NUMG> bdir = [&](u64 i) {
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
@@ -1642,7 +1692,7 @@ struct my_bp_v1 : predictor {
             arr<val<1>,LINEINST> match_offset = [&](u64 j){return branch_offset[j] == offset;};
             return (match_offset.fo1().concat() & update_valid & actualdirs) != hard<0>{};
         };
-#endif
+
         bdir.fanout(hard<2>{});
 
         // tell if global prediction is incorrect
@@ -1650,31 +1700,7 @@ struct my_bp_v1 : predictor {
             return readc[i] != bdir[i];
         };
         badpred1.fanout(hard<3>{});
-#ifdef HASH_TAG
-        // associate to each global table a bit telling if local prediction differs from secondary prediction
-        arr<val<1>,NUMG> altdiffer = [&](u64 i){
-            arr<val<1>,LINEINST> tag_oh = [&](u64 offset){
-                return match2[offset].make_array(val<1>{})[i];
-            };
-            arr<val<LOGLINEINST>,LINEINST> offset_arr = [&](u64 offset){
-                return select(tag_oh[offset],val<LOGLINEINST>{offset},val<LOGLINEINST>{0});
-            };
-            val<LOGLINEINST> tag_offset = offset_arr.fo1().fold_or();
-            return readc[i] != pred2.select(tag_offset.fo1());
-        };
 
-        // associate to each global table a bit telling if prediction for owning branch is correct
-        arr<val<1>,NUMG> goodpred = [&](u64 i){
-            arr<val<1>,LINEINST> tag_oh = [&](u64 offset){
-                return match[offset].make_array(val<1>{})[i];
-            };
-            arr<val<LOGLINEINST>,LINEINST> offset_arr = [&](u64 offset){
-                return select(tag_oh[offset],val<LOGLINEINST>{offset},val<LOGLINEINST>{0});
-            };
-            val<LOGLINEINST> tag_offset = offset_arr.fo1().fold_or();
-            return (tag_offset.fo1() != last_offset) | correct_pred;
-        };
-#else
         // associate to each global table a bit telling if local prediction differs from secondary prediction
         arr<val<1>,NUMG> altdiffer = [&](u64 i){
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
@@ -1686,7 +1712,7 @@ struct my_bp_v1 : predictor {
             val<LOGLINEINST> tag_offset = readt[i] >> HTAGBITS;
             return (tag_offset.fo1() != last_offset) | correct_pred;
         };
-#endif
+
         // do P1 and P2 agree?
         val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
         //TODO:gate
@@ -1767,9 +1793,23 @@ struct my_bp_v1 : predictor {
         val<1> sc_need_update = arr<val<1>,LINEINST>{[&](u64 offset){
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
         }}.fold_or();
-        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | sc_need_update;
+#ifdef SC_FGEHL
+        val<1> wb_force_extra = arr<val<1>,LINEINST>{[&](u64 offset){
+            return fgehl[offset].drain_urgent();
+        }}.fold_or();
 #else
-        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{});
+        val<1> wb_force_extra = val<1>{0};
+#endif
+        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | sc_need_update | wb_force_extra;
+#else
+#ifdef SC_FGEHL
+        val<1> wb_force_extra = arr<val<1>,LINEINST>{[&](u64 offset){
+            return fgehl[offset].drain_urgent();
+        }}.fold_or();
+#else
+        val<1> wb_force_extra = val<1>{0};
+#endif
+        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | wb_force_extra;
 #endif
 
         extra_cycle.fanout(hard<NUMG*2+1>{});
@@ -1785,7 +1825,7 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
 
-#ifdef USE_META
+#ifdef USE_ALT
         // update meta counter
         arr<val<1>,LINEINST> altdiff = [&](u64 offset){
             // for each offset, tell if primary and secondary predictions differ
@@ -1805,17 +1845,12 @@ struct my_bp_v1 : predictor {
         meta[0] = select(newmeta>meta_t::maxval, meta_t{meta_t::maxval}, select(newmeta<meta_t::minval, meta_t{meta_t::minval}, meta_t{newmeta}));
 #endif
 
-        #ifdef HASH_TAG
-                for (u64 i=0; i<NUMG; i++) {
-                    execute_if(allocate[i], [&](){gtag[i].write(gindex[i],last_offset^htag[i]);});
-                }
-        #else
-                // overwrite the tag in the allocated entry (mispredict)
-                for (u64 i=0; i<NUMG; i++) {
-                    execute_if(allocate[i], [&](){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
-                }
 
-        #endif
+        // overwrite the tag in the allocated entry (mispredict)
+        for (u64 i=0; i<NUMG; i++) {
+            execute_if(allocate[i], [&](){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
+        }
+
 
         // update the u bits
         arr<val<1>,NUMG> update_u = [&](u64 i){
@@ -2018,20 +2053,20 @@ struct my_bp_v1 : predictor {
 #ifdef SC_USE_BIAS
             write_tage_info.fanout(hard<5>{});
             high_idx.fanout(hard<4>{});
+            val<1> wb_hit = val<1>{bias_wb_valid[offset]} &
+                            (val<LOGBIAS-LOGLINEINST-2>{bias_wb_idx[offset]} == high_idx);
+            wb_hit.fanout(hard<4>{});
+            arr<val<PERCWIDTH,i64>,4> old_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
+                val<PERCWIDTH,i64> wb_lane = val<PERCWIDTH,i64>{bias_wb_data[bank][offset]};
+                val<PERCWIDTH,i64> ram_lane = val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
+                return select(wb_hit, wb_lane, ram_lane);
+            }};
+            arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
+                val<PERCWIDTH,i64> old_lane = old_bias_vec[bank];
+                val<PERCWIDTH,i64> new_lane = update_ctr(old_lane, branch_taken[offset]);
+                return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
+            }};
             execute_if(sc_update_en, [&](){
-                val<1> wb_hit = val<1>{bias_wb_valid[offset]} &
-                                (val<LOGBIAS-LOGLINEINST-2>{bias_wb_idx[offset]} == high_idx);
-                wb_hit.fanout(hard<4>{});
-                arr<val<PERCWIDTH,i64>,4> old_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                    val<PERCWIDTH,i64> wb_lane = val<PERCWIDTH,i64>{bias_wb_data[bank][offset]};
-                    val<PERCWIDTH,i64> ram_lane = val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
-                    return select(wb_hit, wb_lane, ram_lane);
-                }};
-                arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                    val<PERCWIDTH,i64> old_lane = old_bias_vec[bank];
-                    val<PERCWIDTH,i64> new_lane = update_ctr(old_lane, branch_taken[offset]);
-                    return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
-                }};
                 bias_pc[offset].write(high_idx, new_bias_vec);
                 for (u64 bank = 0; bank < 4; bank++) {
                     bias_wb_data[bank][offset] = new_bias_vec[bank];
@@ -2046,8 +2081,9 @@ struct my_bp_v1 : predictor {
                 val<PERCWIDTH,i64> old_gehl = gehl_map[k][offset];
                 gehl_write_idx.fanout(hard<2>{});
                 old_gehl.fanout(hard<2>{});
+                val<PERCWIDTH,i64> new_gehl = update_ctr(old_gehl, branch_taken[offset]);
                 execute_if(sc_update_en, [&](){
-                    gehl[k][offset].write(gehl_write_idx, update_ctr(old_gehl, branch_taken[offset]));
+                    gehl[k][offset].write(gehl_write_idx, new_gehl);
                 });
             }
 #endif
@@ -2056,9 +2092,8 @@ struct my_bp_v1 : predictor {
             val<PERCWIDTH,i64> old_fgehl = fgehl_map[offset];
             fgehl_write_idx.fanout(hard<2>{});
             old_fgehl.fanout(hard<2>{});
-            execute_if(sc_update_en, [&](){
-                fgehl[offset].write(fgehl_write_idx, update_ctr(old_fgehl, branch_taken[offset]));
-            });
+            val<PERCWIDTH,i64> new_fgehl = update_ctr(old_fgehl, branch_taken[offset]);
+            fgehl[offset].write(fgehl_write_idx, val<PERCWIDTH>{new_fgehl}, sc_update_en, extra_cycle);
 #endif
             
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
