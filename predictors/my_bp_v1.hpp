@@ -540,35 +540,24 @@ struct my_bp_v1 : predictor {
 #ifdef SC_FGEHL
         {
             constexpr u64 WB_DEPTH = 4;
-            constexpr u64 WB_LIFE_BINS = wb_ram<PERCWIDTH,(1<<(LOGFGEHL-LOGLINEINST)),4,1>::WB_LIFETIME_BINS;
+            constexpr u64 WB_LIFE_BINS = wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4,1>::WB_LIFETIME_BINS;
             std::array<u64,WB_DEPTH+1> depth_hist = {};
             std::array<u64,WB_LIFE_BINS+1> life_hist = {};
-            u64 wb_wr_req = 0;
-            u64 wb_wr_hit_merge = 0;
-            u64 wb_wr_enq = 0;
-            u64 wb_wr_drop_full = 0;
-            u64 wb_drain_do = 0;
-            u64 wb_block_cycles = 0;
-            u64 wb_life_samples = 0;
-            u64 wb_life_sum = 0;
-            u64 wb_life_max = 0;
+            u64 wb_wr_req = fgehl.wb_wr_req();
+            u64 wb_wr_hit_merge = fgehl.wb_wr_hit_merge();
+            u64 wb_wr_enq = fgehl.wb_wr_enq();
+            u64 wb_wr_drop_full = fgehl.wb_wr_drop_full();
+            u64 wb_drain_do = fgehl.wb_drain_do();
+            u64 wb_block_cycles = fgehl.wb_block_cycles();
+            u64 wb_life_samples = fgehl.wb_lifetime_samples();
+            u64 wb_life_sum = fgehl.wb_lifetime_sum();
+            u64 wb_life_max = fgehl.wb_lifetime_max();
 
-            for (u64 offset = 0; offset < LINEINST; offset++) {
-                wb_wr_req += fgehl[offset].wb_wr_req();
-                wb_wr_hit_merge += fgehl[offset].wb_wr_hit_merge();
-                wb_wr_enq += fgehl[offset].wb_wr_enq();
-                wb_wr_drop_full += fgehl[offset].wb_wr_drop_full();
-                wb_drain_do += fgehl[offset].wb_drain_do();
-                wb_block_cycles += fgehl[offset].wb_block_cycles();
-                wb_life_samples += fgehl[offset].wb_lifetime_samples();
-                wb_life_sum += fgehl[offset].wb_lifetime_sum();
-                wb_life_max = std::max(wb_life_max, fgehl[offset].wb_lifetime_max());
-                for (u64 d = 0; d <= WB_DEPTH; d++) {
-                    depth_hist[d] += fgehl[offset].wb_block_depth(d);
-                }
-                for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
-                    life_hist[b] += fgehl[offset].wb_lifetime_bin(b);
-                }
+            for (u64 d = 0; d <= WB_DEPTH; d++) {
+                depth_hist[d] += fgehl.wb_block_depth(d);
+            }
+            for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
+                life_hist[b] += fgehl.wb_lifetime_bin(b);
             }
 
             std::cerr << "\n┌─ FGEHL WB Blocked-Write Distribution ───────────────────────────┐\n";
@@ -1101,7 +1090,7 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_FGEHL
     reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
-    wb_ram<PERCWIDTH,(1<<(LOGFGEHL-LOGLINEINST)),4,1> fgehl[LINEINST] {"FGEHL"};
+    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4,1> fgehl {"FGEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
     reg<FHIST_BITS> fhist;
 #endif
@@ -1416,11 +1405,9 @@ struct my_bp_v1 : predictor {
         val<LOGFGEHL-LOGLINEINST> fgehl_base_index = inst_pc >> LOGLB;
         val<FHIST_BITS> fh_mix = val<FHIST_BITS>{fhist} ^ (val<FHIST_BITS>{fhist} >> hard<13>{}) ^ (val<FHIST_BITS>{fhist} >> hard<29>{});
         val<LOGFGEHL-LOGLINEINST> fidx = fgehl_base_index ^ val<LOGFGEHL-LOGLINEINST>{fh_mix};
-        fidx.fanout(hard<LINEINST+1>{});
+        fidx.fanout(hard<2>{});
         fgehl_idx = fidx;
-        fgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            return val<PERCWIDTH,i64>{fgehl[offset].read(fidx)};
-        }};
+        fgehl_map = fgehl.read(fidx);
         fgehl_map.fanout(hard<2>{});
 #endif
 
@@ -1794,18 +1781,14 @@ struct my_bp_v1 : predictor {
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
         }}.fold_or();
 #ifdef SC_FGEHL
-        val<1> wb_force_extra = arr<val<1>,LINEINST>{[&](u64 offset){
-            return fgehl[offset].drain_urgent();
-        }}.fold_or();
+        val<1> wb_force_extra = fgehl.drain_urgent();
 #else
         val<1> wb_force_extra = val<1>{0};
 #endif
         val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | sc_need_update | wb_force_extra;
 #else
 #ifdef SC_FGEHL
-        val<1> wb_force_extra = arr<val<1>,LINEINST>{[&](u64 offset){
-            return fgehl[offset].drain_urgent();
-        }}.fold_or();
+        val<1> wb_force_extra = fgehl.drain_urgent();
 #else
         val<1> wb_force_extra = val<1>{0};
 #endif
@@ -2036,7 +2019,7 @@ struct my_bp_v1 : predictor {
         }
 #endif
 #ifdef SC_FGEHL
-        fgehl_idx.fanout(hard<LINEINST>{});
+        fgehl_idx.fanout(hard<2>{});
         fgehl_map.fanout(hard<LINEINST>{});
 #endif
         //per-offset updates: bias_pc and thre1 (no write conflicts)
@@ -2087,17 +2070,17 @@ struct my_bp_v1 : predictor {
                 });
             }
 #endif
-#ifdef SC_FGEHL
-            val<LOGFGEHL-LOGLINEINST> fgehl_write_idx = fgehl_idx;
-            val<PERCWIDTH,i64> old_fgehl = fgehl_map[offset];
-            fgehl_write_idx.fanout(hard<2>{});
-            old_fgehl.fanout(hard<2>{});
-            val<PERCWIDTH,i64> new_fgehl = update_ctr(old_fgehl, branch_taken[offset]);
-            fgehl[offset].write(fgehl_write_idx, val<PERCWIDTH>{new_fgehl}, sc_update_en, extra_cycle);
-#endif
-            
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
+#ifdef SC_FGEHL
+        arr<val<1>,LINEINST> fgehl_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
+        }};
+        val<LINEINST> fgehl_wmask = fgehl_update_arr.concat();
+        val<LINEINST> fgehl_taken_mask = branch_taken.concat();
+        val<1> fgehl_update_any = fgehl_wmask != val<LINEINST>{0};
+        fgehl.write(fgehl_idx, fgehl_map, fgehl_wmask, fgehl_taken_mask, fgehl_update_any, extra_cycle);
+#endif
 #endif
 
 #ifdef CHEATING_MODE
