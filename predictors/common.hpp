@@ -308,6 +308,230 @@ struct wb_ram {
     }
 };
 
+// write-buffered RAM wrapper with masked vector write.
+// Storage is one aggregated row (L lanes, each W bits) per address.
+// read path always goes directly to backend RAM (no WB lookup).
+// write path supports WAW merge on same address with lane mask merge.
+template<u64 W, u64 L, u64 M, u64 D = 4, u64 T = 1>
+struct wb_mask_ram {
+    static_assert(std::has_single_bit(M));
+    static constexpr u64 A = std::bit_width(M-1);
+    static_assert(D >= 2);
+    static_assert(std::has_single_bit(D));
+    static_assert(T >= 1 && T <= D);
+    static_assert(L >= 1 && L <= 64);
+    static constexpr u64 Q = std::bit_width(D-1);
+    static constexpr u64 QC = std::bit_width(D);
+
+    ram<arr<val<W,i64>,L>,M> mem;
+
+    arr<reg<1>,D> q_valid;
+    arr<reg<A>,D> q_addr;
+    arr<reg<L>,D> q_wmask;
+    arr<reg<W,i64>,D> q_data[L];
+    reg<Q> q_head;
+    reg<Q> q_tail;
+    reg<QC> q_count;
+    reg<4> q_head_wait;
+
+    reg<1> write_stall;
+
+#ifdef PERF_COUNTERS
+    static constexpr u64 WB_LIFETIME_BINS = 64;
+    u64 perf_wb_rd_req = 0;
+    u64 perf_wb_rd_pending_hit = 0;
+    u64 perf_wb_wr_req = 0;
+    u64 perf_wb_wr_hit_merge = 0;
+    u64 perf_wb_wr_enq = 0;
+    u64 perf_wb_wr_drop_full = 0;
+    u64 perf_wb_drain_req = 0;
+    u64 perf_wb_drain_do = 0;
+    u64 perf_wb_drain_block_wr = 0;
+    u64 perf_wb_depth_peak = 0;
+    u64 perf_wb_block_cycles = 0;
+    std::array<u64,D+1> perf_wb_block_depth = {};
+    u64 perf_wb_seq = 0;
+    std::array<u64,D> perf_wb_enq_seq = {};
+    u64 perf_wb_lifetime_samples = 0;
+    u64 perf_wb_lifetime_sum = 0;
+    u64 perf_wb_lifetime_max = 0;
+    std::array<u64,WB_LIFETIME_BINS+1> perf_wb_lifetime_hist = {};
+#endif
+
+    wb_mask_ram(const char *label="") : mem{label} {}
+
+    arr<val<W,i64>,L> read(val<A> addr)
+    {
+#ifdef PERF_COUNTERS
+        perf_wb_rd_req++;
+        bool pending_hit = false;
+        for (u64 i = 0; i < D; i++) {
+            bool v = static_cast<bool>(val<1>{q_valid[i]});
+            bool h = static_cast<bool>(val<A>{q_addr[i]} == addr);
+            pending_hit |= (v & h);
+        }
+        perf_wb_rd_pending_hit += static_cast<u64>(pending_hit);
+#endif
+        return mem.read(addr);
+    }
+
+    // noconflict=1 means no backend read conflict this cycle.
+    // wmask bit=1 means corresponding lane should be updated.
+    // taken_mask bit controls up/down direction for update_ctr on each masked lane.
+    void write(val<A> addr, arr<val<W,i64>,L> data, val<L> wmask, val<L> taken_mask, val<1> we, val<1> noconflict)
+    {
+#ifdef PERF_COUNTERS
+        u64 seq_now = perf_wb_seq++;
+#endif
+        val<1> wr_en = we.fo1() & (wmask != val<L>{0});
+        val<1> can_drain = noconflict.fo1();
+        val<1> reach_threshold = q_count >= val<QC>{T};
+        val<1> has_pending = q_count != val<QC>{0};
+        val<1> do_dequeue = has_pending & can_drain & reach_threshold;
+        val<1> wait_active = has_pending & ~do_dequeue;
+        val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
+        q_head_wait = select(wait_active, wait_inc, val<4>{0});
+
+        arr<val<1>,D> hit = arr<val<1>,D>{[&](u64 i){
+            return wr_en & val<1>{q_valid[i]} & (val<A>{q_addr[i]} == addr);
+        }};
+        val<D> hit_mask = hit.concat();
+        val<1> has_hit = hit_mask != val<D>{0};
+        val<D> hit_oh = hit_mask.one_hot();
+        arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
+        val<D> head_mask = val<Q>{q_head}.decode().concat();
+        val<1> hit_head = (hit_mask & head_mask) != val<D>{0};
+        arr<val<1>,L> wmask_bits = wmask.make_array(val<1>{});
+        arr<val<1>,L> taken_bits = taken_mask.make_array(val<1>{});
+
+        val<A> deq_addr = q_addr.select(q_head);
+        arr<val<W,i64>,L> deq_data_old = arr<val<W,i64>,L>{[&](u64 lane){
+            return q_data[lane].select(q_head);
+        }};
+        arr<val<W,i64>,L> deq_data = arr<val<W,i64>,L>{[&](u64 lane){
+            val<W,i64> deq_lane_new = update_ctr(deq_data_old[lane], taken_bits[lane]);
+            return select(hit_head & wmask_bits[lane], deq_lane_new, deq_data_old[lane]);
+        }};
+        arr<val<W,i64>,L> req_data_updated = arr<val<W,i64>,L>{[&](u64 lane){
+            val<W,i64> req_lane_new = update_ctr(data[lane], taken_bits[lane]);
+            return select(wmask_bits[lane], req_lane_new, data[lane]);
+        }};
+        execute_if(do_dequeue, [&](){
+            mem.write(deq_addr, deq_data);
+        });
+
+        val<1> stall_now = execute_if(wr_en | do_dequeue, [&](){
+            val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
+            val<1> full_after_deq = count_after_deq == val<QC>{D};
+            val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq;
+            val<1> stall_inner = wr_en & ~has_hit & full_after_deq;
+
+#ifdef PERF_COUNTERS
+            perf_wb_wr_req += static_cast<u64>(wr_en);
+            perf_wb_wr_hit_merge += static_cast<u64>(has_hit);
+            perf_wb_wr_enq += static_cast<u64>(do_enqueue);
+            perf_wb_wr_drop_full += static_cast<u64>(stall_inner);
+            perf_wb_drain_req += static_cast<u64>(has_pending & can_drain & reach_threshold);
+            perf_wb_drain_do += static_cast<u64>(do_dequeue);
+            perf_wb_drain_block_wr += static_cast<u64>(has_pending & (~can_drain | ~reach_threshold));
+            if (static_cast<u64>(stall_inner) != 0) {
+                u64 depth_now = static_cast<u64>(q_count);
+                depth_now = std::min(depth_now, D);
+                perf_wb_block_cycles++;
+                perf_wb_block_depth[depth_now]++;
+            }
+            if (static_cast<u64>(do_dequeue) != 0) {
+                u64 head_idx = std::min(static_cast<u64>(q_head), D-1);
+                u64 lifetime = seq_now - perf_wb_enq_seq[head_idx];
+                u64 bin = std::min(lifetime, WB_LIFETIME_BINS);
+                perf_wb_lifetime_samples++;
+                perf_wb_lifetime_sum += lifetime;
+                perf_wb_lifetime_max = std::max(perf_wb_lifetime_max, lifetime);
+                perf_wb_lifetime_hist[bin]++;
+            }
+            if (static_cast<u64>(do_enqueue) != 0) {
+                u64 tail_idx = std::min(static_cast<u64>(q_tail), D-1);
+                perf_wb_enq_seq[tail_idx] = seq_now;
+            }
+#endif
+
+            val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
+            val<Q> q_tail_next = select(do_enqueue, val<Q>{q_tail + val<Q>{1}}, val<Q>{q_tail});
+            val<QC> q_count_next = select(do_enqueue, val<QC>{count_after_deq + val<QC>{1}}, count_after_deq);
+
+#ifdef PERF_COUNTERS
+            u64 depth_now = static_cast<u64>(q_count_next);
+            perf_wb_depth_peak = std::max(perf_wb_depth_peak, depth_now);
+#endif
+
+            q_head = q_head_next;
+            q_tail = q_tail_next;
+            q_count = q_count_next;
+
+            for (u64 i = 0; i < D; i++) {
+                val<1> is_head = q_head == val<Q>{i};
+                val<1> is_tail = q_tail == val<Q>{i};
+                val<1> clear_slot = do_dequeue & is_head;
+                val<1> fill_slot = do_enqueue & is_tail;
+                val<1> merge_slot = hit_oh_split[i];
+
+                q_valid[i] = select(fill_slot, val<1>{1},
+                             select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
+                q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
+                q_wmask[i] = select(fill_slot, wmask,
+                             select(merge_slot, val<L>{q_wmask[i]} | wmask, val<L>{q_wmask[i]}));
+                for (u64 lane = 0; lane < L; lane++) {
+                    val<1> lane_merge = merge_slot & wmask_bits[lane];
+                    val<W,i64> merged_lane = update_ctr(val<W,i64>{q_data[lane][i]}, taken_bits[lane]);
+                    q_data[lane][i] = select(fill_slot, req_data_updated[lane],
+                                      select(lane_merge, merged_lane, val<W,i64>{q_data[lane][i]}));
+                }
+            }
+            return stall_inner;
+        });
+        write_stall = stall_now;
+    }
+
+    val<1> stalled() const
+    {
+        return write_stall;
+    }
+
+    val<1> full() const
+    {
+        return q_count == val<QC>{D};
+    }
+
+    val<1> drain_urgent()
+    {
+        return (q_count != val<QC>{0}) & (q_head_wait > hard<8>{});
+    }
+
+#ifdef PERF_COUNTERS
+    u64 wb_rd_req() const { return perf_wb_rd_req; }
+    u64 wb_rd_pending_hit() const { return perf_wb_rd_pending_hit; }
+    u64 wb_wr_req() const { return perf_wb_wr_req; }
+    u64 wb_wr_hit_merge() const { return perf_wb_wr_hit_merge; }
+    u64 wb_wr_enq() const { return perf_wb_wr_enq; }
+    u64 wb_wr_drop_full() const { return perf_wb_wr_drop_full; }
+    u64 wb_drain_req() const { return perf_wb_drain_req; }
+    u64 wb_drain_do() const { return perf_wb_drain_do; }
+    u64 wb_drain_block_wr() const { return perf_wb_drain_block_wr; }
+    u64 wb_depth_peak() const { return perf_wb_depth_peak; }
+    u64 wb_block_cycles() const { return perf_wb_block_cycles; }
+    u64 wb_block_depth(u64 d) const { return (d <= D) ? perf_wb_block_depth[d] : 0; }
+    u64 wb_lifetime_samples() const { return perf_wb_lifetime_samples; }
+    u64 wb_lifetime_sum() const { return perf_wb_lifetime_sum; }
+    u64 wb_lifetime_max() const { return perf_wb_lifetime_max; }
+    u64 wb_lifetime_bin(u64 b) const { return (b <= WB_LIFETIME_BINS) ? perf_wb_lifetime_hist[b] : 0; }
+#endif
+
+    void reset()
+    {
+        mem.reset();
+    }
+};
+
 
 // write-buffered RWRAM wrapper
 // read path always goes directly to backend RWRAM (no WB lookup).
