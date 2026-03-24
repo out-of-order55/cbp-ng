@@ -103,3 +103,35 @@ execute_if(was_used | do_alloc, [&](){
 2. 实际执行的编译命令与结果。
 3. 实际执行的运行命令与结果。
 4. 若为 feature：提供 before/after 与 `tage` 对比。
+
+## BHYST 聚合 WB RAM 经验沉淀（Must）
+
+1. 讨论“延迟是否变大”时，必须同时给出三种口径，缺一不可：
+   - `macro_latency_cycles`：SRAM 宏模型 `static_ram::LATENCY`。
+   - `intrinsic_latency_cycles`：地址预连接到目标 RAM 后的读延迟（尽量剥离线网影响）。
+   - `e2e_floorplan_latency_cycles`：含 floorplan/wire 的端到端读延迟。
+2. 将分散 SRAM 改成 `wb_ram` 后，必须避免“同周期后端 RAM 读+写”，否则会触发 `single RAM access per cycle`。
+3. `wb_ram` 使用规则：有读且要写时优先入队（`noconflict=0`），无读周期再 drain（`noconflict=1`），不要在同周期强制直写后端。
+4. `fo1()` 只能消费一次；同一信号被多个分支/统计复用时，先 `fanout` 再分别读取，避免 `misuse of fo1()`。
+5. 结构改造必须读写双侧一起改：改了读取组织（如按行聚合）后，更新路径也必须同步改为按行读改写，禁止只改读不改写。
+6. 提交前必须执行：
+   - `git add <目标文件>` 精确暂存；
+   - `git show --name-only -n 1` 复核提交内容；
+   - 若混入非目标文件（如 `AGENTS.md`/`doc`），必须在提交前清理。
+
+## table1_hyst SRAM 选型经验（Must）
+
+1. 对 `table1_hyst`（1-bit hyst，按行更新）优先选 `agg + wb_ram`，不优先 `agg_mask + wb_mask_ram`。
+2. 本项目实测（`LOGLB=6, LOGP1=14`）：
+   - `split`：`READ=217ps`，`WRITE_READY=33ps`，`WRITE_PURE=41ps`，`PWR=5.672665mW`
+   - `agg(wb_ram)`：`READ=166ps`，`WRITE_READY=177ps`，`WRITE_PURE=39ps`，`PWR=1.492450mW`
+   - `agg_mask(wb_mask_ram)`：`READ=170ps`，`WRITE_READY=226ps`，`WRITE_PURE=60ps`，`PWR=2.494258mW`
+3. 结论：
+   - `agg(wb_ram)` 相对 `split`：读更快（`-23.50%`），功耗显著下降（`-73.69%`）。
+   - `agg_mask(wb_mask_ram)` 相对 `agg(wb_ram)`：读略慢（`+2.41%`），写更慢（`WRITE_READY +27.68%`），功耗更高（`+67.13%`）。
+4. 写延迟解读必须拆分两项并同时报告：
+   - `WRITE_READY`：含读依赖（RMW 口径）
+   - `WRITE_PURE`：不含读依赖（纯写逻辑口径）
+5. 何时考虑 `wb_mask_ram`：
+   - 仅在“宽向量+稀疏 lane 更新+队列内高概率同址合并”场景下再评估；
+   - 若是 1-bit/低位宽覆盖式更新，`wb_mask_ram` 常为过度设计。
