@@ -1112,7 +1112,8 @@ struct my_bp_v1 : predictor {
     rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
     zone UPDATE_ONLY;
     ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
-    ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
+    wb_ram<LINEINST,(1<<bindex_bits),4,u64> bhyst {"bhyst"}; // bimodal hysteresis (packed by offset)
+    reg<LINEINST> bhyst_row; // cached bhyst row for current bindex
 
 // #endif
     my_bp_v1()
@@ -1643,6 +1644,14 @@ struct my_bp_v1 : predictor {
             return pred1[offset] != branch_taken[offset];
         };
         primary_wrong.fanout(hard<2>{});
+        arr<val<1>,LINEINST> bhyst_bim_primary = [&](u64 offset){ return actual_match1[offset] >> NUMG; };
+        arr<val<1>,LINEINST> bhyst_we_bits = [&](u64 offset){ return is_branch[offset] & bhyst_bim_primary[offset]; };
+        val<LINEINST> bhyst_we_mask = bhyst_we_bits.concat();
+        val<1> bhyst_we = bhyst_we_mask != val<LINEINST>{0};
+        bhyst_we.fanout(hard<2>{});
+        execute_if(bhyst_we, [&](){
+            bhyst_row = bhyst.read(bindex);
+        });
 
         // select some candidate entries for allocation
         val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
@@ -1719,17 +1728,15 @@ struct my_bp_v1 : predictor {
 
         //TODO:gate
         // read the bimodal hysteresis if bimodal caused a misprediction
+        arr<val<1>,LINEINST> bhyst_weak_bits = (~val<LINEINST>{bhyst_row}).make_array(val<1>{});
+        bhyst_weak_bits.fanout(hard<2>{});
+
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
             // returns 1 iff cause of misprediction and hysteresis is weak
-            val<1> bim_primary = actual_match1[offset] >> NUMG;
 #ifdef GATE
-            return execute_if(bim_primary.fo1() & primary_wrong[offset] & (~gating), [&](){
-                return ~bhyst[offset].read(bindex); // hyst=0 means weak
-            });
+            return bhyst_bim_primary[offset] & primary_wrong[offset] & (~gating) & bhyst_weak_bits[offset];
 #else
-            return execute_if(bim_primary.fo1() & primary_wrong[offset], [&](){
-                return ~bhyst[offset].read(bindex); // hyst=0 means weak
-            });
+            return bhyst_bim_primary[offset] & primary_wrong[offset] & bhyst_weak_bits[offset];
 #endif
         };
 
@@ -1892,13 +1899,13 @@ struct my_bp_v1 : predictor {
             });
         }
 
-        // update bimodal hysteresis if bimodal is primary provider
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            val<1> bim_primary = match1[offset] >> NUMG;
-            execute_if(is_branch[offset] & bim_primary.fo1(), [&](){
-                bhyst[offset].write(bindex,~primary_wrong[offset]);
-            });
-        }
+        // update bimodal hysteresis row if bimodal is primary provider
+        arr<val<1>,LINEINST> bhyst_old_bits = val<LINEINST>{bhyst_row}.make_array(val<1>{});
+        arr<val<1>,LINEINST> bhyst_new_bits = [&](u64 offset){
+            return select(bhyst_we_bits[offset], ~primary_wrong[offset], bhyst_old_bits[offset]);
+        };
+        val<LINEINST> bhyst_new_row = bhyst_new_bits.concat();
+        bhyst.write(bindex, bhyst_new_row, bhyst_we, ~bhyst_we);
 
         // update incorrect global prediction if primary provider and the hysteresis is weak;
         // initialize global prediction in the allocated entry
