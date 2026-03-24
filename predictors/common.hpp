@@ -104,7 +104,7 @@ struct rwram {
 // read path always goes directly to backend RAM (no WB lookup).
 // write path supports WAW merge (same-address write updates buffered entry).
 // one write request per cycle per instance.
-template<u64 N, u64 M, u64 D = 4>
+template<u64 N, u64 M, u64 D = 4, arith T = u64>
 struct wb_ram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
@@ -113,11 +113,11 @@ struct wb_ram {
     static constexpr u64 Q = std::bit_width(D-1);
     static constexpr u64 QC = std::bit_width(D);
 
-    ram<val<N>,M> mem;
+    ram<val<N,T>,M> mem;
 
     arr<reg<1>,D> q_valid;
     arr<reg<A>,D> q_addr;
-    arr<reg<N>,D> q_data;
+    arr<reg<N,T>,D> q_data;
     reg<Q> q_head;
     reg<Q> q_tail;
     reg<QC> q_count;
@@ -149,7 +149,7 @@ struct wb_ram {
 
     wb_ram(const char *label="") : mem{label} {}
 
-    val<N> read(val<A> addr)
+    val<N,T> read(val<A> addr)
     {
 #ifdef PERF_COUNTERS
         perf_wb_rd_req++;
@@ -166,7 +166,7 @@ struct wb_ram {
 
     // noconflict=1 means no backend read conflict this cycle.
     // drain is allowed whenever queue is non-empty and noconflict=1.
-    void write(val<A> addr, val<N> data, val<1> we, val<1> noconflict)
+    void write(val<A> addr, val<N,T> data, val<1> we, val<1> noconflict)
     {
 #ifdef PERF_COUNTERS
         u64 seq_now = perf_wb_seq++;
@@ -210,10 +210,10 @@ struct wb_ram {
 
         // independent RAM-drain stage
         val<A> deq_addr = q_addr.select(q_head);
-        val<N> deq_data_old = q_data.select(q_head);
-        val<N> deq_data = select(hit_head, data, deq_data_old);
+        val<N,T> deq_data_old = q_data.select(q_head);
+        val<N,T> deq_data = select(hit_head, data, deq_data_old);
         val<A> ram_write_addr = select(do_dequeue, deq_addr, addr);
-        val<N> ram_write_data = select(do_dequeue, deq_data, data);
+        val<N,T> ram_write_data = select(do_dequeue, deq_data, data);
         execute_if(do_dequeue | direct_write, [&](){
             mem.write(ram_write_addr, ram_write_data);
         });
@@ -276,7 +276,7 @@ struct wb_ram {
                 q_valid[i] = select(fill_slot, val<1>{1},
                              select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
                 q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
-                q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N>{q_data[i]});
+                q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N,T>{q_data[i]});
             }
 
             q_head = q_head_next;
@@ -332,7 +332,7 @@ struct wb_ram {
 // Storage is one aggregated row (L lanes, each W bits) per address.
 // read path always goes directly to backend RAM (no WB lookup).
 // write path supports WAW merge on same address with lane mask merge.
-template<u64 W, u64 L, u64 M, u64 D = 4>
+template<u64 W, u64 L, u64 M, u64 D = 4, arith T = i64>
 struct wb_mask_ram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
@@ -342,12 +342,12 @@ struct wb_mask_ram {
     static constexpr u64 Q = std::bit_width(D-1);
     static constexpr u64 QC = std::bit_width(D);
 
-    ram<arr<val<W,i64>,L>,M> mem;
+    ram<arr<val<W,T>,L>,M> mem;
 
     arr<reg<1>,D> q_valid;
     arr<reg<A>,D> q_addr;
     arr<reg<L>,D> q_wmask;
-    arr<reg<W,i64>,D> q_data[L];
+    arr<reg<W,T>,D> q_data[L];
     reg<Q> q_head;
     reg<Q> q_tail;
     reg<QC> q_count;
@@ -379,7 +379,7 @@ struct wb_mask_ram {
 
     wb_mask_ram(const char *label="") : mem{label} {}
 
-    arr<val<W,i64>,L> read(val<A> addr)
+    arr<val<W,T>,L> read(val<A> addr)
     {
 #ifdef PERF_COUNTERS
         perf_wb_rd_req++;
@@ -397,7 +397,7 @@ struct wb_mask_ram {
     // noconflict=1 means no backend read conflict this cycle.
     // wmask bit=1 means corresponding lane should be updated.
     // taken_mask bit controls up/down direction for update_ctr on each masked lane.
-    void write(val<A> addr, arr<val<W,i64>,L> data, val<L> wmask, val<L> taken_mask, val<1> we, val<1> noconflict)
+    void write(val<A> addr, arr<val<W,T>,L> data, val<L> wmask, val<L> taken_mask, val<1> we, val<1> noconflict)
     {
 #ifdef PERF_COUNTERS
         u64 seq_now = perf_wb_seq++;
@@ -445,19 +445,19 @@ struct wb_mask_ram {
         taken_bits.fanout(hard<D+3>{});
 
         val<A> deq_addr = q_addr.select(q_head);
-        arr<val<W,i64>,L> deq_data_old = arr<val<W,i64>,L>{[&](u64 lane){
+        arr<val<W,T>,L> deq_data_old = arr<val<W,T>,L>{[&](u64 lane){
             return q_data[lane].select(q_head);
         }};
-        arr<val<W,i64>,L> deq_data = arr<val<W,i64>,L>{[&](u64 lane){
-            val<W,i64> deq_lane_new = update_ctr(deq_data_old[lane], taken_bits[lane]);
+        arr<val<W,T>,L> deq_data = arr<val<W,T>,L>{[&](u64 lane){
+            val<W,T> deq_lane_new = update_ctr(deq_data_old[lane], taken_bits[lane]);
             return select(hit_head & wmask_bits[lane], deq_lane_new, deq_data_old[lane]);
         }};
-        arr<val<W,i64>,L> req_data_updated = arr<val<W,i64>,L>{[&](u64 lane){
-            val<W,i64> req_lane_new = update_ctr(data[lane], taken_bits[lane]);
+        arr<val<W,T>,L> req_data_updated = arr<val<W,T>,L>{[&](u64 lane){
+            val<W,T> req_lane_new = update_ctr(data[lane], taken_bits[lane]);
             return select(wmask_bits[lane], req_lane_new, data[lane]);
         }};
         val<A> ram_write_addr = select(do_dequeue, deq_addr, addr);
-        arr<val<W,i64>,L> ram_write_data = arr<val<W,i64>,L>{[&](u64 lane){
+        arr<val<W,T>,L> ram_write_data = arr<val<W,T>,L>{[&](u64 lane){
             return select(do_dequeue, deq_data[lane], req_data_updated[lane]);
         }};
         execute_if(do_dequeue | direct_write, [&](){
@@ -525,9 +525,9 @@ struct wb_mask_ram {
                              select(merge_slot, val<L>{q_wmask[i]} | wmask, val<L>{q_wmask[i]}));
                 for (u64 lane = 0; lane < L; lane++) {
                     val<1> lane_merge = merge_slot & wmask_bits[lane];
-                    val<W,i64> merged_lane = update_ctr(val<W,i64>{q_data[lane][i]}, taken_bits[lane]);
+                    val<W,T> merged_lane = update_ctr(val<W,T>{q_data[lane][i]}, taken_bits[lane]);
                     q_data[lane][i] = select(fill_slot, req_data_updated[lane],
-                                      select(lane_merge, merged_lane, val<W,i64>{q_data[lane][i]}));
+                                      select(lane_merge, merged_lane, val<W,T>{q_data[lane][i]}));
                 }
             }
 
@@ -584,7 +584,7 @@ struct wb_mask_ram {
 // read path always goes directly to backend RWRAM (no WB lookup).
 // write path supports WAW merge (same-address write updates buffered entry).
 // one write request per cycle per instance.
-template<u64 N, u64 M, u64 B, u64 D = 4>
+template<u64 N, u64 M, u64 B, u64 D = 4, arith T = u64>
 struct wb_rwram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
@@ -597,7 +597,7 @@ struct wb_rwram {
 
     arr<reg<1>,D> q_valid;
     arr<reg<A>,D> q_addr;
-    arr<reg<N>,D> q_data;
+    arr<reg<N,T>,D> q_data;
     reg<Q> q_head;
     reg<Q> q_tail;
     reg<QC> q_count;
@@ -619,7 +619,7 @@ struct wb_rwram {
 
     wb_rwram(const char *label="") : mem{label} {}
 
-    val<N> read(val<A> addr)
+    val<N,T> read(val<A> addr)
     {
 #ifdef PERF_COUNTERS
         perf_wb_rd_req++;
@@ -631,12 +631,12 @@ struct wb_rwram {
         }
         perf_wb_rd_pending_hit += static_cast<u64>(pending_hit);
 #endif
-        return mem.read(addr);
+        return val<N,T>{mem.read(addr)};
     }
 
     // noconflict is passed to backend rwram write when dequeuing.
     // drain is allowed whenever queue is non-empty and noconflict=1.
-    void write(val<A> addr, val<N> data, val<1> we, val<1> noconflict)
+    void write(val<A> addr, val<N,T> data, val<1> we, val<1> noconflict)
     {
         addr.fanout(hard<2*D+2>{});
         data.fanout(hard<D+3>{});
@@ -670,12 +670,12 @@ struct wb_rwram {
         val<1> hit_head = (hit_mask & head_mask) != val<D>{0};
 
         val<A> deq_addr = q_addr.select(q_head);
-        val<N> deq_data_old = q_data.select(q_head);
-        val<N> deq_data = select(hit_head, data, deq_data_old);
+        val<N,T> deq_data_old = q_data.select(q_head);
+        val<N,T> deq_data = select(hit_head, data, deq_data_old);
         val<A> ram_write_addr = select(do_dequeue, deq_addr, addr);
-        val<N> ram_write_data = select(do_dequeue, deq_data, data);
+        val<N,T> ram_write_data = select(do_dequeue, deq_data, data);
         execute_if(do_dequeue | direct_write, [&](){
-            mem.write(ram_write_addr, ram_write_data, can_drain);
+            mem.write(ram_write_addr, val<N>{ram_write_data}, can_drain);
         });
 
         val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
@@ -713,7 +713,7 @@ struct wb_rwram {
             q_valid[i] = select(fill_slot, val<1>{1},
                          select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
             q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
-            q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N>{q_data[i]});
+            q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N,T>{q_data[i]});
         }
 
         q_head = q_head_next;
