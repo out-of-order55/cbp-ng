@@ -104,13 +104,12 @@ struct rwram {
 // read path always goes directly to backend RAM (no WB lookup).
 // write path supports WAW merge (same-address write updates buffered entry).
 // one write request per cycle per instance.
-template<u64 N, u64 M, u64 D = 4, u64 T = 1>
+template<u64 N, u64 M, u64 D = 4>
 struct wb_ram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
     static_assert(D >= 2);
     static_assert(std::has_single_bit(D));
-    static_assert(T >= 1 && T <= D);
     static constexpr u64 Q = std::bit_width(D-1);
     static constexpr u64 QC = std::bit_width(D);
 
@@ -172,12 +171,26 @@ struct wb_ram {
 #ifdef PERF_COUNTERS
         u64 seq_now = perf_wb_seq++;
 #endif
+        addr.fanout(hard<2*D+2>{});
+        data.fanout(hard<D+3>{});
         val<1> wr_en = we.fo1();
+        wr_en.fanout(hard<D+8>{});
+        q_head.fanout(hard<5+D>{});
+        q_tail.fanout(hard<2+D>{});
+        q_count.fanout(hard<3>{});
+        q_valid.fanout(hard<2>{});
+        q_addr.fanout(hard<3>{});
+        q_data.fanout(hard<2>{});
         val<1> can_drain = noconflict.fo1();
-        val<1> reach_threshold = q_count >= val<QC>{T};
+        can_drain.fanout(hard<8>{});
         val<1> has_pending = q_count != val<QC>{0};
-        val<1> do_dequeue = has_pending & can_drain & reach_threshold;
+        has_pending.fanout(hard<8>{});
+        val<1> do_dequeue = has_pending & can_drain;
+        do_dequeue.fanout(hard<D+12>{});
+        val<1> direct_write = wr_en & ~has_pending & can_drain;
+        direct_write.fanout(hard<4>{});
         val<1> wait_active = has_pending & ~do_dequeue;
+        q_head_wait.fanout(hard<4>{});
         val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
         q_head_wait = select(wait_active, wait_inc, val<4>{0});
 
@@ -189,6 +202,7 @@ struct wb_ram {
             return hit.concat();
         });
         val<1> has_hit = hit_mask != val<D>{0};
+        has_hit.fanout(hard<6>{});
         val<D> hit_oh = hit_mask.one_hot();
         arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
         val<D> head_mask = val<Q>{q_head}.decode().concat();
@@ -198,15 +212,20 @@ struct wb_ram {
         val<A> deq_addr = q_addr.select(q_head);
         val<N> deq_data_old = q_data.select(q_head);
         val<N> deq_data = select(hit_head, data, deq_data_old);
-        execute_if(do_dequeue, [&](){
-            mem.write(deq_addr, deq_data);
+        val<A> ram_write_addr = select(do_dequeue, deq_addr, addr);
+        val<N> ram_write_data = select(do_dequeue, deq_data, data);
+        execute_if(do_dequeue | direct_write, [&](){
+            mem.write(ram_write_addr, ram_write_data);
         });
 
         // queue update stage
         val<1> stall_now = execute_if(wr_en | do_dequeue, [&](){
             val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
+            count_after_deq.fanout(hard<3>{});
             val<1> full_after_deq = count_after_deq == val<QC>{D};
-            val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq;
+            count_after_deq.fanout(hard<2>{});
+            val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq & ~direct_write;
+            do_enqueue.fanout(hard<D+8>{});
             val<1> stall_inner = wr_en & ~has_hit & full_after_deq;
 
 #ifdef PERF_COUNTERS
@@ -214,9 +233,9 @@ struct wb_ram {
             perf_wb_wr_hit_merge += static_cast<u64>(has_hit);
             perf_wb_wr_enq += static_cast<u64>(do_enqueue);
             perf_wb_wr_drop_full += static_cast<u64>(stall_inner);
-            perf_wb_drain_req += static_cast<u64>(has_pending & can_drain & reach_threshold);
+            perf_wb_drain_req += static_cast<u64>(has_pending & can_drain);
             perf_wb_drain_do += static_cast<u64>(do_dequeue);
-            perf_wb_drain_block_wr += static_cast<u64>(has_pending & (~can_drain | ~reach_threshold));
+            perf_wb_drain_block_wr += static_cast<u64>(has_pending & ~can_drain);
             if (static_cast<u64>(stall_inner) != 0) {
                 u64 depth_now = static_cast<u64>(q_count);
                 depth_now = std::min(depth_now, D);
@@ -247,21 +266,22 @@ struct wb_ram {
             perf_wb_depth_peak = std::max(perf_wb_depth_peak, depth_now);
 #endif
 
-            q_head = q_head_next;
-            q_tail = q_tail_next;
-            q_count = q_count_next;
-
             for (u64 i = 0; i < D; i++) {
                 val<1> is_head = q_head == val<Q>{i};
                 val<1> is_tail = q_tail == val<Q>{i};
                 val<1> clear_slot = do_dequeue & is_head;
                 val<1> fill_slot = do_enqueue & is_tail;
+                fill_slot.fanout(hard<3>{});
 
                 q_valid[i] = select(fill_slot, val<1>{1},
                              select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
                 q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
                 q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N>{q_data[i]});
             }
+
+            q_head = q_head_next;
+            q_tail = q_tail_next;
+            q_count = q_count_next;
             return stall_inner;
         });
         write_stall = stall_now;
@@ -312,13 +332,12 @@ struct wb_ram {
 // Storage is one aggregated row (L lanes, each W bits) per address.
 // read path always goes directly to backend RAM (no WB lookup).
 // write path supports WAW merge on same address with lane mask merge.
-template<u64 W, u64 L, u64 M, u64 D = 4, u64 T = 1>
+template<u64 W, u64 L, u64 M, u64 D = 4>
 struct wb_mask_ram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
     static_assert(D >= 2);
     static_assert(std::has_single_bit(D));
-    static_assert(T >= 1 && T <= D);
     static_assert(L >= 1 && L <= 64);
     static constexpr u64 Q = std::bit_width(D-1);
     static constexpr u64 QC = std::bit_width(D);
@@ -383,12 +402,30 @@ struct wb_mask_ram {
 #ifdef PERF_COUNTERS
         u64 seq_now = perf_wb_seq++;
 #endif
+        addr.fanout(hard<2*D+2>{});
+        data.fanout(hard<L+3>{});
+        wmask.fanout(hard<D+4>{});
         val<1> wr_en = we.fo1() & (wmask != val<L>{0});
+        wr_en.fanout(hard<D+8>{});
+        q_head.fanout(hard<5+D>{});
+        q_tail.fanout(hard<2+D>{});
+        q_count.fanout(hard<3>{});
+        q_valid.fanout(hard<2>{});
+        q_addr.fanout(hard<3>{});
+        q_wmask.fanout(hard<2>{});
+        for (u64 lane = 0; lane < L; lane++) {
+            q_data[lane].fanout(hard<2>{});
+        }
         val<1> can_drain = noconflict.fo1();
-        val<1> reach_threshold = q_count >= val<QC>{T};
+        can_drain.fanout(hard<8>{});
         val<1> has_pending = q_count != val<QC>{0};
-        val<1> do_dequeue = has_pending & can_drain & reach_threshold;
+        has_pending.fanout(hard<8>{});
+        val<1> do_dequeue = has_pending & can_drain;
+        do_dequeue.fanout(hard<L+D+12>{});
+        val<1> direct_write = wr_en & ~has_pending & can_drain;
+        direct_write.fanout(hard<4>{});
         val<1> wait_active = has_pending & ~do_dequeue;
+        q_head_wait.fanout(hard<4>{});
         val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
         q_head_wait = select(wait_active, wait_inc, val<4>{0});
 
@@ -397,12 +434,15 @@ struct wb_mask_ram {
         }};
         val<D> hit_mask = hit.concat();
         val<1> has_hit = hit_mask != val<D>{0};
+        has_hit.fanout(hard<6>{});
         val<D> hit_oh = hit_mask.one_hot();
         arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
         val<D> head_mask = val<Q>{q_head}.decode().concat();
         val<1> hit_head = (hit_mask & head_mask) != val<D>{0};
         arr<val<1>,L> wmask_bits = wmask.make_array(val<1>{});
         arr<val<1>,L> taken_bits = taken_mask.make_array(val<1>{});
+        wmask_bits.fanout(hard<D+3>{});
+        taken_bits.fanout(hard<D+3>{});
 
         val<A> deq_addr = q_addr.select(q_head);
         arr<val<W,i64>,L> deq_data_old = arr<val<W,i64>,L>{[&](u64 lane){
@@ -416,14 +456,19 @@ struct wb_mask_ram {
             val<W,i64> req_lane_new = update_ctr(data[lane], taken_bits[lane]);
             return select(wmask_bits[lane], req_lane_new, data[lane]);
         }};
-        execute_if(do_dequeue, [&](){
-            mem.write(deq_addr, deq_data);
+        val<A> ram_write_addr = select(do_dequeue, deq_addr, addr);
+        arr<val<W,i64>,L> ram_write_data = arr<val<W,i64>,L>{[&](u64 lane){
+            return select(do_dequeue, deq_data[lane], req_data_updated[lane]);
+        }};
+        execute_if(do_dequeue | direct_write, [&](){
+            mem.write(ram_write_addr, ram_write_data);
         });
 
         val<1> stall_now = execute_if(wr_en | do_dequeue, [&](){
             val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
             val<1> full_after_deq = count_after_deq == val<QC>{D};
-            val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq;
+            val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq & ~direct_write;
+            do_enqueue.fanout(hard<D+8>{});
             val<1> stall_inner = wr_en & ~has_hit & full_after_deq;
 
 #ifdef PERF_COUNTERS
@@ -431,9 +476,9 @@ struct wb_mask_ram {
             perf_wb_wr_hit_merge += static_cast<u64>(has_hit);
             perf_wb_wr_enq += static_cast<u64>(do_enqueue);
             perf_wb_wr_drop_full += static_cast<u64>(stall_inner);
-            perf_wb_drain_req += static_cast<u64>(has_pending & can_drain & reach_threshold);
+            perf_wb_drain_req += static_cast<u64>(has_pending & can_drain);
             perf_wb_drain_do += static_cast<u64>(do_dequeue);
-            perf_wb_drain_block_wr += static_cast<u64>(has_pending & (~can_drain | ~reach_threshold));
+            perf_wb_drain_block_wr += static_cast<u64>(has_pending & ~can_drain);
             if (static_cast<u64>(stall_inner) != 0) {
                 u64 depth_now = static_cast<u64>(q_count);
                 depth_now = std::min(depth_now, D);
@@ -464,16 +509,14 @@ struct wb_mask_ram {
             perf_wb_depth_peak = std::max(perf_wb_depth_peak, depth_now);
 #endif
 
-            q_head = q_head_next;
-            q_tail = q_tail_next;
-            q_count = q_count_next;
-
             for (u64 i = 0; i < D; i++) {
                 val<1> is_head = q_head == val<Q>{i};
                 val<1> is_tail = q_tail == val<Q>{i};
                 val<1> clear_slot = do_dequeue & is_head;
                 val<1> fill_slot = do_enqueue & is_tail;
+                fill_slot.fanout(hard<L+4>{});
                 val<1> merge_slot = hit_oh_split[i];
+                merge_slot.fanout(hard<L+2>{});
 
                 q_valid[i] = select(fill_slot, val<1>{1},
                              select(clear_slot, val<1>{0}, val<1>{q_valid[i]}));
@@ -487,6 +530,10 @@ struct wb_mask_ram {
                                       select(lane_merge, merged_lane, val<W,i64>{q_data[lane][i]}));
                 }
             }
+
+            q_head = q_head_next;
+            q_tail = q_tail_next;
+            q_count = q_count_next;
             return stall_inner;
         });
         write_stall = stall_now;
@@ -537,13 +584,12 @@ struct wb_mask_ram {
 // read path always goes directly to backend RWRAM (no WB lookup).
 // write path supports WAW merge (same-address write updates buffered entry).
 // one write request per cycle per instance.
-template<u64 N, u64 M, u64 B, u64 D = 4, u64 T = 1>
+template<u64 N, u64 M, u64 B, u64 D = 4>
 struct wb_rwram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
     static_assert(D >= 2);
     static_assert(std::has_single_bit(D));
-    static_assert(T >= 1 && T <= D);
     static constexpr u64 Q = std::bit_width(D-1);
     static constexpr u64 QC = std::bit_width(D);
 
@@ -592,33 +638,50 @@ struct wb_rwram {
     // drain is allowed whenever queue is non-empty and noconflict=1.
     void write(val<A> addr, val<N> data, val<1> we, val<1> noconflict)
     {
+        addr.fanout(hard<2*D+2>{});
+        data.fanout(hard<D+3>{});
         val<1> wr_en = we.fo1();
+        wr_en.fanout(hard<D+8>{});
+        q_head.fanout(hard<5+D>{});
+        q_tail.fanout(hard<2+D>{});
+        q_count.fanout(hard<3>{});
+        q_valid.fanout(hard<2>{});
+        q_addr.fanout(hard<3>{});
+        q_data.fanout(hard<2>{});
         val<1> can_drain = noconflict.fo1();
+        can_drain.fanout(hard<8>{});
 
         val<1> has_pending = q_count != val<QC>{0};
+        has_pending.fanout(hard<8>{});
+        val<1> do_dequeue = has_pending & can_drain;
+        do_dequeue.fanout(hard<D+10>{});
+        val<1> direct_write = wr_en & ~has_pending & can_drain;
+        direct_write.fanout(hard<4>{});
 
         arr<val<1>,D> hit = arr<val<1>,D>{[&](u64 i){
             return wr_en & val<1>{q_valid[i]} & (val<A>{q_addr[i]} == addr);
         }};
         val<D> hit_mask = hit.concat();
         val<1> has_hit = hit_mask != val<D>{0};
+        has_hit.fanout(hard<6>{});
         val<D> hit_oh = hit_mask.one_hot();
         arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
         val<D> head_mask = val<Q>{q_head}.decode().concat();
         val<1> hit_head = (hit_mask & head_mask) != val<D>{0};
 
-        val<1> reach_threshold = q_count >= val<QC>{T};
-        val<1> do_dequeue = has_pending & can_drain & reach_threshold;
         val<A> deq_addr = q_addr.select(q_head);
         val<N> deq_data_old = q_data.select(q_head);
         val<N> deq_data = select(hit_head, data, deq_data_old);
-        execute_if(do_dequeue, [&](){
-            mem.write(deq_addr, deq_data, noconflict);
+        val<A> ram_write_addr = select(do_dequeue, deq_addr, addr);
+        val<N> ram_write_data = select(do_dequeue, deq_data, data);
+        execute_if(do_dequeue | direct_write, [&](){
+            mem.write(ram_write_addr, ram_write_data, can_drain);
         });
 
         val<QC> count_after_deq = select(do_dequeue, val<QC>{q_count - val<QC>{1}}, val<QC>{q_count});
         val<1> full_after_deq = count_after_deq == val<QC>{D};
-        val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq;
+        val<1> do_enqueue = wr_en & ~has_hit & ~full_after_deq & ~direct_write;
+        do_enqueue.fanout(hard<D+8>{});
         val<1> stall_now = wr_en & ~has_hit & full_after_deq;
         write_stall = stall_now;
 
@@ -627,9 +690,9 @@ struct wb_rwram {
         perf_wb_wr_hit_merge += static_cast<u64>(has_hit);
         perf_wb_wr_enq += static_cast<u64>(do_enqueue);
         perf_wb_wr_drop_full += static_cast<u64>(stall_now);
-        perf_wb_drain_req += static_cast<u64>(has_pending & can_drain & reach_threshold);
+        perf_wb_drain_req += static_cast<u64>(has_pending & can_drain);
         perf_wb_drain_do += static_cast<u64>(do_dequeue);
-        perf_wb_drain_block_wr += static_cast<u64>(has_pending & (~can_drain | ~reach_threshold));
+        perf_wb_drain_block_wr += static_cast<u64>(has_pending & ~can_drain);
 #endif
 
         val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
@@ -640,10 +703,6 @@ struct wb_rwram {
         u64 depth_now = static_cast<u64>(q_count_next);
         perf_wb_depth_peak = std::max(perf_wb_depth_peak, depth_now);
 #endif
-
-        q_head = q_head_next;
-        q_tail = q_tail_next;
-        q_count = q_count_next;
 
         for (u64 i = 0; i < D; i++) {
             val<1> is_head = q_head == val<Q>{i};
@@ -656,6 +715,10 @@ struct wb_rwram {
             q_addr[i] = select(fill_slot, addr, val<A>{q_addr[i]});
             q_data[i] = select(hit_oh_split[i] | fill_slot, data, val<N>{q_data[i]});
         }
+
+        q_head = q_head_next;
+        q_tail = q_tail_next;
+        q_count = q_count_next;
     }
 
     val<1> stalled() const

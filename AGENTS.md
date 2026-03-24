@@ -94,6 +94,7 @@ execute_if(was_used | do_alloc, [&](){
 4. 不允许 `arr<arr<...>>` 嵌套。
 5. 默认不改已有函数的外部行为与签名；若必须修改，需在计划中说明影响与理由。
 6. 生成文件不得写入 `/tmp`，只能放在工作目录及子目录。
+7. 测试unit文件放入test文件夹，测试完成后删除可执行文件
 
 ## 交付清单（Must）
 
@@ -101,3 +102,37 @@ execute_if(was_used | do_alloc, [&](){
 2. 实际执行的编译命令与结果。
 3. 实际执行的运行命令与结果。
 4. 若为 feature：提供 before/after 与 `tage` 对比。
+
+## WB 可见周期统计规范（Must）
+
+1. 讨论“几周期后可见”时，必须明确并同时报告两种口径：
+   - `probe_latency_cycles`：从读探测开始到首次命中的周期数。
+   - `e2e_latency_cycles`：从写请求锚点周期到首次命中的端到端周期数。
+2. 若只报告一种口径，结论无效。
+3. 若使用随机延迟抖动，必须固定随机种子并记录在报告中。
+4. 随机延迟实验至少覆盖：
+   - 地址延迟 `0~4`
+   - 数据延迟 `0~4`
+   - 连续 fill (`noconflict=0`) + 连续 drain (`noconflict=1`)
+5. 当回答“最大延迟”时，不允许引用单次运行；必须多种子统计并报告：
+   - `max`
+   - `p99`
+   - `mean`
+   - 样本数 `N`
+6. 默认推荐最小统计规模：`N >= 256`（可由多 seed * 多请求组成）。
+7. 报告字段至少包含：
+   - RAM 类型（`wb_ram/wb_mask_ram/wb_rwram`）
+   - 测试模式（direct/buffered/continuous/jitter）
+   - 种子
+   - `probe_latency_cycles` 与 `e2e_latency_cycles`
+   - 是否出现 stall/drop/full
+8. 若 `probe_latency` 与 `e2e_latency` 差异过大，优先排查：
+   - 探测起点定义是否一致
+   - drain 启动时机
+   - 读探测是否违反 `single RAM read per cycle`
+
+## WB 测试输出规范（Should）
+
+1. 每条关键写请求建议打印：`idx / addr / data / write_anchor / first_visible / probe_latency / e2e_latency`。
+2. 输出中建议附加 `queue_depth` 峰值与 drain 完成周期，便于快速定位瓶颈。
+3. 回归对比时，优先比较同一 seed、同一请求序列，避免随机差异误导结论。

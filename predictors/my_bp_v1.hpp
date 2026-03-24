@@ -539,42 +539,15 @@ struct my_bp_v1 : predictor {
 
 #ifdef SC_FGEHL
         {
-            constexpr u64 WB_DEPTH = 4;
-            constexpr u64 WB_LIFE_BINS = wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4,1>::WB_LIFETIME_BINS;
-            std::array<u64,WB_DEPTH+1> depth_hist = {};
+            constexpr u64 WB_LIFE_BINS = wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4>::WB_LIFETIME_BINS;
             std::array<u64,WB_LIFE_BINS+1> life_hist = {};
-            u64 wb_wr_req = fgehl.wb_wr_req();
-            u64 wb_wr_hit_merge = fgehl.wb_wr_hit_merge();
-            u64 wb_wr_enq = fgehl.wb_wr_enq();
-            u64 wb_wr_drop_full = fgehl.wb_wr_drop_full();
-            u64 wb_drain_do = fgehl.wb_drain_do();
-            u64 wb_block_cycles = fgehl.wb_block_cycles();
             u64 wb_life_samples = fgehl.wb_lifetime_samples();
             u64 wb_life_sum = fgehl.wb_lifetime_sum();
             u64 wb_life_max = fgehl.wb_lifetime_max();
 
-            for (u64 d = 0; d <= WB_DEPTH; d++) {
-                depth_hist[d] += fgehl.wb_block_depth(d);
-            }
             for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
                 life_hist[b] += fgehl.wb_lifetime_bin(b);
             }
-
-            std::cerr << "\n┌─ FGEHL WB Blocked-Write Distribution ───────────────────────────┐\n";
-            std::cerr << "│ wr_req/hit_merge/enq/drop: " << std::setw(34) << std::left
-                      << (std::to_string(wb_wr_req) + " / " + std::to_string(wb_wr_hit_merge) + " / "
-                          + std::to_string(wb_wr_enq) + " / " + std::to_string(wb_wr_drop_full)) << "│\n";
-            std::cerr << "│ drain_do:                " << std::setw(36) << std::left << wb_drain_do << "│\n";
-            std::cerr << "│ blocked cycles (total):  " << std::setw(36) << std::left << wb_block_cycles << "│\n";
-            for (u64 d = 0; d <= WB_DEPTH; d++) {
-                std::string line = "depth " + std::to_string(d) + ": " + std::to_string(depth_hist[d]);
-                if (wb_block_cycles > 0) {
-                    double pct = 100.0 * static_cast<double>(depth_hist[d]) / static_cast<double>(wb_block_cycles);
-                    line += " (" + (std::to_string(pct)).substr(0,5) + "%)";
-                }
-                std::cerr << "│   " << std::setw(53) << std::left << line << "│\n";
-            }
-            std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
             std::cerr << "\n┌─ FGEHL WB Request Lifetime (enqueue->RAM write) ───────────────┐\n";
             std::cerr << "│ samples:                 " << std::setw(36) << std::left << wb_life_samples << "│\n";
@@ -1090,7 +1063,7 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_FGEHL
     reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
-    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4,1> fgehl {"FGEHL"};
+    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4> fgehl {"FGEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
     reg<FHIST_BITS> fhist;
 #endif
