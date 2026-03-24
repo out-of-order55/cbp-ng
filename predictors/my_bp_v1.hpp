@@ -1069,11 +1069,8 @@ struct my_bp_v1 : predictor {
     //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
     arr<reg<TOTAL_THREBITS>,LINEINST> threshold;
 #ifdef SC_USE_BIAS
-    ram<arr<val<PERCWIDTH,i64>,4>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[LINEINST] {"Bias pc"};
+    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGBIAS-LOGLINEINST-2)),4> bias_pc[4] {"Bias pc"};
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_bank_map[4];
-    arr<reg<1>,LINEINST> bias_wb_valid;
-    arr<reg<LOGBIAS-LOGLINEINST-2>,LINEINST> bias_wb_idx;
-    arr<reg<PERCWIDTH,i64>,LINEINST> bias_wb_data[4];
     arr<reg<PERCWIDTH,i64>,4> bias_lmap;
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_map;
     arr<reg<2>,LINEINST> tage_info;
@@ -1366,19 +1363,21 @@ struct my_bp_v1 : predictor {
         // bias
 #ifdef SC_USE_BIAS
         val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB+2);
-        bias_pc_high_index.fanout(hard<(LINEINST+1)>{});
+        bias_pc_high_index.fanout(hard<5>{});
 #ifdef DEBUG_ENERGY
         energy_checkpoint(monitor);
 #endif
+        for (u64 bank = 0; bank < 4; bank++) {
+            bias_bank_map[bank] = bias_pc[bank].read(bias_pc_high_index);
+        }
         bias_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            arr<val<PERCWIDTH,i64>,4> bank_out = bias_pc[offset].read(bias_pc_high_index);
-            for (u64 bank = 0; bank < 4; bank++) {
-                bias_bank_map[bank][offset] = bank_out[bank];
-            }
             val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
             val<1> prov_pred = pred1[offset] & prov_hit;
             val<1> is_prov_weak =  prov_weak[offset];
             tage_info[offset] = concat(prov_pred,is_prov_weak);
+            arr<val<PERCWIDTH,i64>,4> bank_out = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
+                return val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
+            }};
             val<PERCWIDTH,i64> result = bank_out.select(tage_info[offset]);
             return result;
         }};
@@ -2029,7 +2028,7 @@ struct my_bp_v1 : predictor {
 
         
 #ifdef SC_USE_BIAS
-        bias_high_idx.fanout(hard<LINEINST>{});
+        bias_high_idx.fanout(hard<4>{});
 #endif
 #ifdef SC_USE_GEHL
         for (u64 k = 0; k < NUMGEHL; k++) {
@@ -2043,42 +2042,28 @@ struct my_bp_v1 : predictor {
 #endif
         //per-offset updates: bias_pc and thre1 (no write conflicts)
         for (u64 offset = 0; offset < LINEINST; offset++) {
-#ifdef SC_USE_BIAS
-            val<LOGBIAS-LOGLINEINST-2> high_idx = bias_high_idx;
-            val<2> write_tage_info = tage_info[offset];
-#endif
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
             val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, sc_wrong_arr[offset]);
 #if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL)
             [[maybe_unused]] val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
 #endif
-#ifdef SC_USE_BIAS
-            write_tage_info.fanout(hard<5>{});
-            high_idx.fanout(hard<4>{});
-            val<1> wb_hit = val<1>{bias_wb_valid[offset]} &
-                            (val<LOGBIAS-LOGLINEINST-2>{bias_wb_idx[offset]} == high_idx);
-            wb_hit.fanout(hard<4>{});
-            arr<val<PERCWIDTH,i64>,4> old_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                val<PERCWIDTH,i64> wb_lane = val<PERCWIDTH,i64>{bias_wb_data[bank][offset]};
-                val<PERCWIDTH,i64> ram_lane = val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
-                return select(wb_hit, wb_lane, ram_lane);
-            }};
-            arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                val<PERCWIDTH,i64> old_lane = old_bias_vec[bank];
-                val<PERCWIDTH,i64> new_lane = update_ctr(old_lane, branch_taken[offset]);
-                return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
-            }};
-            execute_if(sc_update_en, [&](){
-                bias_pc[offset].write(high_idx, new_bias_vec);
-                for (u64 bank = 0; bank < 4; bank++) {
-                    bias_wb_data[bank][offset] = new_bias_vec[bank];
-                }
-                bias_wb_valid[offset] = val<1>{1};
-                bias_wb_idx[offset] = high_idx;
-            });
-#endif
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
+#ifdef SC_USE_BIAS
+        arr<val<1>,LINEINST> bias_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
+        }};
+        val<LINEINST> bias_taken_mask = branch_taken.concat();
+        for (u64 bank = 0; bank < 4; bank++) {
+            val<2> bank_sel = val<2>{bank};
+            arr<val<1>,LINEINST> bias_bank_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+                return bias_update_arr[offset] & (val<2>{tage_info[offset]} == bank_sel);
+            }};
+            val<LINEINST> bias_wmask = bias_bank_update_arr.concat();
+            val<1> bias_update_any = bias_wmask != val<LINEINST>{0};
+            bias_pc[bank].write(bias_high_idx, bias_bank_map[bank], bias_wmask, bias_taken_mask, bias_update_any, extra_cycle);
+        }
+#endif
 #ifdef SC_USE_GEHL
         arr<val<1>,LINEINST> gehl_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
