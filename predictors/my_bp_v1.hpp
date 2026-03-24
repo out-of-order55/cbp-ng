@@ -327,6 +327,110 @@ struct my_bp_v1 : predictor {
         }
     }
 
+    template<u64 LIFE_BINS>
+    struct wb_counter_snapshot {
+        u64 rd_req = 0;
+        u64 rd_pending_hit = 0;
+        u64 wr_req = 0;
+        u64 wr_hit_merge = 0;
+        u64 wr_enq = 0;
+        u64 wr_drop_full = 0;
+        u64 drain_req = 0;
+        u64 drain_do = 0;
+        u64 drain_block_wr = 0;
+        u64 depth_peak = 0;
+        u64 life_samples = 0;
+        u64 life_sum = 0;
+        u64 life_max = 0;
+        std::array<u64, LIFE_BINS + 1> life_hist = {};
+    };
+
+    template<typename WB>
+    void wb_snapshot_add(wb_counter_snapshot<WB::WB_LIFETIME_BINS> &s, const WB &wb)
+    {
+        s.rd_req += wb.wb_rd_req();
+        s.rd_pending_hit += wb.wb_rd_pending_hit();
+        s.wr_req += wb.wb_wr_req();
+        s.wr_hit_merge += wb.wb_wr_hit_merge();
+        s.wr_enq += wb.wb_wr_enq();
+        s.wr_drop_full += wb.wb_wr_drop_full();
+        s.drain_req += wb.wb_drain_req();
+        s.drain_do += wb.wb_drain_do();
+        s.drain_block_wr += wb.wb_drain_block_wr();
+        s.depth_peak = std::max(s.depth_peak, wb.wb_depth_peak());
+        s.life_samples += wb.wb_lifetime_samples();
+        s.life_sum += wb.wb_lifetime_sum();
+        s.life_max = std::max(s.life_max, wb.wb_lifetime_max());
+        for (u64 b = 0; b <= WB::WB_LIFETIME_BINS; b++) {
+            s.life_hist[b] += wb.wb_lifetime_bin(b);
+        }
+    }
+
+    template<typename WB>
+    auto wb_snapshot_collect(const WB &wb)
+    {
+        wb_counter_snapshot<WB::WB_LIFETIME_BINS> s;
+        wb_snapshot_add(s, wb);
+        return s;
+    }
+
+    template<typename WB, u64 N>
+    auto wb_snapshot_collect(const WB (&arr)[N])
+    {
+        wb_counter_snapshot<WB::WB_LIFETIME_BINS> s;
+        for (u64 i = 0; i < N; i++) {
+            wb_snapshot_add(s, arr[i]);
+        }
+        return s;
+    }
+
+    template<u64 LIFE_BINS>
+    void print_wb_snapshot(const std::string &name, const wb_counter_snapshot<LIFE_BINS> &s)
+    {
+        u64 wr_direct = 0;
+        if (s.wr_req >= s.wr_hit_merge + s.wr_enq + s.wr_drop_full) {
+            wr_direct = s.wr_req - s.wr_hit_merge - s.wr_enq - s.wr_drop_full;
+        }
+
+        std::cerr << "\n┌─ " << name << " WB Write-Path Counters ───────────────────────────────┐\n";
+        std::cerr << "│ rd req / rd pending-hit:  " << std::setw(36) << std::left
+                  << (std::to_string(s.rd_req) + " / " + std::to_string(s.rd_pending_hit)) << "│\n";
+        std::cerr << "│ wr req:                   " << std::setw(36) << std::left << s.wr_req << "│\n";
+        std::cerr << "│ wr direct (derived):      " << std::setw(36) << std::left << wr_direct << "│\n";
+        std::cerr << "│ wr hit-merge / enq / drop:" << std::setw(36) << std::left
+                  << (std::to_string(s.wr_hit_merge) + " / " + std::to_string(s.wr_enq) + " / " + std::to_string(s.wr_drop_full)) << "│\n";
+        std::cerr << "│ drain req / do / blocked: " << std::setw(36) << std::left
+                  << (std::to_string(s.drain_req) + " / " + std::to_string(s.drain_do) + " / " + std::to_string(s.drain_block_wr)) << "│\n";
+        std::cerr << "│ depth peak:               " << std::setw(36) << std::left << s.depth_peak << "│\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
+        std::cerr << "\n┌─ " << name << " WB Head Lifetime (head->RAM write) ─────────────────────┐\n";
+        std::cerr << "│ samples:                 " << std::setw(36) << std::left << s.life_samples << "│\n";
+        if (s.life_samples > 0) {
+            double avg_life = static_cast<double>(s.life_sum) / static_cast<double>(s.life_samples);
+            std::cerr << "│ avg lifetime (cycles):   " << std::setw(36) << std::left << avg_life << "│\n";
+            std::cerr << "│ max lifetime (cycles):   " << std::setw(36) << std::left << s.life_max << "│\n";
+        } else {
+            std::cerr << "│ avg lifetime (cycles):   " << std::setw(36) << std::left << "N/A" << "│\n";
+            std::cerr << "│ max lifetime (cycles):   " << std::setw(36) << std::left << "N/A" << "│\n";
+        }
+        bool printed = false;
+        for (u64 b = 0; b <= LIFE_BINS; b++) {
+            if (s.life_hist[b] == 0) continue;
+            printed = true;
+            std::string line = std::to_string(b) + " cycles: " + std::to_string(s.life_hist[b]);
+            if (s.life_samples > 0) {
+                double pct = 100.0 * static_cast<double>(s.life_hist[b]) / static_cast<double>(s.life_samples);
+                line += " (" + (std::to_string(pct)).substr(0,5) + "%)";
+            }
+            std::cerr << "│   " << std::setw(53) << std::left << line << "│\n";
+        }
+        if (!printed) {
+            std::cerr << "│   " << std::setw(53) << std::left << "no dequeued samples" << "│\n";
+        }
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+    }
+
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
         std::cerr << "║           TAGE PREDICTOR PERFORMANCE COUNTERS                   ║\n";
@@ -539,72 +643,16 @@ struct my_bp_v1 : predictor {
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
 #ifdef SC_FGEHL
-        {
-            constexpr u64 WB_LIFE_BINS = wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4>::WB_LIFETIME_BINS;
-            std::array<u64,WB_LIFE_BINS+1> life_hist = {};
-            u64 wb_rd_req = fgehl.wb_rd_req();
-            u64 wb_rd_pending_hit = fgehl.wb_rd_pending_hit();
-            u64 wb_wr_req = fgehl.wb_wr_req();
-            u64 wb_wr_hit_merge = fgehl.wb_wr_hit_merge();
-            u64 wb_wr_enq = fgehl.wb_wr_enq();
-            u64 wb_wr_drop_full = fgehl.wb_wr_drop_full();
-            u64 wb_drain_req = fgehl.wb_drain_req();
-            u64 wb_drain_do = fgehl.wb_drain_do();
-            u64 wb_drain_block_wr = fgehl.wb_drain_block_wr();
-            u64 wb_depth_peak = fgehl.wb_depth_peak();
-            u64 wb_life_samples = fgehl.wb_lifetime_samples();
-            u64 wb_life_sum = fgehl.wb_lifetime_sum();
-            u64 wb_life_max = fgehl.wb_lifetime_max();
-            u64 wb_wr_direct = 0;
-            if (wb_wr_req >= wb_wr_hit_merge + wb_wr_enq + wb_wr_drop_full) {
-                wb_wr_direct = wb_wr_req - wb_wr_hit_merge - wb_wr_enq - wb_wr_drop_full;
-            }
-
-            for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
-                life_hist[b] += fgehl.wb_lifetime_bin(b);
-            }
-
-            std::cerr << "\n┌─ FGEHL WB Write-Path Counters ─────────────────────────────────┐\n";
-            std::cerr << "│ rd req / rd pending-hit:  " << std::setw(36) << std::left
-                      << (std::to_string(wb_rd_req) + " / " + std::to_string(wb_rd_pending_hit)) << "│\n";
-            std::cerr << "│ wr req:                   " << std::setw(36) << std::left << wb_wr_req << "│\n";
-            std::cerr << "│ wr direct (derived):      " << std::setw(36) << std::left << wb_wr_direct << "│\n";
-            std::cerr << "│ wr hit-merge / enq / drop:" << std::setw(36) << std::left
-                      << (std::to_string(wb_wr_hit_merge) + " / " + std::to_string(wb_wr_enq) + " / " + std::to_string(wb_wr_drop_full)) << "│\n";
-            std::cerr << "│ drain req / do / blocked: " << std::setw(36) << std::left
-                      << (std::to_string(wb_drain_req) + " / " + std::to_string(wb_drain_do) + " / " + std::to_string(wb_drain_block_wr)) << "│\n";
-            std::cerr << "│ depth peak:               " << std::setw(36) << std::left << wb_depth_peak << "│\n";
-            std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
-
-            std::cerr << "\n┌─ FGEHL WB Request Lifetime (enqueue->RAM write) ───────────────┐\n";
-            std::cerr << "│ samples:                 " << std::setw(36) << std::left << wb_life_samples << "│\n";
-            if (wb_life_samples > 0) {
-                double avg_life = static_cast<double>(wb_life_sum) / static_cast<double>(wb_life_samples);
-                std::cerr << "│ avg lifetime (cycles):   " << std::setw(36) << std::left << avg_life << "│\n";
-                std::cerr << "│ max lifetime (cycles):   " << std::setw(36) << std::left << wb_life_max << "│\n";
-            } else {
-                std::cerr << "│ avg lifetime (cycles):   " << std::setw(36) << std::left << "N/A" << "│\n";
-                std::cerr << "│ max lifetime (cycles):   " << std::setw(36) << std::left << "N/A" << "│\n";
-            }
-            bool printed = false;
-            for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
-                if (life_hist[b] == 0) continue;
-                printed = true;
-                std::string name = (b == WB_LIFE_BINS) ? (">=" + std::to_string(WB_LIFE_BINS) + " cycles") :
-                                                          (std::to_string(b) + " cycles");
-                std::string line = name + ": " + std::to_string(life_hist[b]);
-                if (wb_life_samples > 0) {
-                    double pct = 100.0 * static_cast<double>(life_hist[b]) / static_cast<double>(wb_life_samples);
-                    line += " (" + (std::to_string(pct)).substr(0,5) + "%)";
-                }
-                std::cerr << "│   " << std::setw(53) << std::left << line << "│\n";
-            }
-            if (!printed) {
-                std::cerr << "│   " << std::setw(53) << std::left << "no dequeued samples" << "│\n";
-            }
-            std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
-        }
+        print_wb_snapshot("FGEHL", wb_snapshot_collect(fgehl));
 #endif
+#ifdef SC_USE_GEHL
+        print_wb_snapshot("GEHL(all tables)", wb_snapshot_collect(gehl));
+#endif
+#ifdef SC_USE_BIAS
+        print_wb_snapshot("BIAS(all banks)", wb_snapshot_collect(bias_pc));
+#endif
+        print_wb_snapshot("P1 hyst row", wb_snapshot_collect(table1_hyst));
+        print_wb_snapshot("BHYST row", wb_snapshot_collect(bhyst));
 
 #endif
 
@@ -1111,7 +1159,8 @@ struct my_bp_v1 : predictor {
 
     rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
     zone UPDATE_ONLY;
-    ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
+    wb_ram<LINEINST,(1<<index1_bits),4,u64> table1_hyst {"P1 hyst"}; // P1 hysteresis (packed by offset)
+    reg<LINEINST> table1_hyst_row; // cached P1 hysteresis row for current index1
     wb_ram<LINEINST,(1<<bindex_bits),4,u64> bhyst {"bhyst"}; // bimodal hysteresis (packed by offset)
     reg<LINEINST> bhyst_row; // cached bhyst row for current bindex
 
@@ -1309,7 +1358,7 @@ struct my_bp_v1 : predictor {
 #endif
             pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
         }
-        pred1.fanout(hard<2>{});
+        pred1.fanout(hard<3>{});
 
         // for each offset, find second longest match and select secondary prediction
         for (u64 offset=0; offset<LINEINST; offset++) {
@@ -1359,7 +1408,6 @@ struct my_bp_v1 : predictor {
 
         // inst_pc.fanout(hard<5>{});
         match1.fanout(hard<2>{});
-        pred1.fanout(hard<2>{});
         prov_weak.fanout(hard<2>{});
         // bias
 #ifdef SC_USE_BIAS
@@ -1370,6 +1418,7 @@ struct my_bp_v1 : predictor {
 #endif
         for (u64 bank = 0; bank < 4; bank++) {
             bias_bank_map[bank] = bias_pc[bank].read(bias_pc_high_index);
+            bias_bank_map[bank].fanout(hard<2>{});
         }
         bias_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
             val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
@@ -1413,7 +1462,7 @@ struct my_bp_v1 : predictor {
         threshold = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
             return global_thre + thre1[offset];
         }};
-        threshold.fanout(hard<5>{});
+        threshold.fanout(hard<4>{});
 
         //100 ps 2.5 cycle
         sc_sum = arr<val<TOTAL_THREBITS,i64>,LINEINST>{[&](u64 offset){
@@ -1454,7 +1503,7 @@ struct my_bp_v1 : predictor {
             return sc_hist_sum + bias_ext;
         }};
         
-        sc_sum.fanout(hard<5>{});
+        sc_sum.fanout(hard<4>{});
         //100 ps
         use_sc = arr<val<1>,LINEINST>{[&](u64 offset){
             val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
@@ -1479,7 +1528,6 @@ struct my_bp_v1 : predictor {
             val<1> tage_pred = tage_p2.make_array(val<1>{})[offset];
             return select(use_sc[offset],sc_pred[offset],tage_pred);
         }}.concat();
-        // sc_p2.fanout(hard<2>{});
         
     }
 #endif
@@ -1573,12 +1621,12 @@ struct my_bp_v1 : predictor {
             return; // stop here
         }
         //TODO: gate
-        mispredict.fanout(hard<NUMG+2+3>{});
+        mispredict.fanout(hard<3>{});
         val<1> correct_pred = ~mispredict;
         correct_pred.fanout(hard<NUMG+2>{});
-        index1.fanout(hard<LINEINST*3>{});
+        index1.fanout(hard<LINEINST+2>{});
         p2.fanout(hard<2>{});
-        bindex.fanout(hard<LINEINST*3>{});
+        bindex.fanout(hard<LINEINST+2>{});
         gindex.fanout(hard<4>{});
         htag.fanout(hard<3>{});
         readb.fanout(hard<2>{});
@@ -1613,6 +1661,7 @@ struct my_bp_v1 : predictor {
         is_branch.fanout(hard<11>{});
 
         val<LINEINST> branch_mask = is_branch.concat();
+        branch_mask.fanout(hard<2>{});
 
         val<LINEINST> actualdirs = branch_dir.concat();
         actualdirs.fanout(hard<LINEINST>{});
@@ -1628,7 +1677,7 @@ struct my_bp_v1 : predictor {
         };
 
         //TODO: fix it
-        branch_taken.fanout(hard<8>{});
+        branch_taken.fanout(hard<7>{});
 
         arr<val<NUMG+1>,LINEINST> actual_match1 = [&] (u64 offset) {
             return select(is_branch[offset],match1[offset],val<NUMG+1>{0});
@@ -1710,18 +1759,23 @@ struct my_bp_v1 : predictor {
         };
 
         // do P1 and P2 agree?
-        val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask.fo1();
+        val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask;
         //TODO:gate
         disagree_mask.fanout(hard<2+2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
 
-        // read the P1 hysteresis if P1 and P2 disagree
+        // read/update P1 hysteresis as one aggregated row
+        val<1> table1_hyst_we = branch_mask != val<LINEINST>{0};
+        table1_hyst_we.fanout(hard<4>{});
+        execute_if(table1_hyst_we, [&](){
+            table1_hyst_row = table1_hyst.read(index1);
+        });
+        arr<val<1>,LINEINST> table1_hyst_weak_bits = (~val<LINEINST>{table1_hyst_row}).make_array(val<1>{});
+        table1_hyst_weak_bits.fanout(hard<2>{});
         arr<val<1>,LINEINST> p1_weak = [&] (u64 offset) -> val<1> {
             // returns 1 iff disagreement and hysteresis is weak
-            return execute_if(disagree[offset], [&](){
-                return ~table1_hyst[offset].read(index1); // hyst=0 means weak
-            });
+            return disagree[offset] & table1_hyst_weak_bits[offset];
         };
 
 
@@ -1759,6 +1813,7 @@ struct my_bp_v1 : predictor {
         some_badpred1.fanout(hard<2>{});
 #endif
 #endif
+
 #ifdef MY_SC
         sc_sum.fanout(hard<3>{});
         // use_sc.fanout(hard<LINEINST*3>{});
@@ -1771,7 +1826,7 @@ struct my_bp_v1 : predictor {
             val<1> sc_pred_bit = sc_pred[offset];
             return sc_pred_bit != branch_taken[offset];
         }};
-        sc_wrong_arr.fanout(hard<2>{});
+        sc_wrong_arr.fanout(hard<3>{});
         
         
         
@@ -1789,32 +1844,23 @@ struct my_bp_v1 : predictor {
             // return val<1>{1};
         }};
 
-        thre_guard_arr.fanout(hard<2>{});
         val<1> sc_need_update = arr<val<1>,LINEINST>{[&](u64 offset){
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
         }}.fold_or();
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-        // sc_need_update is consumed by extra_cycle and PERF counters in this mode.
-        sc_need_update.fanout(hard<2>{});
-#endif
-#endif
-#ifdef SC_FGEHL
-        val<1> wb_force_extra = fgehl.drain_urgent();
-#else
-        val<1> wb_force_extra = val<1>{0};
-#endif
-        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | sc_need_update | wb_force_extra;
-#else
-#ifdef SC_FGEHL
-        val<1> wb_force_extra = fgehl.drain_urgent();
-#else
-        val<1> wb_force_extra = val<1>{0};
-#endif
+
+        arr<val<1>,4> bias_uragent = [&](u64 bank){
+            return bias_pc[bank].drain_urgent();
+        };
+        arr<val<1>,2> global_uragent = [&](u64 tb){
+            return gehl[tb].drain_urgent();
+        };
+        val<1> wb_force_extra = fgehl.drain_urgent() | bias_uragent.fold_or() | global_uragent.fold_or();
         val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | wb_force_extra;
+#else
+        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) ;
 #endif
 
-        extra_cycle.fanout(hard<NUMG*2+1>{});
+        extra_cycle.fanout(hard<NUMG*2+8>{});
         need_extra_cycle(extra_cycle);
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
@@ -1885,12 +1931,13 @@ struct my_bp_v1 : predictor {
                 table1_pred[offset].write(index1,p2_split[offset].fo1());
             });
         }
-        // update P1 hysteresis
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            execute_if(is_branch[offset],[&](){
-                table1_hyst[offset].write(index1,~disagree[offset]);
-            });
-        }
+        // update P1 hysteresis row: per-branch offsets set to ~disagree, others keep old bits
+        arr<val<1>,LINEINST> table1_hyst_old_bits = val<LINEINST>{table1_hyst_row}.make_array(val<1>{});
+        arr<val<1>,LINEINST> table1_hyst_new_bits = [&](u64 offset){
+            return select(is_branch[offset], ~disagree[offset], table1_hyst_old_bits[offset]);
+        };
+        val<LINEINST> table1_hyst_new_row = table1_hyst_new_bits.concat();
+        table1_hyst.write(index1, table1_hyst_new_row, table1_hyst_we, extra_cycle);
 
         // update incorrect bimodal prediction if primary provider and hysteresis is weak
         for (u64 offset=0; offset<LINEINST; offset++) {
@@ -1905,7 +1952,7 @@ struct my_bp_v1 : predictor {
             return select(bhyst_we_bits[offset], ~primary_wrong[offset], bhyst_old_bits[offset]);
         };
         val<LINEINST> bhyst_new_row = bhyst_new_bits.concat();
-        bhyst.write(bindex, bhyst_new_row, bhyst_we, ~bhyst_we);
+        bhyst.write(bindex, bhyst_new_row, bhyst_we, extra_cycle);
 
         // update incorrect global prediction if primary provider and the hysteresis is weak;
         // initialize global prediction in the allocated entry
@@ -2037,16 +2084,8 @@ struct my_bp_v1 : predictor {
 #ifdef SC_USE_BIAS
         bias_high_idx.fanout(hard<4>{});
 #endif
-#ifdef SC_USE_GEHL
-        for (u64 k = 0; k < NUMGEHL; k++) {
-            gehl_idx[k].fanout(hard<LINEINST>{});
-            gehl_map[k].fanout(hard<LINEINST>{});
-        }
-#endif
-#ifdef SC_FGEHL
-        fgehl_idx.fanout(hard<2>{});
-        fgehl_map.fanout(hard<LINEINST>{});
-#endif
+
+
         //per-offset updates: bias_pc and thre1 (no write conflicts)
         for (u64 offset = 0; offset < LINEINST; offset++) {
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];

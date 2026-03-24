@@ -16,6 +16,26 @@ template<u64 N, typename T>
     return select(incr.fo1(),incsat.fo1(),decsat.fo1());
 }
 
+#ifdef PERF_COUNTERS
+template<u64 LIFE_BINS>
+inline void wb_record_head_lifetime(bool did_dequeue,
+                                    u64 head_wait_cycles,
+                                    u64 &samples,
+                                    u64 &sum,
+                                    u64 &maxv,
+                                    std::array<u64,LIFE_BINS+1> &hist)
+{
+    if (!did_dequeue) return;
+    // report only queue-head residence time until RAM write, in cycles.
+    u64 lifetime = head_wait_cycles + 1;
+    u64 bin = std::min(lifetime, LIFE_BINS);
+    samples++;
+    sum += lifetime;
+    maxv = std::max(maxv, lifetime);
+    hist[bin]++;
+}
+#endif
+
 
 // banked RAM for doing (almost) 1 read-modify-write per cycle
 template<u64 N, u64 M, u64 B>
@@ -139,8 +159,6 @@ struct wb_ram {
     u64 perf_wb_depth_peak = 0;
     u64 perf_wb_block_cycles = 0;
     std::array<u64,D+1> perf_wb_block_depth = {};
-    u64 perf_wb_seq = 0;
-    std::array<u64,D> perf_wb_enq_seq = {};
     u64 perf_wb_lifetime_samples = 0;
     u64 perf_wb_lifetime_sum = 0;
     u64 perf_wb_lifetime_max = 0;
@@ -168,9 +186,6 @@ struct wb_ram {
     // drain is allowed whenever queue is non-empty and noconflict=1.
     void write(val<A> addr, val<N,T> data, val<1> we, val<1> noconflict)
     {
-#ifdef PERF_COUNTERS
-        u64 seq_now = perf_wb_seq++;
-#endif
         addr.fanout(hard<2*D+2>{});
         data.fanout(hard<D+3>{});
         val<1> wr_en = we.fo1();
@@ -189,6 +204,7 @@ struct wb_ram {
         do_dequeue.fanout(hard<D+12>{});
         val<1> direct_write = wr_en & ~has_pending & can_drain;
         direct_write.fanout(hard<4>{});
+        val<4> q_head_wait_prev = q_head_wait;
         val<1> wait_active = has_pending & ~do_dequeue;
         q_head_wait.fanout(hard<4>{});
         val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
@@ -242,19 +258,12 @@ struct wb_ram {
                 perf_wb_block_cycles++;
                 perf_wb_block_depth[depth_now]++;
             }
-            if (static_cast<u64>(do_dequeue) != 0) {
-                u64 head_idx = std::min(static_cast<u64>(q_head), D-1);
-                u64 lifetime = seq_now - perf_wb_enq_seq[head_idx];
-                u64 bin = std::min(lifetime, WB_LIFETIME_BINS);
-                perf_wb_lifetime_samples++;
-                perf_wb_lifetime_sum += lifetime;
-                perf_wb_lifetime_max = std::max(perf_wb_lifetime_max, lifetime);
-                perf_wb_lifetime_hist[bin]++;
-            }
-            if (static_cast<u64>(do_enqueue) != 0) {
-                u64 tail_idx = std::min(static_cast<u64>(q_tail), D-1);
-                perf_wb_enq_seq[tail_idx] = seq_now;
-            }
+            wb_record_head_lifetime<WB_LIFETIME_BINS>(static_cast<u64>(do_dequeue) != 0,
+                                                      static_cast<u64>(q_head_wait_prev),
+                                                      perf_wb_lifetime_samples,
+                                                      perf_wb_lifetime_sum,
+                                                      perf_wb_lifetime_max,
+                                                      perf_wb_lifetime_hist);
 #endif
 
             val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
@@ -369,8 +378,6 @@ struct wb_mask_ram {
     u64 perf_wb_depth_peak = 0;
     u64 perf_wb_block_cycles = 0;
     std::array<u64,D+1> perf_wb_block_depth = {};
-    u64 perf_wb_seq = 0;
-    std::array<u64,D> perf_wb_enq_seq = {};
     u64 perf_wb_lifetime_samples = 0;
     u64 perf_wb_lifetime_sum = 0;
     u64 perf_wb_lifetime_max = 0;
@@ -399,9 +406,6 @@ struct wb_mask_ram {
     // taken_mask bit controls up/down direction for update_ctr on each masked lane.
     void write(val<A> addr, arr<val<W,T>,L> data, val<L> wmask, val<L> taken_mask, val<1> we, val<1> noconflict)
     {
-#ifdef PERF_COUNTERS
-        u64 seq_now = perf_wb_seq++;
-#endif
         addr.fanout(hard<2*D+2>{});
         data.fanout(hard<L+3>{});
         wmask.fanout(hard<D+4>{});
@@ -424,6 +428,7 @@ struct wb_mask_ram {
         do_dequeue.fanout(hard<L+D+12>{});
         val<1> direct_write = wr_en & ~has_pending & can_drain;
         direct_write.fanout(hard<4>{});
+        val<4> q_head_wait_prev = q_head_wait;
         val<1> wait_active = has_pending & ~do_dequeue;
         q_head_wait.fanout(hard<4>{});
         val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
@@ -485,19 +490,12 @@ struct wb_mask_ram {
                 perf_wb_block_cycles++;
                 perf_wb_block_depth[depth_now]++;
             }
-            if (static_cast<u64>(do_dequeue) != 0) {
-                u64 head_idx = std::min(static_cast<u64>(q_head), D-1);
-                u64 lifetime = seq_now - perf_wb_enq_seq[head_idx];
-                u64 bin = std::min(lifetime, WB_LIFETIME_BINS);
-                perf_wb_lifetime_samples++;
-                perf_wb_lifetime_sum += lifetime;
-                perf_wb_lifetime_max = std::max(perf_wb_lifetime_max, lifetime);
-                perf_wb_lifetime_hist[bin]++;
-            }
-            if (static_cast<u64>(do_enqueue) != 0) {
-                u64 tail_idx = std::min(static_cast<u64>(q_tail), D-1);
-                perf_wb_enq_seq[tail_idx] = seq_now;
-            }
+            wb_record_head_lifetime<WB_LIFETIME_BINS>(static_cast<u64>(do_dequeue) != 0,
+                                                      static_cast<u64>(q_head_wait_prev),
+                                                      perf_wb_lifetime_samples,
+                                                      perf_wb_lifetime_sum,
+                                                      perf_wb_lifetime_max,
+                                                      perf_wb_lifetime_hist);
 #endif
 
             val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
@@ -601,10 +599,12 @@ struct wb_rwram {
     reg<Q> q_head;
     reg<Q> q_tail;
     reg<QC> q_count;
+    reg<4> q_head_wait;
 
     reg<1> write_stall;
 
 #ifdef PERF_COUNTERS
+    static constexpr u64 WB_LIFETIME_BINS = 64;
     u64 perf_wb_rd_req = 0;
     u64 perf_wb_rd_pending_hit = 0;
     u64 perf_wb_wr_req = 0;
@@ -615,6 +615,10 @@ struct wb_rwram {
     u64 perf_wb_drain_do = 0;
     u64 perf_wb_drain_block_wr = 0;
     u64 perf_wb_depth_peak = 0;
+    u64 perf_wb_lifetime_samples = 0;
+    u64 perf_wb_lifetime_sum = 0;
+    u64 perf_wb_lifetime_max = 0;
+    std::array<u64,WB_LIFETIME_BINS+1> perf_wb_lifetime_hist = {};
 #endif
 
     wb_rwram(const char *label="") : mem{label} {}
@@ -657,6 +661,11 @@ struct wb_rwram {
         do_dequeue.fanout(hard<D+10>{});
         val<1> direct_write = wr_en & ~has_pending & can_drain;
         direct_write.fanout(hard<4>{});
+        val<4> q_head_wait_prev = q_head_wait;
+        val<1> wait_active = has_pending & ~do_dequeue;
+        q_head_wait.fanout(hard<4>{});
+        val<4> wait_inc = select(q_head_wait == hard<15>{}, val<4>{q_head_wait}, val<4>{q_head_wait + hard<1>{}});
+        q_head_wait = select(wait_active, wait_inc, val<4>{0});
 
         arr<val<1>,D> hit = arr<val<1>,D>{[&](u64 i){
             return wr_en & val<1>{q_valid[i]} & (val<A>{q_addr[i]} == addr);
@@ -693,6 +702,12 @@ struct wb_rwram {
         perf_wb_drain_req += static_cast<u64>(has_pending & can_drain);
         perf_wb_drain_do += static_cast<u64>(do_dequeue);
         perf_wb_drain_block_wr += static_cast<u64>(has_pending & ~can_drain);
+        wb_record_head_lifetime<WB_LIFETIME_BINS>(static_cast<u64>(do_dequeue) != 0,
+                                                  static_cast<u64>(q_head_wait_prev),
+                                                  perf_wb_lifetime_samples,
+                                                  perf_wb_lifetime_sum,
+                                                  perf_wb_lifetime_max,
+                                                  perf_wb_lifetime_hist);
 #endif
 
         val<Q> q_head_next = select(do_dequeue, val<Q>{q_head + val<Q>{1}}, val<Q>{q_head});
@@ -742,6 +757,10 @@ struct wb_rwram {
     u64 wb_drain_do() const { return perf_wb_drain_do; }
     u64 wb_drain_block_wr() const { return perf_wb_drain_block_wr; }
     u64 wb_depth_peak() const { return perf_wb_depth_peak; }
+    u64 wb_lifetime_samples() const { return perf_wb_lifetime_samples; }
+    u64 wb_lifetime_sum() const { return perf_wb_lifetime_sum; }
+    u64 wb_lifetime_max() const { return perf_wb_lifetime_max; }
+    u64 wb_lifetime_bin(u64 b) const { return (b <= WB_LIFETIME_BINS) ? perf_wb_lifetime_hist[b] : 0; }
 #endif
 
     void reset()
