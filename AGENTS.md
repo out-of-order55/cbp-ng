@@ -136,3 +136,34 @@ execute_if(was_used | do_alloc, [&](){
 1. 每条关键写请求建议打印：`idx / addr / data / write_anchor / first_visible / probe_latency / e2e_latency`。
 2. 输出中建议附加 `queue_depth` 峰值与 drain 完成周期，便于快速定位瓶颈。
 3. 回归对比时，优先比较同一 seed、同一请求序列，避免随机差异误导结论。
+
+## FGEHL WB 经验（Must）
+
+1. 看到 `lifetime samples=0` 时，不允许直接下结论“写未生效”或“排空异常”；必须先报告写路径拆分：
+   - `wr_req`
+   - `wr_direct`
+   - `wr_hit_merge`
+   - `wr_enq`
+   - `wr_drop_full`
+   - `drain_req/do/blocked`
+2. 若 `wr_direct≈wr_req`，则应判定本轮以 direct-bypass 为主，`lifetime` 指标不再是主要证据，需转向“每次写的基值是否陈旧”的验证。
+3. 验证“写后短周期读旧值/写旧值”时，必须给出 shadow 对照统计（至少）：
+   - `read_cmp / stale_read`
+   - `write_cmp / stale_base_write`
+   - `stale_read_age<=3`
+   - `stale_write_age<=3`
+   - stale age 分布（建议 `0..7` 和 `>=8`）
+4. `wb on/off` 比较时，必须同时给出上述 stale 指标与性能指标（`mispredictions`、`extra_cycles`），避免只看能耗或单一计数器。
+5. `PERF_COUNTERS + CHEATING_MODE` 路径中，若同一 `val` 需要被多个统计/逻辑分支读取，必须先显式设置 `fanout`，避免 `misuse of fo1()`。
+
+## GEHL/Wiredebug 经验（Must）
+
+1. `wb_mask` 改造必须保留 `wb on/off` 双路径可编译可运行；读写两侧都要完整实现，禁止只改读不改写。
+2. 做 A/B 对比时，必须固定：trace、窗口、编译器选项、随机种子（若有），且默认不加 `-DFREE_FANOUT`，否则结论无效。
+3. `wiredebug` 结论边界必须写清：它能证明线网切换/距离/能耗与热点变化，不能直接证明“写入值是否陈旧”。
+4. 若热点链路 bits 接近但 energy 显著上升，优先检查链路距离（`dist`）与跨区通信，而不是先归因于功能错误。
+5. 当 `wb on` 出现功耗/延时上升时，必须同时报告：
+   - `p2 latency`、`energy per instruction`、`dynamic power`
+   - `total wire energy`
+   - `SC-path wire energy` 及占比
+6. `sc_sum` 优化优先采用“分段求和 + 最后加 bias”的结构，减少关键链路深度；变更后必须复测 `mispredictions/latency/energy` 三项。
