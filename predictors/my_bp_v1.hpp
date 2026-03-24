@@ -27,6 +27,7 @@
 #ifndef SC_GLOBAL_THRE_PIPE_STAGES
 #define SC_GLOBAL_THRE_PIPE_STAGES 2
 #endif
+
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
@@ -541,13 +542,39 @@ struct my_bp_v1 : predictor {
         {
             constexpr u64 WB_LIFE_BINS = wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4>::WB_LIFETIME_BINS;
             std::array<u64,WB_LIFE_BINS+1> life_hist = {};
+            u64 wb_rd_req = fgehl.wb_rd_req();
+            u64 wb_rd_pending_hit = fgehl.wb_rd_pending_hit();
+            u64 wb_wr_req = fgehl.wb_wr_req();
+            u64 wb_wr_hit_merge = fgehl.wb_wr_hit_merge();
+            u64 wb_wr_enq = fgehl.wb_wr_enq();
+            u64 wb_wr_drop_full = fgehl.wb_wr_drop_full();
+            u64 wb_drain_req = fgehl.wb_drain_req();
+            u64 wb_drain_do = fgehl.wb_drain_do();
+            u64 wb_drain_block_wr = fgehl.wb_drain_block_wr();
+            u64 wb_depth_peak = fgehl.wb_depth_peak();
             u64 wb_life_samples = fgehl.wb_lifetime_samples();
             u64 wb_life_sum = fgehl.wb_lifetime_sum();
             u64 wb_life_max = fgehl.wb_lifetime_max();
+            u64 wb_wr_direct = 0;
+            if (wb_wr_req >= wb_wr_hit_merge + wb_wr_enq + wb_wr_drop_full) {
+                wb_wr_direct = wb_wr_req - wb_wr_hit_merge - wb_wr_enq - wb_wr_drop_full;
+            }
 
             for (u64 b = 0; b <= WB_LIFE_BINS; b++) {
                 life_hist[b] += fgehl.wb_lifetime_bin(b);
             }
+
+            std::cerr << "\n┌─ FGEHL WB Write-Path Counters ─────────────────────────────────┐\n";
+            std::cerr << "│ rd req / rd pending-hit:  " << std::setw(36) << std::left
+                      << (std::to_string(wb_rd_req) + " / " + std::to_string(wb_rd_pending_hit)) << "│\n";
+            std::cerr << "│ wr req:                   " << std::setw(36) << std::left << wb_wr_req << "│\n";
+            std::cerr << "│ wr direct (derived):      " << std::setw(36) << std::left << wb_wr_direct << "│\n";
+            std::cerr << "│ wr hit-merge / enq / drop:" << std::setw(36) << std::left
+                      << (std::to_string(wb_wr_hit_merge) + " / " + std::to_string(wb_wr_enq) + " / " + std::to_string(wb_wr_drop_full)) << "│\n";
+            std::cerr << "│ drain req / do / blocked: " << std::setw(36) << std::left
+                      << (std::to_string(wb_drain_req) + " / " + std::to_string(wb_drain_do) + " / " + std::to_string(wb_drain_block_wr)) << "│\n";
+            std::cerr << "│ depth peak:               " << std::setw(36) << std::left << wb_depth_peak << "│\n";
+            std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
             std::cerr << "\n┌─ FGEHL WB Request Lifetime (enqueue->RAM write) ───────────────┐\n";
             std::cerr << "│ samples:                 " << std::setw(36) << std::left << wb_life_samples << "│\n";
@@ -578,6 +605,7 @@ struct my_bp_v1 : predictor {
             std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
         }
 #endif
+
 #endif
 
         std::cerr << "\n┌─ Mispred Reason Statistics ──────────────────────────────────────┐\n";
@@ -1058,7 +1086,7 @@ struct my_bp_v1 : predictor {
     arr<reg<TOTAL_THREBITS,i64>,LINEINST> sc_sum;
 #ifdef SC_USE_GEHL
     arr<reg<LOGGEHL-LOGLINEINST>,NUMGEHL> gehl_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGGEHL-LOGLINEINST))> gehl[NUMGEHL][LINEINST] {"GEHL"};
+    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGGEHL-LOGLINEINST)),4> gehl[NUMGEHL] {"GEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> gehl_map[NUMGEHL];
 #endif
 #ifdef SC_FGEHL
@@ -1368,9 +1396,7 @@ struct my_bp_v1 : predictor {
             val<LOGGEHL-LOGLINEINST> idx = gehl_base_index ^ val<LOGGEHL-LOGLINEINST>{gfolds.template get<0>(k+1)};
             idx.fanout(hard<LINEINST+1>{});
             gehl_idx[k] = idx;
-            gehl_map[k] = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-                return gehl[k][offset].read(idx);
-            }};
+            gehl_map[k] = gehl[k].read(idx);
             gehl_map[k].fanout(hard<2>{});
         }
 #endif
@@ -1420,10 +1446,12 @@ struct my_bp_v1 : predictor {
             fgehl_v.fanout(hard<2>{});
             val<1> fgehl_sign = val<1>{fgehl_v >> hard<PERCWIDTH-1>{}};
             val<TOTAL_THREBITS,i64> fgehl_ext = concat(fgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{fgehl_v});
-            return bias_ext + gehl0_ext + gehl1_ext + fgehl_ext;
 #else
-            return bias_ext + gehl0_ext + gehl1_ext;
+            val<TOTAL_THREBITS,i64> fgehl_ext = val<TOTAL_THREBITS,i64>{0};
 #endif
+            val<PERCWIDTH+1,i64> gehl_pair_sum = gehl0_ext + gehl1_ext;
+            val<PERCWIDTH+2,i64> sc_hist_sum = gehl_pair_sum + fgehl_ext;
+            return sc_hist_sum + bias_ext;
         }};
         
         sc_sum.fanout(hard<5>{});
@@ -1719,6 +1747,12 @@ struct my_bp_v1 : predictor {
 #endif
         // need extra cycle for modifying prediction bits and for TAGE allocation
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        // some_badpred1 is consumed by extra_cycle and PERF counters in this mode.
+        some_badpred1.fanout(hard<2>{});
+#endif
+#endif
 #ifdef MY_SC
         sc_sum.fanout(hard<3>{});
         // use_sc.fanout(hard<LINEINST*3>{});
@@ -1753,19 +1787,25 @@ struct my_bp_v1 : predictor {
         val<1> sc_need_update = arr<val<1>,LINEINST>{[&](u64 offset){
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
         }}.fold_or();
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        // sc_need_update is consumed by extra_cycle and PERF counters in this mode.
+        sc_need_update.fanout(hard<2>{});
+#endif
+#endif
 #ifdef SC_FGEHL
         val<1> wb_force_extra = fgehl.drain_urgent();
 #else
         val<1> wb_force_extra = val<1>{0};
 #endif
-        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | sc_need_update | wb_force_extra;
+        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | sc_need_update | wb_force_extra;
 #else
 #ifdef SC_FGEHL
         val<1> wb_force_extra = fgehl.drain_urgent();
 #else
         val<1> wb_force_extra = val<1>{0};
 #endif
-        val<1> extra_cycle = some_badpred1.fo1() | mispredict | (disagree_mask != hard<0>{}) | wb_force_extra;
+        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | wb_force_extra;
 #endif
 
         extra_cycle.fanout(hard<NUMG*2+1>{});
@@ -1814,7 +1854,13 @@ struct my_bp_v1 : predictor {
         };
         // if all post entries have the u bit set, reset their u bits
         val<1> noalloc = (candallocmask == hard<0>{});
-        val<NUMG> uclearmask = postmask & noalloc.fo1().replicate(hard<NUMG>{}).concat();
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        // noalloc is consumed by uclear path and end-of-cycle perf accounting.
+        noalloc.fanout(hard<2>{});
+#endif
+#endif
+        val<NUMG> uclearmask = postmask & noalloc.replicate(hard<NUMG>{}).concat();
         arr<val<1>,NUMG> uclear = uclearmask.fo1().make_array(val<1>{});
         uclear.fanout(hard<2>{});
 
@@ -2004,7 +2050,7 @@ struct my_bp_v1 : predictor {
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
             val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, sc_wrong_arr[offset]);
 #if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL)
-            val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
+            [[maybe_unused]] val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
 #endif
 #ifdef SC_USE_BIAS
             write_tage_info.fanout(hard<5>{});
@@ -2031,20 +2077,19 @@ struct my_bp_v1 : predictor {
                 bias_wb_idx[offset] = high_idx;
             });
 #endif
-#ifdef SC_USE_GEHL
-            for (u64 k = 0; k < NUMGEHL; k++) {
-                val<LOGGEHL-LOGLINEINST> gehl_write_idx = gehl_idx[k];
-                val<PERCWIDTH,i64> old_gehl = gehl_map[k][offset];
-                gehl_write_idx.fanout(hard<2>{});
-                old_gehl.fanout(hard<2>{});
-                val<PERCWIDTH,i64> new_gehl = update_ctr(old_gehl, branch_taken[offset]);
-                execute_if(sc_update_en, [&](){
-                    gehl[k][offset].write(gehl_write_idx, new_gehl);
-                });
-            }
-#endif
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
+#ifdef SC_USE_GEHL
+        arr<val<1>,LINEINST> gehl_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
+            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
+        }};
+        val<LINEINST> gehl_wmask = gehl_update_arr.concat();
+        val<LINEINST> gehl_taken_mask = branch_taken.concat();
+        val<1> gehl_update_any = gehl_wmask != val<LINEINST>{0};
+        for (u64 k = 0; k < NUMGEHL; k++) {
+            gehl[k].write(gehl_idx[k], gehl_map[k], gehl_wmask, gehl_taken_mask, gehl_update_any, extra_cycle);
+        }
+#endif
 #ifdef SC_FGEHL
         arr<val<1>,LINEINST> fgehl_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
