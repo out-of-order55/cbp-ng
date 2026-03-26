@@ -516,8 +516,8 @@ struct wb_mask_ram {
 // read path always goes directly to backend RWRAM (no WB lookup).
 // write path supports WAW update (same-address write updates buffered entry).
 // one write request per cycle per instance.
-// Each bank owns an independent pending-write queue of depth D.
-template<u64 N, u64 M, u64 B, u64 D = 2, arith T = u64>
+// Each bank owns one pending-write slot.
+template<u64 N, u64 M, u64 B, arith T = u64>
 struct wb_rwram {
     static_assert(std::has_single_bit(M));
     static constexpr u64 A = std::bit_width(M-1);
@@ -528,37 +528,15 @@ struct wb_rwram {
     static constexpr u64 L = std::bit_width(E - 1);
     static constexpr u64 I = std::bit_width(B - 1);
     static_assert(A == L + I);
-    static_assert(D >= 1);
-    static_assert(std::has_single_bit(D));
-    static constexpr u64 Q = D == 1 ? 1 : std::bit_width(D-1);
-    static constexpr u64 QC = std::bit_width(D);
-    static constexpr u64 S = B * D;
-    static constexpr u64 DEPTH = D;
-
-    static constexpr u64 slot_index(u64 bank_id, u64 slot_id)
-    {
-        return bank_id * D + slot_id;
-    }
-
-    static val<Q> next_slot(val<Q> slot)
-    {
-        if constexpr (D == 1) {
-            return val<Q>{0};
-        } else {
-            return val<Q>{slot + val<Q>{1}};
-        }
-    }
+    static constexpr u64 DEPTH = 1;
 
     // Native banked RAM backend (no rwram wrapper).
     ram<val<N,T>,E> bank[B];
 
-    arr<reg<1>,S> q_valid;
-    arr<reg<A>,S> q_addr;
-    arr<reg<N,T>,S> q_data;
-    arr<reg<Q>,B> q_head;
-    arr<reg<Q>,B> q_tail;
-    arr<reg<QC>,B> q_count;
-    arr<reg<4>,B> q_head_wait;
+    arr<reg<1>,B> q_valid;
+    arr<reg<A>,B> q_addr;
+    arr<reg<N,T>,B> q_data;
+    arr<reg<4>,B> pending_wait;
 
     reg<1> write_stall;
 
@@ -569,7 +547,7 @@ struct wb_rwram {
     u64 perf_drop_writes = 0;
     u64 perf_write_merges = 0;
     u64 perf_read_pending_hits = 0;
-    u64 perf_read_pending_hit_depth[D] = {};
+    u64 perf_read_pending_hit_depth[DEPTH] = {};
     T perf_shadow_data[M] = {};
 #endif
 
@@ -588,20 +566,12 @@ struct wb_rwram {
         perf_reads++;
         u64 full_addr = static_cast<u64>(addr);
         u64 bank_idx = static_cast<u64>(bankid);
-        u64 bank_head = static_cast<u64>(q_head[bank_idx]);
-        u64 bank_count = static_cast<u64>(q_count[bank_idx]);
         bool stale = false;
-        for (u64 depth = 0; depth < bank_count; depth++) {
-            u64 slot = (bank_head + depth) & (D - 1);
-            u64 idx = slot_index(bank_idx, slot);
-            if (!static_cast<bool>(q_valid[idx]))
-                continue;
-            if (static_cast<u64>(q_addr[idx]) != full_addr)
-                continue;
+        if (static_cast<bool>(q_valid[bank_idx]) &&
+            static_cast<u64>(q_addr[bank_idx]) == full_addr) {
             perf_read_pending_hits++;
-            perf_read_pending_hit_depth[depth]++;
-            stale = static_cast<T>(q_data[idx]) != perf_shadow_data[full_addr];
-            break;
+            perf_read_pending_hit_depth[0]++;
+            stale = static_cast<T>(q_data[bank_idx]) != perf_shadow_data[full_addr];
         }
         if (stale)
             perf_stale_reads++;
@@ -623,9 +593,9 @@ struct wb_rwram {
     // noconflict is an incremental condition:
     //   - noconflict=1 guarantees no bank conflict this cycle
     //   - noconflict=0 falls back to read_addr/ren bank-conflict checks
-    // Full queue policy:
-    //   - if head can write RAM: flush oldest entry then enqueue new request
-    //   - otherwise: drop oldest entry then enqueue new request
+    // Single-slot policy:
+    //   - if the pending slot can drain, write it back first and optionally refill it
+    //   - otherwise, keep the pending slot unless DROP_OLDEST is enabled
     void write(val<A> addr, val<N,T> data, val<1> we, val<A> read_addr, val<1> ren, val<1> noconflict)
     {
         write_impl(addr, data, we, read_addr, ren, noconflict, val<1>{0}, val<1>{0});
@@ -640,8 +610,8 @@ struct wb_rwram {
     void write_impl(val<A> addr, val<N,T> data, val<1> we, val<A> read_addr, val<1> ren,
                     val<1> noconflict, val<1> update_hit, val<1> update_incr)
     {
-        addr.fanout(hard<B+B*D>{});
-        data.fanout(hard<B+B*D>{});
+        addr.fanout(hard<2 * B>{});
+        data.fanout(hard<2 * B>{});
         val<1> wr_en = we.fo1();
         wr_en.fanout(hard<2 * B>{});
         val<1> update_hit_en = update_hit.fo1() & wr_en;
@@ -657,13 +627,10 @@ struct wb_rwram {
         }
 #endif
         write_stall = val<1>{0};
-        q_head.fanout(hard<2>{});
-        q_tail.fanout(hard<2>{});
-        q_count.fanout(hard<3>{});
         q_valid.fanout(hard<4>{});
         q_addr.fanout(hard<5>{});
         q_data.fanout(hard<4>{});
-        q_head_wait.fanout(hard<4>{});
+        pending_wait.fanout(hard<4>{});
 
         val<A> wr_addr_for_split = addr;
         val<A> rd_addr_for_split = read_addr;
@@ -673,7 +640,6 @@ struct wb_rwram {
         wr_localaddr.fanout(hard<B>{});
         arr<val<1>,B> wr_bank_split = wr_bankid.fo1().decode();
         arr<val<1>,B> rd_bank_split = rd_bankid.fo1().decode();
-        // wr_bank_split.fanout(hard<D + 12>{});
         // rd_bank_split.fanout(hard<4>{});
 
         for (u64 b = 0; b < B; b++) {
@@ -685,14 +651,7 @@ struct wb_rwram {
             bank_update_hit.fanout(hard<4>{});
             val<1> bank_read_conflict = ren_en & rd_bank_split[b];
 
-            val<Q> bank_head = q_head[b];
-            val<Q> bank_tail = q_tail[b];
-            val<QC> bank_count = q_count[b];
-            bank_head.fanout(hard<3 + D>{});
-            bank_tail.fanout(hard<1 + D>{});
-            bank_count.fanout(hard<4>{});
-
-            val<1> has_pending = bank_count != val<QC>{0};
+            val<1> has_pending = q_valid[b];
             has_pending.fanout(hard<8>{});
             val<1> head_can_write = no_conflict_force | ~bank_read_conflict;
             head_can_write.fanout(hard<4>{});
@@ -700,57 +659,35 @@ struct wb_rwram {
             bank_pending_ready.fanout(hard<2>{});
             val<1> bank_active = bank_wr_en | bank_pending_ready;
 
-            // Gate the heavy per-bank compare/select logic unless this bank is the target
-            // of the current write or has a pending head that can drain this cycle.
+            // Gate the per-bank logic unless this bank is the target
+            // of the current write or has a pending slot that can drain this cycle.
             execute_if(bank_active, [&](){
-                arr<val<1>,D> bank_valid = [&](u64 s) -> val<1> {
-                    return val<1>{q_valid[slot_index(b, s)]};
-                };
-                arr<val<A>,D> bank_addr = [&](u64 s) -> val<A> {
-                    return val<A>{q_addr[slot_index(b, s)]};
-                };
-                bank_addr.fanout(hard<2>{});
-                arr<val<N,T>,D> bank_data = [&](u64 s) -> val<N,T> {
-                    return val<N,T>{q_data[slot_index(b, s)]};
-                };
+                val<1> slot_valid = val<1>{q_valid[b]};
+                val<A> slot_addr = val<A>{q_addr[b]};
+                val<N,T> slot_data = val<N,T>{q_data[b]};
+                slot_addr.fanout(hard<2>{});
 
-                val<1> full_now = bank_count == val<QC>{D};
-                full_now.fanout(hard<2>{});
-
-                val<D> hit_mask = execute_if(bank_wr_en & has_pending, [&](){
-                    arr<val<1>,D> hit = [&](u64 s) -> val<1> {
-                        return bank_valid[s] & (bank_addr[s] == addr);
-                    };
-                    return hit.concat();
+                val<1> has_hit = execute_if(bank_wr_en & has_pending, [&](){
+                    return slot_valid & (slot_addr == addr);
                 });
-                hit_mask.fanout(hard<2>{});
-                val<1> has_hit = hit_mask != val<D>{0};
                 has_hit.fanout(hard<2>{});
-                val<D> hit_oh = hit_mask.one_hot();
-                arr<val<1>,D> hit_oh_split = hit_oh.make_array(val<1>{});
-                // hit_oh_split.fanout(hard<2>{});
-
-                val<A> head_addr = execute_if(has_pending, [&](){
-                    return bank_addr.select(bank_head);
-                });
-                val<N,T> head_data = execute_if(has_pending, [&](){
-                    return bank_data.select(bank_head);
-                });
+                val<N,T> head_data = slot_data;
+                val<N,T> resolved_hit_data = select(bank_update_hit,
+                                                    update_ctr(slot_data, update_incr_en),
+                                                    data);
+                resolved_hit_data.fanout(hard<3>{});
                 val<L> head_localaddr = execute_if(has_pending, [&](){
-                    auto [localaddr, head_bankid] = split<L, I>(head_addr);
+                    auto [localaddr, head_bankid] = split<L, I>(slot_addr);
                     static_cast<void>(head_bankid);
                     return localaddr;
                 });
-
-
                 val<1> direct_write = bank_wr_en & ~has_pending & head_can_write;
                 direct_write.fanout(hard<4>{});
-
-                val<1> hit_head = bank_wr_en & has_pending & (head_addr == addr);
+                val<1> hit_head = has_hit;
                 hit_head.fanout(hard<2>{});
                 val<1> do_drain_ready = bank_pending_ready;
                 do_drain_ready.fanout(hard<2>{});
-                val<1> full_conflict = bank_wr_en & ~has_hit & full_now & has_pending;
+                val<1> full_conflict = bank_wr_en & ~has_hit & has_pending;
                 full_conflict.fanout(hard<3>{});
                 val<1> blocked_full = full_conflict & ~head_can_write;
                 blocked_full.fanout(hard<2>{});
@@ -759,13 +696,11 @@ struct wb_rwram {
 #else
                 val<1> pop_entry = do_drain_ready;
 #endif
-                pop_entry.fanout(hard<D + 5>{});
+                pop_entry.fanout(hard<6>{});
 
                 execute_if(do_drain_ready | direct_write, [&](){
                     val<L> waddr = select(direct_write, wr_localaddr, head_localaddr);
-                    val<N,T> hit_update_data = update_ctr(head_data, update_incr_en);
-                    val<N,T> pending_hit_data = select(bank_update_hit, hit_update_data, data);
-                    val<N,T> pending_wdata = select(hit_head, pending_hit_data, head_data);
+                    val<N,T> pending_wdata = select(hit_head, resolved_hit_data, head_data);
                     val<N,T> wdata = select(direct_write, data, pending_wdata);
                     bank[b].write(waddr, wdata);
                 });
@@ -781,9 +716,7 @@ struct wb_rwram {
                     if (do_backend_write) {
                         bool write_direct = static_cast<bool>(direct_write);
                         bool write_updated_head = static_cast<bool>(do_drain_ready) && static_cast<bool>(hit_head);
-                        T head_write_data = static_cast<bool>(bank_update_hit)
-                                                ? static_cast<T>(update_ctr(head_data, update_incr_en))
-                                                : static_cast<T>(data);
+                        T head_write_data = static_cast<T>(resolved_hit_data);
                         u64 full_addr = (b << L) | (write_direct ? static_cast<u64>(wr_localaddr)
                                                                   : static_cast<u64>(head_localaddr));
                         perf_shadow_data[full_addr] = write_direct ? static_cast<T>(data)
@@ -794,58 +727,31 @@ struct wb_rwram {
 #endif
 
                 execute_if(has_pending, [&](){
-                    val<4> bank_wait_prev = q_head_wait[b];
+                    val<4> bank_wait_prev = pending_wait[b];
                     val<1> wait_active = ~pop_entry;
                     val<4> wait_inc = select(bank_wait_prev == hard<15>{},
                                              bank_wait_prev,
                                              val<4>{bank_wait_prev + hard<1>{}});
-                    q_head_wait[b] = select(wait_active, wait_inc, val<4>{0});
+                    pending_wait[b] = select(wait_active, wait_inc, val<4>{0});
                 });
 
-                val<QC> count_after_pop = select(pop_entry,
-                                                 val<QC>{bank_count - val<QC>{1}},
-                                                 bank_count);
-                count_after_pop.fanout(hard<2>{});
-                val<1> do_enqueue = bank_wr_en & ~has_hit & (~full_now | do_drain_ready) & ~direct_write;
-                do_enqueue.fanout(hard<D + 3>{});
-                val<QC> q_count_next = select(do_enqueue,
-                                              val<QC>{count_after_pop + val<QC>{1}},
-                                              count_after_pop);
+                val<1> do_enqueue = bank_wr_en & ~has_hit & (~has_pending | pop_entry) & ~direct_write;
+                do_enqueue.fanout(hard<4>{});
+                val<1> clear_slot = pop_entry;
+                val<1> fill_slot = do_enqueue;
+                fill_slot.fanout(hard<4>{});
+                val<1> update_slot = has_hit;
+                update_slot.fanout(hard<2>{});
+                val<1> touch_meta = clear_slot | fill_slot;
+                val<1> touch_data = update_slot | fill_slot;
 
-                execute_if(pop_entry, [&](){
-                    q_head[b] = next_slot(bank_head);
+                execute_if(touch_meta, [&](){
+                    q_valid[b] = select(fill_slot, val<1>{1}, val<1>{0});
+                    q_addr[b] = select(fill_slot, addr, val<A>{q_addr[b]});
                 });
-                execute_if(do_enqueue, [&](){
-                    q_tail[b] = next_slot(bank_tail);
+                execute_if(touch_data, [&](){
+                    q_data[b] = select(fill_slot, data, resolved_hit_data);
                 });
-                execute_if(pop_entry | do_enqueue, [&](){
-                    q_count[b] = q_count_next;
-                });
-
-                for (u64 s = 0; s < D; s++) {
-                    const u64 idx = slot_index(b, s);
-                    val<1> is_head = bank_head == val<Q>{s};
-                    val<1> is_tail = bank_tail == val<Q>{s};
-                    val<1> clear_slot = pop_entry & is_head;
-                    val<1> fill_slot = do_enqueue & is_tail;
-                    fill_slot.fanout(hard<4>{});
-                    val<1> update_slot = hit_oh_split[s];
-                    update_slot.fanout(hard<2>{});
-                    val<1> touch_meta = clear_slot | fill_slot;
-                    val<1> touch_data = update_slot | fill_slot;
-
-                    execute_if(touch_meta, [&](){
-                        q_valid[idx] = select(fill_slot, val<1>{1}, val<1>{0});
-                        q_addr[idx] = select(fill_slot, addr, val<A>{q_addr[idx]});
-                    });
-                    execute_if(touch_data, [&](){
-                        val<N,T> slot_data_old = bank_data[s];
-                        val<N,T> slot_data_hit = select(bank_update_hit,
-                                                        update_ctr(slot_data_old, update_incr_en),
-                                                        data);
-                        q_data[idx] = select(fill_slot, data, slot_data_hit);
-                    });
-                }
             });
         }
     }
@@ -858,7 +764,7 @@ struct wb_rwram {
     val<1> full() const
     {
         arr<val<1>,B> bank_full = [&](u64 i) -> val<1> {
-            return val<QC>{q_count[i]} == val<QC>{D};
+            return val<1>{q_valid[i]};
         };
         return bank_full.fo1().fold_or();
     }
@@ -913,7 +819,7 @@ struct wb_rwram {
 
     u64 perf_total_read_pending_hit_depth(u64 depth) const
     {
-        return depth < D ? perf_read_pending_hit_depth[depth] : 0;
+        return depth == 0 ? perf_read_pending_hit_depth[0] : 0;
     }
 #endif
 };

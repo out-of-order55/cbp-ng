@@ -28,10 +28,6 @@
 #define MY_BP_V1_GHYST_HIT_UPDATE 0
 #endif
 
-#ifndef MY_BP_V1_GHYST_WB_DEPTH
-#define MY_BP_V1_GHYST_WB_DEPTH 1
-#endif
-
 #ifndef SC_GLOBAL_THRE_INIT
 #define SC_GLOBAL_THRE_INIT 23
 #endif
@@ -102,18 +98,17 @@ struct my_bp_v1 : predictor {
     static constexpr u64 TAGGATEBITS = 8;
     static constexpr u64 CTRGATEBITS = 3;
 #if MY_BP_V1_GHYST_USE_WB_RWRAM
-    static constexpr u64 GHYST_WB_DEPTH = MY_BP_V1_GHYST_WB_DEPTH;
   #if WB_RWRAM_DROP_OLDEST_ON_CONFLICT
     #if MY_BP_V1_GHYST_HIT_UPDATE
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_drop_oldest_hit_update";
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_drop_oldest_hit_update";
     #else
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_drop_oldest_hit_overwrite";
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_drop_oldest_hit_overwrite";
     #endif
   #else
     #if MY_BP_V1_GHYST_HIT_UPDATE
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_keep_oldest_hit_update";
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_keep_oldest_hit_update";
     #else
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_keep_oldest_hit_overwrite";
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_keep_oldest_hit_overwrite";
     #endif
   #endif
 #else
@@ -621,7 +616,7 @@ struct my_bp_v1 : predictor {
         u64 ghyst_write_hit_events = 0;
 #if MY_BP_V1_GHYST_USE_WB_RWRAM
         u64 ghyst_read_pending_hits = 0;
-        u64 ghyst_read_pending_depth[GHYST_WB_DEPTH] = {};
+        u64 ghyst_read_pending_depth1 = 0;
 #endif
         for (u64 j = 0; j < NUMG; j++) {
             ghyst_reads += ghyst[j].perf_total_reads();
@@ -631,9 +626,7 @@ struct my_bp_v1 : predictor {
             ghyst_write_hit_events += ghyst[j].perf_total_write_updates();
 #if MY_BP_V1_GHYST_USE_WB_RWRAM
             ghyst_read_pending_hits += ghyst[j].perf_total_read_pending_hits();
-            for (u64 depth = 0; depth < GHYST_WB_DEPTH; depth++) {
-                ghyst_read_pending_depth[depth] += ghyst[j].perf_total_read_pending_hit_depth(depth);
-            }
+            ghyst_read_pending_depth1 += ghyst[j].perf_total_read_pending_hit_depth(0);
 #endif
         }
         std::cerr << "\n┌─ GHyst RAM Statistics ──────────────────────────────────────────┐\n";
@@ -654,13 +647,10 @@ struct my_bp_v1 : predictor {
 #if MY_BP_V1_GHYST_USE_WB_RWRAM
         std::cerr << "│ Read Pending Hits:      " << std::setw(36) << std::left
                   << (std::to_string(ghyst_read_pending_hits) + (ghyst_reads ? " (" + std::to_string(100.0 * ghyst_read_pending_hits / ghyst_reads).substr(0,6) + "%)" : "")) << "│\n";
-        for (u64 depth = 0; depth < GHYST_WB_DEPTH; depth++) {
-            std::string label = "│ Pending Depth" + std::to_string(depth + 1) + ":";
-            std::cerr << label << std::setw(36 + (23 - label.size())) << std::left
-                      << (std::to_string(ghyst_read_pending_depth[depth]) +
-                          (ghyst_read_pending_hits ? " (" + std::to_string(100.0 * ghyst_read_pending_depth[depth] / ghyst_read_pending_hits).substr(0,6) + "%)" : ""))
-                      << "│\n";
-        }
+        std::cerr << "│ Pending Depth1:         " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_read_pending_depth1) +
+                      (ghyst_read_pending_hits ? " (" + std::to_string(100.0 * ghyst_read_pending_depth1 / ghyst_read_pending_hits).substr(0,6) + "%)" : ""))
+                  << "│\n";
 #endif
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
@@ -1138,7 +1128,7 @@ struct my_bp_v1 : predictor {
     // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
     ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
 #if MY_BP_V1_GHYST_USE_WB_RWRAM
-    wb_rwram<2,(1<<LOGG),4,GHYST_WB_DEPTH> ghyst[NUMG] {"ghyst"}; // hysteresis
+    wb_rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
 #else
     rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
 #endif
