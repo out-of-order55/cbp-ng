@@ -20,6 +20,18 @@
 #define SC_USE_GEHL
 #endif
 
+#ifndef MY_BP_V1_GHYST_USE_WB_RWRAM
+#define MY_BP_V1_GHYST_USE_WB_RWRAM 1
+#endif
+
+#ifndef MY_BP_V1_GHYST_HIT_UPDATE
+#define MY_BP_V1_GHYST_HIT_UPDATE 0
+#endif
+
+#ifndef MY_BP_V1_GHYST_WB_DEPTH
+#define MY_BP_V1_GHYST_WB_DEPTH 1
+#endif
+
 #ifndef SC_GLOBAL_THRE_INIT
 #define SC_GLOBAL_THRE_INIT 23
 #endif
@@ -89,6 +101,24 @@ struct my_bp_v1 : predictor {
     static constexpr u64 LOGGATEBITS = 5;
     static constexpr u64 TAGGATEBITS = 8;
     static constexpr u64 CTRGATEBITS = 3;
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
+    static constexpr u64 GHYST_WB_DEPTH = MY_BP_V1_GHYST_WB_DEPTH;
+  #if WB_RWRAM_DROP_OLDEST_ON_CONFLICT
+    #if MY_BP_V1_GHYST_HIT_UPDATE
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_drop_oldest_hit_update";
+    #else
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_drop_oldest_hit_overwrite";
+    #endif
+  #else
+    #if MY_BP_V1_GHYST_HIT_UPDATE
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_keep_oldest_hit_update";
+    #else
+    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_keep_oldest_hit_overwrite";
+    #endif
+  #endif
+#else
+    static constexpr const char *GHYST_IMPL_NAME = "rwram";
+#endif
 
 #ifdef USE_ALT
     static constexpr u64 METAPIPE = 2;
@@ -584,6 +614,56 @@ struct my_bp_v1 : predictor {
 #endif
         std::cerr << "└────────────────────────────────────────────────────────���──────┘\n";
 
+        u64 ghyst_reads = 0;
+        u64 ghyst_writes = 0;
+        u64 ghyst_stale_reads = 0;
+        u64 ghyst_drop_writes = 0;
+        u64 ghyst_write_hit_events = 0;
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
+        u64 ghyst_read_pending_hits = 0;
+        u64 ghyst_read_pending_depth[GHYST_WB_DEPTH] = {};
+#endif
+        for (u64 j = 0; j < NUMG; j++) {
+            ghyst_reads += ghyst[j].perf_total_reads();
+            ghyst_writes += ghyst[j].perf_total_writes();
+            ghyst_stale_reads += ghyst[j].perf_total_stale_reads();
+            ghyst_drop_writes += ghyst[j].perf_total_drop_writes();
+            ghyst_write_hit_events += ghyst[j].perf_total_write_updates();
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
+            ghyst_read_pending_hits += ghyst[j].perf_total_read_pending_hits();
+            for (u64 depth = 0; depth < GHYST_WB_DEPTH; depth++) {
+                ghyst_read_pending_depth[depth] += ghyst[j].perf_total_read_pending_hit_depth(depth);
+            }
+#endif
+        }
+        std::cerr << "\n┌─ GHyst RAM Statistics ──────────────────────────────────────────┐\n";
+        std::cerr << "│ Impl:                   " << std::setw(36) << std::left << GHYST_IMPL_NAME << "│\n";
+        std::cerr << "│ Reads/Writes:           " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_reads) + " / " + std::to_string(ghyst_writes)) << "│\n";
+        std::cerr << "│ Stale Reads:            " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_stale_reads) + (ghyst_reads ? " (" + std::to_string(100.0 * ghyst_stale_reads / ghyst_reads).substr(0,6) + "%)" : "")) << "│\n";
+        std::cerr << "│ Dropped Writes:         " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_drop_writes) + (ghyst_writes ? " (" + std::to_string(100.0 * ghyst_drop_writes / ghyst_writes).substr(0,6) + "%)" : "")) << "│\n";
+#if MY_BP_V1_GHYST_HIT_UPDATE
+        std::cerr << "│ Write Updates:          " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_write_hit_events) + (ghyst_writes ? " (" + std::to_string(100.0 * ghyst_write_hit_events / ghyst_writes).substr(0,6) + "%)" : "")) << "│\n";
+#else
+        std::cerr << "│ Write Hit Events:       " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_write_hit_events) + (ghyst_writes ? " (" + std::to_string(100.0 * ghyst_write_hit_events / ghyst_writes).substr(0,6) + "%)" : "")) << "│\n";
+#endif
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
+        std::cerr << "│ Read Pending Hits:      " << std::setw(36) << std::left
+                  << (std::to_string(ghyst_read_pending_hits) + (ghyst_reads ? " (" + std::to_string(100.0 * ghyst_read_pending_hits / ghyst_reads).substr(0,6) + "%)" : "")) << "│\n";
+        for (u64 depth = 0; depth < GHYST_WB_DEPTH; depth++) {
+            std::string label = "│ Pending Depth" + std::to_string(depth + 1) + ":";
+            std::cerr << label << std::setw(36 + (23 - label.size())) << std::left
+                      << (std::to_string(ghyst_read_pending_depth[depth]) +
+                          (ghyst_read_pending_hits ? " (" + std::to_string(100.0 * ghyst_read_pending_depth[depth] / ghyst_read_pending_hits).substr(0,6) + "%)" : ""))
+                      << "│\n";
+        }
+#endif
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+
         // Allocation failures
         std::cerr << "\n┌─ Allocation Statistics ─────────────────────────────────────────┐\n";
         std::cerr << "│ Allocation Failures: " << std::setw(41) << std::left
@@ -1019,7 +1099,7 @@ struct my_bp_v1 : predictor {
     //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
     arr<reg<TOTAL_THREBITS>,LINEINST> threshold;
 #ifdef SC_USE_BIAS
-    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGBIAS-LOGLINEINST-2)),4> bias_pc[4] {"Bias pc"};
+    ram<arr<val<PERCWIDTH,i64>,4>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[LINEINST] {"Bias pc"};
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_bank_map[4];
     arr<reg<PERCWIDTH,i64>,4> bias_lmap;
     arr<reg<PERCWIDTH,i64>,LINEINST> bias_map;
@@ -1033,12 +1113,12 @@ struct my_bp_v1 : predictor {
     arr<reg<TOTAL_THREBITS,i64>,LINEINST> sc_sum;
 #ifdef SC_USE_GEHL
     arr<reg<LOGGEHL-LOGLINEINST>,NUMGEHL> gehl_idx;
-    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGGEHL-LOGLINEINST)),4> gehl[NUMGEHL] {"GEHL"};
+    ram<val<PERCWIDTH,i64>,(1<<(LOGGEHL-LOGLINEINST))> gehl[NUMGEHL][LINEINST] {"GEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> gehl_map[NUMGEHL];
 #endif
 #ifdef SC_FGEHL
     reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
-    wb_mask_ram<PERCWIDTH,LINEINST,(1<<(LOGFGEHL-LOGLINEINST)),4> fgehl {"FGEHL"};
+    ram<val<PERCWIDTH,i64>,(1<<(LOGFGEHL-LOGLINEINST))> fgehl[LINEINST] {"FGEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
     reg<FHIST_BITS> fhist;
 #endif
@@ -1057,7 +1137,11 @@ struct my_bp_v1 : predictor {
     ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
     // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
     ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
-    wb_rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
+    wb_rwram<2,(1<<LOGG),4,GHYST_WB_DEPTH> ghyst[NUMG] {"ghyst"}; // hysteresis
+#else
+    rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
+#endif
 
     rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
     zone UPDATE_ONLY;
@@ -1322,20 +1406,16 @@ struct my_bp_v1 : predictor {
         // bias
 #ifdef SC_USE_BIAS
         val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB+2);
-        bias_pc_high_index.fanout(hard<5>{});
-        for (u64 bank = 0; bank < 4; bank++) {
-            bias_bank_map[bank] = bias_pc[bank].read(bias_pc_high_index);
-            bias_bank_map[bank].fanout(hard<2>{});
-        }
+        bias_pc_high_index.fanout(hard<(LINEINST+1)>{});
         bias_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            arr<val<PERCWIDTH,i64>,4> bank_out = bias_pc[offset].read(bias_pc_high_index);
+            for (u64 bank = 0; bank < 4; bank++) {
+                bias_bank_map[bank][offset] = bank_out[bank];
+            }
             val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
             val<1> prov_pred = pred1[offset] & prov_hit;
             val<1> is_prov_weak =  prov_weak[offset];
             tage_info[offset] = concat(prov_pred,is_prov_weak);
-            arr<val<PERCWIDTH,i64>,4> bank_out = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                return val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
-            }};
-            
             val<PERCWIDTH,i64> result = bank_out.select(tage_info[offset]);
             return result;
         }};
@@ -1354,7 +1434,9 @@ struct my_bp_v1 : predictor {
             val<LOGGEHL-LOGLINEINST> idx = gehl_base_index ^ val<LOGGEHL-LOGLINEINST>{gfolds.template get<0>(k+1)};
             idx.fanout(hard<LINEINST+1>{});
             gehl_idx[k] = idx;
-            gehl_map[k] = gehl[k].read(idx);
+            gehl_map[k] = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+                return gehl[k][offset].read(idx);
+            }};
             gehl_map[k].fanout(hard<2>{});
         }
 #endif
@@ -1362,9 +1444,11 @@ struct my_bp_v1 : predictor {
         val<LOGFGEHL-LOGLINEINST> fgehl_base_index = inst_pc >> LOGLB;
         val<FHIST_BITS> fh_mix = val<FHIST_BITS>{fhist} ^ (val<FHIST_BITS>{fhist} >> hard<13>{}) ^ (val<FHIST_BITS>{fhist} >> hard<29>{});
         val<LOGFGEHL-LOGLINEINST> fidx = fgehl_base_index ^ val<LOGFGEHL-LOGLINEINST>{fh_mix};
-        fidx.fanout(hard<2>{});
+        fidx.fanout(hard<LINEINST+1>{});
         fgehl_idx = fidx;
-        fgehl_map = fgehl.read(fidx);
+        fgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            return fgehl[offset].read(fidx);
+        }};
         fgehl_map.fanout(hard<2>{});
 #endif
 #ifdef DEBUG_ENERGY
@@ -1520,7 +1604,9 @@ struct my_bp_v1 : predictor {
         // updates for all conditional branches in the predicted block
         if (num_branch == 0) {
             for (u64 i=0; i<NUMG; i++) {
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
                 ghyst[i].write(gindex[i],val<2>{0},val<1>{0},gindex[i],val<1>{1},val<1>{0});
+#endif
             }
             // no conditional branch in this block
             val<1> line_end = block_entry >> (LINEINST-block_size);
@@ -1761,16 +1847,7 @@ struct my_bp_v1 : predictor {
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
         }}.fold_or();
 
-        arr<val<1>,4> bias_uragent = [&](u64 bank){
-            return bias_pc[bank].drain_urgent();
-        };
-        arr<val<1>,2> global_uragent = [&](u64 tb){
-            return gehl[tb].drain_urgent();
-        };
-        val<1> wb_force_extra = fgehl.drain_urgent() | bias_uragent.fold_or() | global_uragent.fold_or();
-        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | wb_force_extra;
-#else
-        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) ;
+        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | sc_need_update;
 #endif
 
         extra_cycle.fanout(hard<NUMG*2+8>{});
@@ -1896,8 +1973,17 @@ struct my_bp_v1 : predictor {
             // if allocated entry, set hysteresis to 0;
             // otherwise, increment hysteresis if correct pred, decrement if incorrect
             val<2> newhyst = select(allocate[i],val<2>{0},update_ctr(readh[i],~badpred1[i]));
+#if MY_BP_V1_GHYST_USE_WB_RWRAM
+  #if MY_BP_V1_GHYST_HIT_UPDATE
+            ghyst[i].write_update(gindex[i], newhyst.fo1(), do_ghyst_write,
+                                  primary[i] & ~allocate[i], ~badpred1[i],
+                                  gindex[i], ~extra_cycle, extra_cycle);
+  #else
             ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,gindex[i],~extra_cycle,extra_cycle);
-
+  #endif
+#else
+            ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,extra_cycle);
+#endif
         }
 
 #ifdef RESET_UBITS
@@ -2022,63 +2108,61 @@ struct my_bp_v1 : predictor {
 
         //per-offset updates: bias_pc and thre1 (no write conflicts)
         for (u64 offset = 0; offset < LINEINST; offset++) {
+#ifdef SC_USE_BIAS
+            val<LOGBIAS-LOGLINEINST-2> high_idx = bias_high_idx;
+            val<2> write_tage_info = tage_info[offset];
+#endif
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
             val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, sc_wrong_arr[offset]);
 #if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL)
             [[maybe_unused]] val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
 #endif
+#ifdef SC_USE_BIAS
+            write_tage_info.fanout(hard<4>{});
+            high_idx.fanout(hard<4>{});
+            execute_if(sc_update_en, [&](){
+                arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
+                    val<PERCWIDTH,i64> old_lane = val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
+                    val<PERCWIDTH,i64> new_lane = update_ctr(old_lane, branch_taken[offset]);
+                    return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
+                }};
+                bias_pc[offset].write(high_idx, new_bias_vec);
+            });
+#endif
+#ifdef SC_USE_GEHL
+            for (u64 k = 0; k < NUMGEHL; k++) {
+                val<LOGGEHL-LOGLINEINST> gehl_write_idx = gehl_idx[k];
+                val<PERCWIDTH,i64> old_gehl = gehl_map[k][offset];
+                gehl_write_idx.fanout(hard<2>{});
+                old_gehl.fanout(hard<2>{});
+                execute_if(sc_update_en, [&](){
+                    gehl[k][offset].write(gehl_write_idx, update_ctr(old_gehl, branch_taken[offset]));
+                });
+            }
+#endif
+#ifdef SC_FGEHL
+            val<LOGFGEHL-LOGLINEINST> fgehl_write_idx = fgehl_idx;
+            val<PERCWIDTH,i64> old_fgehl = fgehl_map[offset];
+            fgehl_write_idx.fanout(hard<2>{});
+            old_fgehl.fanout(hard<2>{});
+            execute_if(sc_update_en, [&](){
+                fgehl[offset].write(fgehl_write_idx, update_ctr(old_fgehl, branch_taken[offset]));
+            });
+#endif
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
 #ifdef DEBUG_ENERGY
         energy_mark("UpdateSCThre1");
-#endif
 #ifdef SC_USE_BIAS
-        arr<val<1>,LINEINST> bias_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
-        }};
-        val<LINEINST> bias_taken_mask = branch_taken.concat();
-        bias_taken_mask.fanout(hard<4>{});
-        for (u64 bank = 0; bank < 4; bank++) {
-            val<2> bank_sel = val<2>{bank};
-            arr<val<1>,LINEINST> bias_bank_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-                return bias_update_arr[offset] & (val<2>{tage_info[offset]} == bank_sel);
-            }};
-            val<LINEINST> bias_wmask = bias_bank_update_arr.concat();
-            bias_wmask.fanout(hard<2>{});
-            val<1> bias_update_any = bias_wmask != val<LINEINST>{0};
-            bias_pc[bank].write(bias_high_idx, bias_bank_map[bank], bias_wmask, bias_taken_mask, bias_update_any, extra_cycle);
-        }
-#endif
-#ifdef DEBUG_ENERGY
         energy_mark("UpdateSCBias");
 #endif
 #ifdef SC_USE_GEHL
-        arr<val<1>,LINEINST> gehl_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
-        }};
-        val<LINEINST> gehl_wmask = gehl_update_arr.concat();
-        gehl_wmask.fanout(hard<2>{});
-        val<LINEINST> gehl_taken_mask = branch_taken.concat();
-        val<1> gehl_update_any = gehl_wmask != val<LINEINST>{0};
-        for (u64 k = 0; k < NUMGEHL; k++) {
-            gehl[k].write(gehl_idx[k], gehl_map[k], gehl_wmask, gehl_taken_mask, gehl_update_any, extra_cycle);
-        }
-#endif
-#ifdef DEBUG_ENERGY
         energy_mark("UpdateSCGehl");
 #endif
 #ifdef SC_FGEHL
-        arr<val<1>,LINEINST> fgehl_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
-        }};
-        val<LINEINST> fgehl_wmask = fgehl_update_arr.concat();
-        val<LINEINST> fgehl_taken_mask = branch_taken.concat();
-        val<1> fgehl_update_any = fgehl_wmask != val<LINEINST>{0};
-        fgehl.write(fgehl_idx, fgehl_map, fgehl_wmask, fgehl_taken_mask, fgehl_update_any, extra_cycle);
-#endif
-#endif
-#ifdef DEBUG_ENERGY
         energy_mark("UpdateSCFgehl");
+#endif
+#endif
 #endif
 
 #ifdef CHEATING_MODE
