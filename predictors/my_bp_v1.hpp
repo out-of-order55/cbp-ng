@@ -4,7 +4,9 @@
 #define RESET_UBITS
 
 // #define GATE
+#ifndef MY_BP_V1_DISABLE_SC
 #define MY_SC
+#endif
 
 #if (defined(SC_CFG_BASE) + defined(SC_CFG_MEDIUM) + defined(SC_CFG_FULL)) > 1
 #error "Select at most one of SC_CFG_BASE, SC_CFG_MEDIUM, SC_CFG_FULL"
@@ -149,6 +151,10 @@ struct my_bp_v1 : predictor {
     static_assert(TAGW > LOGLINEINST); // the unhashed line offset is part of the tag
 
     static constexpr u64 HTAGBITS = TAGW-LOGLINEINST; // hashed tag bits
+    static_assert(NUMG == 14);
+    static constexpr u64 NUMP = NUMG / 2;
+    static constexpr u64 NUMG_GROUP = NUMP;
+    static constexpr u64 LOGG_SH = LOGG;
 
 
     geometric_folds<NUMG,MINHIST,GHIST,LOGG,HTAGBITS> gfolds;
@@ -181,6 +187,12 @@ struct my_bp_v1 : predictor {
     reg<bindex_bits> bindex; // bimodal table index
     arr<reg<LOGG>,NUMG> gindex; // global tables indexes
     arr<reg<HTAGBITS>,NUMG> htag; // computed hashed tags
+    arr<reg<LOGG_SH>,NUMG_GROUP> group_row_idx; // grouped indexes (adjacent tables share row index)
+    arr<reg<1>,3> share_route_bit; // routing bits for (G0,G4),(G1,G5),(G2,G6)
+    arr<reg<TAGW>,2> snap_tag[NUMG_GROUP]; // prediction-time snapshots, used by update RMW
+    arr<reg<1>,2> snap_pred[NUMG_GROUP];
+    arr<reg<2>,2> snap_hyst[NUMG_GROUP];
+    arr<reg<1>,2> snap_u[NUMG_GROUP];
     arr<reg<1>,LINEINST> readb; // read bimodal prediction bit for each offset
     arr<reg<TAGW>,NUMG> readt; // read tags
     arr<reg<1>,NUMG> readc; // read predictions
@@ -419,12 +431,12 @@ struct my_bp_v1 : predictor {
         u64 ghyst_stale_reads = 0;
         u64 ghyst_drop_writes = 0;
         u64 ghyst_write_hit_events = 0;
-        for (u64 j = 0; j < NUMG; j++) {
-            ghyst_reads += ghyst[j].perf_total_reads();
-            ghyst_writes += ghyst[j].perf_total_writes();
-            ghyst_stale_reads += ghyst[j].perf_total_stale_reads();
-            ghyst_drop_writes += ghyst[j].perf_total_drop_writes();
-            ghyst_write_hit_events += ghyst[j].perf_total_write_updates();
+        for (u64 j = 0; j < NUMP; j++) {
+            ghyst_reads += ghyst_p[j].perf_total_reads();
+            ghyst_writes += ghyst_p[j].perf_total_writes();
+            ghyst_stale_reads += ghyst_p[j].perf_total_stale_reads();
+            ghyst_drop_writes += ghyst_p[j].perf_total_drop_writes();
+            ghyst_write_hit_events += ghyst_p[j].perf_total_write_updates();
         }
 
         std::array<std::uint64_t, NUMG> hist_len = {};
@@ -924,12 +936,10 @@ struct my_bp_v1 : predictor {
     // Put TAGE tables in a dedicated cluster.
     zone TAGE_CLUSTER;
     // P2 (TAGE)
-    ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
-    // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
-    ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
-    rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
-
-    rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
+    ram<arr<val<TAGW>,2>,(1<<LOGG_SH)> gtag_p[NUMP] {"tags"}; // tags (2-slot row)
+    ram<arr<val<1>,2>,(1<<LOGG_SH)> gpred_p[NUMP] {"gpred"}; // predictions (2-slot row)
+    rwram<4,(1<<LOGG_SH),4> ghyst_p[NUMP] {"ghyst"}; // packed hysteresis row: {slot1,slot0}
+    rwram<2,(1<<LOGG_SH),4> ubit_p[NUMP] {"u"}; // packed u-bit row: {slot1,slot0}
     zone UPDATE_ONLY;
     ram<val<1>,(1<<index1_bits)> table1_hyst[LINEINST] {"P1 hyst"}; // P1 hysteresis
     ram<val<1>,(1<<bindex_bits)> bhyst[LINEINST] {"bhyst"}; // bimodal hysteresis
@@ -1035,6 +1045,397 @@ struct my_bp_v1 : predictor {
         gating = ((read_tag == tag) & (read_gate_ctr == val<CTRGATEBITS>{7}));
     };
 #endif
+    void read_tag_pred_physical(
+        val<LOGG_SH> p0_row,
+        val<LOGG_SH> p1_row,
+        val<LOGG_SH> p2_row,
+        val<LOGG_SH> p3_row,
+        val<LOGG_SH> p4_row,
+        val<LOGG_SH> p5_row,
+        val<LOGG_SH> p6_row,
+        val<1> s0,
+        val<1> s1,
+        val<1> s2)
+    {
+        p0_row.fanout(hard<2>{});
+        p1_row.fanout(hard<2>{});
+        p2_row.fanout(hard<2>{});
+        p3_row.fanout(hard<2>{});
+        p4_row.fanout(hard<2>{});
+        p5_row.fanout(hard<2>{});
+        p6_row.fanout(hard<2>{});
+        s0.fanout(hard<8>{});
+        s1.fanout(hard<8>{});
+        s2.fanout(hard<8>{});
+
+        arr<val<TAGW>,2> tag_p0 = gtag_p[0].read(p0_row);
+        arr<val<TAGW>,2> tag_p1 = gtag_p[1].read(p1_row);
+        arr<val<TAGW>,2> tag_p2 = gtag_p[2].read(p2_row);
+        arr<val<TAGW>,2> tag_p3 = gtag_p[3].read(p3_row);
+        arr<val<TAGW>,2> tag_p4 = gtag_p[4].read(p4_row);
+        arr<val<TAGW>,2> tag_p5 = gtag_p[5].read(p5_row);
+        arr<val<TAGW>,2> tag_p6 = gtag_p[6].read(p6_row);
+
+        arr<val<1>,2> pred_p0 = gpred_p[0].read(p0_row);
+        arr<val<1>,2> pred_p1 = gpred_p[1].read(p1_row);
+        arr<val<1>,2> pred_p2 = gpred_p[2].read(p2_row);
+        arr<val<1>,2> pred_p3 = gpred_p[3].read(p3_row);
+        arr<val<1>,2> pred_p4 = gpred_p[4].read(p4_row);
+        arr<val<1>,2> pred_p5 = gpred_p[5].read(p5_row);
+        arr<val<1>,2> pred_p6 = gpred_p[6].read(p6_row);
+
+        val<4> hyst_p0 = ghyst_p[0].read(p0_row);
+        val<4> hyst_p1 = ghyst_p[1].read(p1_row);
+        val<4> hyst_p2 = ghyst_p[2].read(p2_row);
+        val<4> hyst_p3 = ghyst_p[3].read(p3_row);
+        val<4> hyst_p4 = ghyst_p[4].read(p4_row);
+        val<4> hyst_p5 = ghyst_p[5].read(p5_row);
+        val<4> hyst_p6 = ghyst_p[6].read(p6_row);
+
+        val<2> u_p0 = ubit_p[0].read(p0_row);
+        val<2> u_p1 = ubit_p[1].read(p1_row);
+        val<2> u_p2 = ubit_p[2].read(p2_row);
+        val<2> u_p3 = ubit_p[3].read(p3_row);
+        val<2> u_p4 = ubit_p[4].read(p4_row);
+        val<2> u_p5 = ubit_p[5].read(p5_row);
+        val<2> u_p6 = ubit_p[6].read(p6_row);
+
+        arr<val<2>,2> h2_p0 = {val<2>{hyst_p0}, val<2>{hyst_p0 >> 2}};
+        arr<val<2>,2> h2_p1 = {val<2>{hyst_p1}, val<2>{hyst_p1 >> 2}};
+        arr<val<2>,2> h2_p2 = {val<2>{hyst_p2}, val<2>{hyst_p2 >> 2}};
+        arr<val<2>,2> h2_p3 = {val<2>{hyst_p3}, val<2>{hyst_p3 >> 2}};
+        arr<val<2>,2> h2_p4 = {val<2>{hyst_p4}, val<2>{hyst_p4 >> 2}};
+        arr<val<2>,2> h2_p5 = {val<2>{hyst_p5}, val<2>{hyst_p5 >> 2}};
+        arr<val<2>,2> h2_p6 = {val<2>{hyst_p6}, val<2>{hyst_p6 >> 2}};
+
+        arr<val<1>,2> u2_p0 = {val<1>{u_p0}, val<1>{u_p0 >> 1}};
+        arr<val<1>,2> u2_p1 = {val<1>{u_p1}, val<1>{u_p1 >> 1}};
+        arr<val<1>,2> u2_p2 = {val<1>{u_p2}, val<1>{u_p2 >> 1}};
+        arr<val<1>,2> u2_p3 = {val<1>{u_p3}, val<1>{u_p3 >> 1}};
+        arr<val<1>,2> u2_p4 = {val<1>{u_p4}, val<1>{u_p4 >> 1}};
+        arr<val<1>,2> u2_p5 = {val<1>{u_p5}, val<1>{u_p5 >> 1}};
+        arr<val<1>,2> u2_p6 = {val<1>{u_p6}, val<1>{u_p6 >> 1}};
+
+        snap_tag[0][0] = select(s0, tag_p4[0], tag_p0[0]);
+        snap_tag[0][1] = select(s0, tag_p4[1], tag_p0[1]);
+        snap_tag[1][0] = select(s1, tag_p5[0], tag_p1[0]);
+        snap_tag[1][1] = select(s1, tag_p5[1], tag_p1[1]);
+        snap_tag[2][0] = select(s2, tag_p6[0], tag_p2[0]);
+        snap_tag[2][1] = select(s2, tag_p6[1], tag_p2[1]);
+        snap_tag[3][0] = tag_p3[0];
+        snap_tag[3][1] = tag_p3[1];
+        snap_tag[4][0] = select(s0, tag_p0[0], tag_p4[0]);
+        snap_tag[4][1] = select(s0, tag_p0[1], tag_p4[1]);
+        snap_tag[5][0] = select(s1, tag_p1[0], tag_p5[0]);
+        snap_tag[5][1] = select(s1, tag_p1[1], tag_p5[1]);
+        snap_tag[6][0] = select(s2, tag_p2[0], tag_p6[0]);
+        snap_tag[6][1] = select(s2, tag_p2[1], tag_p6[1]);
+
+        snap_pred[0][0] = select(s0, pred_p4[0], pred_p0[0]);
+        snap_pred[0][1] = select(s0, pred_p4[1], pred_p0[1]);
+        snap_pred[1][0] = select(s1, pred_p5[0], pred_p1[0]);
+        snap_pred[1][1] = select(s1, pred_p5[1], pred_p1[1]);
+        snap_pred[2][0] = select(s2, pred_p6[0], pred_p2[0]);
+        snap_pred[2][1] = select(s2, pred_p6[1], pred_p2[1]);
+        snap_pred[3][0] = pred_p3[0];
+        snap_pred[3][1] = pred_p3[1];
+        snap_pred[4][0] = select(s0, pred_p0[0], pred_p4[0]);
+        snap_pred[4][1] = select(s0, pred_p0[1], pred_p4[1]);
+        snap_pred[5][0] = select(s1, pred_p1[0], pred_p5[0]);
+        snap_pred[5][1] = select(s1, pred_p1[1], pred_p5[1]);
+        snap_pred[6][0] = select(s2, pred_p2[0], pred_p6[0]);
+        snap_pred[6][1] = select(s2, pred_p2[1], pred_p6[1]);
+
+        snap_hyst[0][0] = select(s0, h2_p4[0], h2_p0[0]);
+        snap_hyst[0][1] = select(s0, h2_p4[1], h2_p0[1]);
+        snap_hyst[1][0] = select(s1, h2_p5[0], h2_p1[0]);
+        snap_hyst[1][1] = select(s1, h2_p5[1], h2_p1[1]);
+        snap_hyst[2][0] = select(s2, h2_p6[0], h2_p2[0]);
+        snap_hyst[2][1] = select(s2, h2_p6[1], h2_p2[1]);
+        snap_hyst[3][0] = h2_p3[0];
+        snap_hyst[3][1] = h2_p3[1];
+        snap_hyst[4][0] = select(s0, h2_p0[0], h2_p4[0]);
+        snap_hyst[4][1] = select(s0, h2_p0[1], h2_p4[1]);
+        snap_hyst[5][0] = select(s1, h2_p1[0], h2_p5[0]);
+        snap_hyst[5][1] = select(s1, h2_p1[1], h2_p5[1]);
+        snap_hyst[6][0] = select(s2, h2_p2[0], h2_p6[0]);
+        snap_hyst[6][1] = select(s2, h2_p2[1], h2_p6[1]);
+
+        snap_u[0][0] = select(s0, u2_p4[0], u2_p0[0]);
+        snap_u[0][1] = select(s0, u2_p4[1], u2_p0[1]);
+        snap_u[1][0] = select(s1, u2_p5[0], u2_p1[0]);
+        snap_u[1][1] = select(s1, u2_p5[1], u2_p1[1]);
+        snap_u[2][0] = select(s2, u2_p6[0], u2_p2[0]);
+        snap_u[2][1] = select(s2, u2_p6[1], u2_p2[1]);
+        snap_u[3][0] = u2_p3[0];
+        snap_u[3][1] = u2_p3[1];
+        snap_u[4][0] = select(s0, u2_p0[0], u2_p4[0]);
+        snap_u[4][1] = select(s0, u2_p0[1], u2_p4[1]);
+        snap_u[5][0] = select(s1, u2_p1[0], u2_p5[0]);
+        snap_u[5][1] = select(s1, u2_p1[1], u2_p5[1]);
+        snap_u[6][0] = select(s2, u2_p2[0], u2_p6[0]);
+        snap_u[6][1] = select(s2, u2_p2[1], u2_p6[1]);
+
+        for (u64 g=0; g<NUMG_GROUP; g++) {
+            readt[2*g] = snap_tag[g][0];
+            readt[2*g+1] = snap_tag[g][1];
+            readc[2*g] = snap_pred[g][0];
+            readc[2*g+1] = snap_pred[g][1];
+            readh[2*g] = snap_hyst[g][0];
+            readh[2*g+1] = snap_hyst[g][1];
+            readu[2*g] = snap_u[g][0];
+            readu[2*g+1] = snap_u[g][1];
+        }
+    }
+
+    void write_tag_physical(
+        arr<val<1>,NUMG_GROUP> &tag_we,
+        arr<val<TAGW>,NUMG_GROUP> &tag_row0,
+        arr<val<TAGW>,NUMG_GROUP> &tag_row1,
+        val<1> upd_s0, val<1> upd_s1, val<1> upd_s2)
+    {
+        auto make_tag_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> arr<val<TAGW>,2> {
+            return arr<val<TAGW>,2>{[&](u64 slot) -> val<TAGW> {
+                val<TAGW> a = (slot == 0) ? tag_row0[g_sel0] : tag_row1[g_sel0];
+                val<TAGW> b = (slot == 0) ? tag_row0[g_sel1] : tag_row1[g_sel1];
+                return select(pick0, a, b);
+            }};
+        };
+
+        val<1> tag_p0_a = tag_we[0] & ~upd_s0;
+        val<1> tag_p0_b = tag_we[4] &  upd_s0;
+        val<1> tag_p0_we = tag_p0_a | tag_p0_b;
+        val<LOGG_SH> tag_p0_addr = select(tag_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        arr<val<TAGW>,2> tag_p0_row = make_tag_row(0, 4, tag_p0_a);
+        execute_if(tag_p0_we, [&](){ gtag_p[0].write(tag_p0_addr, tag_p0_row); });
+
+        val<1> tag_p4_a = tag_we[0] &  upd_s0;
+        val<1> tag_p4_b = tag_we[4] & ~upd_s0;
+        val<1> tag_p4_we = tag_p4_a | tag_p4_b;
+        val<LOGG_SH> tag_p4_addr = select(tag_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        arr<val<TAGW>,2> tag_p4_row = make_tag_row(0, 4, tag_p4_a);
+        execute_if(tag_p4_we, [&](){ gtag_p[4].write(tag_p4_addr, tag_p4_row); });
+
+        val<1> tag_p1_a = tag_we[1] & ~upd_s1;
+        val<1> tag_p1_b = tag_we[5] &  upd_s1;
+        val<1> tag_p1_we = tag_p1_a | tag_p1_b;
+        val<LOGG_SH> tag_p1_addr = select(tag_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        arr<val<TAGW>,2> tag_p1_row = make_tag_row(1, 5, tag_p1_a);
+        execute_if(tag_p1_we, [&](){ gtag_p[1].write(tag_p1_addr, tag_p1_row); });
+
+        val<1> tag_p5_a = tag_we[1] &  upd_s1;
+        val<1> tag_p5_b = tag_we[5] & ~upd_s1;
+        val<1> tag_p5_we = tag_p5_a | tag_p5_b;
+        val<LOGG_SH> tag_p5_addr = select(tag_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        arr<val<TAGW>,2> tag_p5_row = make_tag_row(1, 5, tag_p5_a);
+        execute_if(tag_p5_we, [&](){ gtag_p[5].write(tag_p5_addr, tag_p5_row); });
+
+        val<1> tag_p2_a = tag_we[2] & ~upd_s2;
+        val<1> tag_p2_b = tag_we[6] &  upd_s2;
+        val<1> tag_p2_we = tag_p2_a | tag_p2_b;
+        val<LOGG_SH> tag_p2_addr = select(tag_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        arr<val<TAGW>,2> tag_p2_row = make_tag_row(2, 6, tag_p2_a);
+        execute_if(tag_p2_we, [&](){ gtag_p[2].write(tag_p2_addr, tag_p2_row); });
+
+        val<1> tag_p6_a = tag_we[2] &  upd_s2;
+        val<1> tag_p6_b = tag_we[6] & ~upd_s2;
+        val<1> tag_p6_we = tag_p6_a | tag_p6_b;
+        val<LOGG_SH> tag_p6_addr = select(tag_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        arr<val<TAGW>,2> tag_p6_row = make_tag_row(2, 6, tag_p6_a);
+        execute_if(tag_p6_we, [&](){ gtag_p[6].write(tag_p6_addr, tag_p6_row); });
+
+        val<1> tag_p3_we = tag_we[3];
+        arr<val<TAGW>,2> tag_p3_row = arr<val<TAGW>,2>{[&](u64 slot) -> val<TAGW> {
+            return (slot == 0) ? tag_row0[3] : tag_row1[3];
+        }};
+        execute_if(tag_p3_we, [&](){ gtag_p[3].write(group_row_idx[3], tag_p3_row); });
+    }
+
+    void write_pred_physical(
+        arr<val<1>,NUMG_GROUP> &pred_we,
+        arr<val<1>,NUMG_GROUP> &pred_row0,
+        arr<val<1>,NUMG_GROUP> &pred_row1,
+        val<1> upd_s0, val<1> upd_s1, val<1> upd_s2)
+    {
+        auto make_pred_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> arr<val<1>,2> {
+            return arr<val<1>,2>{[&](u64 slot) -> val<1> {
+                val<1> a = (slot == 0) ? pred_row0[g_sel0] : pred_row1[g_sel0];
+                val<1> b = (slot == 0) ? pred_row0[g_sel1] : pred_row1[g_sel1];
+                return select(pick0, a, b);
+            }};
+        };
+
+        val<1> pred_p0_a = pred_we[0] & ~upd_s0;
+        val<1> pred_p0_b = pred_we[4] &  upd_s0;
+        val<1> pred_p0_we = pred_p0_a | pred_p0_b;
+        val<LOGG_SH> pred_p0_addr = select(pred_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        arr<val<1>,2> pred_p0_row = make_pred_row(0, 4, pred_p0_a);
+        execute_if(pred_p0_we, [&](){ gpred_p[0].write(pred_p0_addr, pred_p0_row); });
+
+        val<1> pred_p4_a = pred_we[0] &  upd_s0;
+        val<1> pred_p4_b = pred_we[4] & ~upd_s0;
+        val<1> pred_p4_we = pred_p4_a | pred_p4_b;
+        val<LOGG_SH> pred_p4_addr = select(pred_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        arr<val<1>,2> pred_p4_row = make_pred_row(0, 4, pred_p4_a);
+        execute_if(pred_p4_we, [&](){ gpred_p[4].write(pred_p4_addr, pred_p4_row); });
+
+        val<1> pred_p1_a = pred_we[1] & ~upd_s1;
+        val<1> pred_p1_b = pred_we[5] &  upd_s1;
+        val<1> pred_p1_we = pred_p1_a | pred_p1_b;
+        val<LOGG_SH> pred_p1_addr = select(pred_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        arr<val<1>,2> pred_p1_row = make_pred_row(1, 5, pred_p1_a);
+        execute_if(pred_p1_we, [&](){ gpred_p[1].write(pred_p1_addr, pred_p1_row); });
+
+        val<1> pred_p5_a = pred_we[1] &  upd_s1;
+        val<1> pred_p5_b = pred_we[5] & ~upd_s1;
+        val<1> pred_p5_we = pred_p5_a | pred_p5_b;
+        val<LOGG_SH> pred_p5_addr = select(pred_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        arr<val<1>,2> pred_p5_row = make_pred_row(1, 5, pred_p5_a);
+        execute_if(pred_p5_we, [&](){ gpred_p[5].write(pred_p5_addr, pred_p5_row); });
+
+        val<1> pred_p2_a = pred_we[2] & ~upd_s2;
+        val<1> pred_p2_b = pred_we[6] &  upd_s2;
+        val<1> pred_p2_we = pred_p2_a | pred_p2_b;
+        val<LOGG_SH> pred_p2_addr = select(pred_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        arr<val<1>,2> pred_p2_row = make_pred_row(2, 6, pred_p2_a);
+        execute_if(pred_p2_we, [&](){ gpred_p[2].write(pred_p2_addr, pred_p2_row); });
+
+        val<1> pred_p6_a = pred_we[2] &  upd_s2;
+        val<1> pred_p6_b = pred_we[6] & ~upd_s2;
+        val<1> pred_p6_we = pred_p6_a | pred_p6_b;
+        val<LOGG_SH> pred_p6_addr = select(pred_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        arr<val<1>,2> pred_p6_row = make_pred_row(2, 6, pred_p6_a);
+        execute_if(pred_p6_we, [&](){ gpred_p[6].write(pred_p6_addr, pred_p6_row); });
+
+        val<1> pred_p3_we = pred_we[3];
+        arr<val<1>,2> pred_p3_row = arr<val<1>,2>{[&](u64 slot) -> val<1> {
+            return (slot == 0) ? pred_row0[3] : pred_row1[3];
+        }};
+        execute_if(pred_p3_we, [&](){ gpred_p[3].write(group_row_idx[3], pred_p3_row); });
+    }
+
+    void write_hyst_physical(
+        arr<val<1>,NUMG_GROUP> &hyst_we,
+        arr<val<2>,NUMG_GROUP> &hyst_row0,
+        arr<val<2>,NUMG_GROUP> &hyst_row1,
+        val<1> upd_s0, val<1> upd_s1, val<1> upd_s2,
+        val<1> noconflict)
+    {
+        noconflict.fanout(hard<NUMP + 1>{});
+        auto make_hyst_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> val<4> {
+            val<2> lo = select(pick0, hyst_row0[g_sel0], hyst_row0[g_sel1]);
+            val<2> hi = select(pick0, hyst_row1[g_sel0], hyst_row1[g_sel1]);
+            return concat(hi, lo);
+        };
+
+        val<1> h_p0_a = hyst_we[0] & ~upd_s0;
+        val<1> h_p0_b = hyst_we[4] &  upd_s0;
+        val<1> h_p0_we = h_p0_a | h_p0_b;
+        val<LOGG_SH> h_p0_addr = select(h_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        val<4> h_p0_row = make_hyst_row(0, 4, h_p0_a);
+        ghyst_p[0].write(h_p0_addr, h_p0_row, h_p0_we, noconflict);
+
+        val<1> h_p4_a = hyst_we[0] &  upd_s0;
+        val<1> h_p4_b = hyst_we[4] & ~upd_s0;
+        val<1> h_p4_we = h_p4_a | h_p4_b;
+        val<LOGG_SH> h_p4_addr = select(h_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        val<4> h_p4_row = make_hyst_row(0, 4, h_p4_a);
+        ghyst_p[4].write(h_p4_addr, h_p4_row, h_p4_we, noconflict);
+
+        val<1> h_p1_a = hyst_we[1] & ~upd_s1;
+        val<1> h_p1_b = hyst_we[5] &  upd_s1;
+        val<1> h_p1_we = h_p1_a | h_p1_b;
+        val<LOGG_SH> h_p1_addr = select(h_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        val<4> h_p1_row = make_hyst_row(1, 5, h_p1_a);
+        ghyst_p[1].write(h_p1_addr, h_p1_row, h_p1_we, noconflict);
+
+        val<1> h_p5_a = hyst_we[1] &  upd_s1;
+        val<1> h_p5_b = hyst_we[5] & ~upd_s1;
+        val<1> h_p5_we = h_p5_a | h_p5_b;
+        val<LOGG_SH> h_p5_addr = select(h_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        val<4> h_p5_row = make_hyst_row(1, 5, h_p5_a);
+        ghyst_p[5].write(h_p5_addr, h_p5_row, h_p5_we, noconflict);
+
+        val<1> h_p2_a = hyst_we[2] & ~upd_s2;
+        val<1> h_p2_b = hyst_we[6] &  upd_s2;
+        val<1> h_p2_we = h_p2_a | h_p2_b;
+        val<LOGG_SH> h_p2_addr = select(h_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        val<4> h_p2_row = make_hyst_row(2, 6, h_p2_a);
+        ghyst_p[2].write(h_p2_addr, h_p2_row, h_p2_we, noconflict);
+
+        val<1> h_p6_a = hyst_we[2] &  upd_s2;
+        val<1> h_p6_b = hyst_we[6] & ~upd_s2;
+        val<1> h_p6_we = h_p6_a | h_p6_b;
+        val<LOGG_SH> h_p6_addr = select(h_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        val<4> h_p6_row = make_hyst_row(2, 6, h_p6_a);
+        ghyst_p[6].write(h_p6_addr, h_p6_row, h_p6_we, noconflict);
+
+        val<1> h_p3_we = hyst_we[3];
+        val<4> h_p3_row = concat(hyst_row1[3], hyst_row0[3]);
+        ghyst_p[3].write(group_row_idx[3], h_p3_row, h_p3_we, noconflict);
+    }
+
+    void write_ubit_physical(
+        arr<val<1>,NUMG_GROUP> &u_we,
+        arr<val<1>,NUMG_GROUP> &u_row0,
+        arr<val<1>,NUMG_GROUP> &u_row1,
+        val<1> upd_s0, val<1> upd_s1, val<1> upd_s2,
+        val<1> noconflict)
+    {
+        noconflict.fanout(hard<NUMP + 1>{});
+        auto make_u_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> val<2> {
+            val<1> lo = select(pick0, u_row0[g_sel0], u_row0[g_sel1]);
+            val<1> hi = select(pick0, u_row1[g_sel0], u_row1[g_sel1]);
+            return concat(hi, lo);
+        };
+
+        val<1> u_p0_a = u_we[0] & ~upd_s0;
+        val<1> u_p0_b = u_we[4] &  upd_s0;
+        val<1> u_p0_we = u_p0_a | u_p0_b;
+        val<LOGG_SH> u_p0_addr = select(u_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        val<2> u_p0_row = make_u_row(0, 4, u_p0_a);
+        ubit_p[0].write(u_p0_addr, u_p0_row, u_p0_we, noconflict);
+
+        val<1> u_p4_a = u_we[0] &  upd_s0;
+        val<1> u_p4_b = u_we[4] & ~upd_s0;
+        val<1> u_p4_we = u_p4_a | u_p4_b;
+        val<LOGG_SH> u_p4_addr = select(u_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        val<2> u_p4_row = make_u_row(0, 4, u_p4_a);
+        ubit_p[4].write(u_p4_addr, u_p4_row, u_p4_we, noconflict);
+
+        val<1> u_p1_a = u_we[1] & ~upd_s1;
+        val<1> u_p1_b = u_we[5] &  upd_s1;
+        val<1> u_p1_we = u_p1_a | u_p1_b;
+        val<LOGG_SH> u_p1_addr = select(u_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        val<2> u_p1_row = make_u_row(1, 5, u_p1_a);
+        ubit_p[1].write(u_p1_addr, u_p1_row, u_p1_we, noconflict);
+
+        val<1> u_p5_a = u_we[1] &  upd_s1;
+        val<1> u_p5_b = u_we[5] & ~upd_s1;
+        val<1> u_p5_we = u_p5_a | u_p5_b;
+        val<LOGG_SH> u_p5_addr = select(u_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        val<2> u_p5_row = make_u_row(1, 5, u_p5_a);
+        ubit_p[5].write(u_p5_addr, u_p5_row, u_p5_we, noconflict);
+
+        val<1> u_p2_a = u_we[2] & ~upd_s2;
+        val<1> u_p2_b = u_we[6] &  upd_s2;
+        val<1> u_p2_we = u_p2_a | u_p2_b;
+        val<LOGG_SH> u_p2_addr = select(u_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        val<2> u_p2_row = make_u_row(2, 6, u_p2_a);
+        ubit_p[2].write(u_p2_addr, u_p2_row, u_p2_we, noconflict);
+
+        val<1> u_p6_a = u_we[2] &  upd_s2;
+        val<1> u_p6_b = u_we[6] & ~upd_s2;
+        val<1> u_p6_we = u_p6_a | u_p6_b;
+        val<LOGG_SH> u_p6_addr = select(u_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        val<2> u_p6_row = make_u_row(2, 6, u_p6_a);
+        ubit_p[6].write(u_p6_addr, u_p6_row, u_p6_we, noconflict);
+
+        val<1> u_p3_we = u_we[3];
+        val<2> u_p3_row = concat(u_row1[3], u_row0[3]);
+        ubit_p[3].write(group_row_idx[3], u_p3_row, u_p3_we, noconflict);
+    }
+
     void tage_pred(val<64> inst_pc){
         val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<1+NUMG*2>{});
@@ -1060,28 +1461,45 @@ struct my_bp_v1 : predictor {
             readb[offset] = bim[offset].read(bindex);
         }
         readb.fanout(hard<2>{});
-        gindex.fanout(hard<4>{});
+        gindex.fanout(hard<8>{});
+        for (u64 g=0; g<NUMG_GROUP; g++) {
+            group_row_idx[g] = val<LOGG_SH>{gindex[2*g]};
+        }
+        group_row_idx.fanout(hard<8>{});
+        share_route_bit[0] = val<1>{group_row_idx[0]};
+        share_route_bit[1] = val<1>{group_row_idx[1]};
+        share_route_bit[2] = val<1>{group_row_idx[2]};
+        val<1> s0 = share_route_bit[0];
+        val<1> s1 = share_route_bit[1];
+        val<1> s2 = share_route_bit[2];
+        s0.fanout(hard<32>{});
+        s1.fanout(hard<32>{});
+        s2.fanout(hard<32>{});
 #ifdef GATE
 
             
             gating.fanout(hard<4>{});
-            for (u64 i=0; i<NUMG; i++) {
-                execute_if(~gating, [&](){
-                    readt[i] = gtag[i].read(gindex[i]);
-                    readc[i] = gpred[i].read(gindex[i]);
-                    readh[i] = ghyst[i].read(gindex[i]);
-                    readu[i] = ubit[i].read(gindex[i]);
-                });
-            }
+            execute_if(~gating, [&](){
+                val<LOGG_SH> p0_row = select(s0, val<LOGG_SH>{group_row_idx[4]}, val<LOGG_SH>{group_row_idx[0]});
+                val<LOGG_SH> p1_row = select(s1, val<LOGG_SH>{group_row_idx[5]}, val<LOGG_SH>{group_row_idx[1]});
+                val<LOGG_SH> p2_row = select(s2, val<LOGG_SH>{group_row_idx[6]}, val<LOGG_SH>{group_row_idx[2]});
+                val<LOGG_SH> p3_row = group_row_idx[3];
+                val<LOGG_SH> p4_row = select(s0, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+                val<LOGG_SH> p5_row = select(s1, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+                val<LOGG_SH> p6_row = select(s2, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+                read_tag_pred_physical(p0_row, p1_row, p2_row, p3_row, p4_row, p5_row, p6_row, s0, s1, s2);
+            });
 
 #else
 
-        for (u64 i=0; i<NUMG; i++) {
-            readt[i] = gtag[i].read(gindex[i]);
-            readc[i] = gpred[i].read(gindex[i]);
-            readh[i] = ghyst[i].read(gindex[i]);
-            readu[i] = ubit[i].read(gindex[i]);
-        }
+        val<LOGG_SH> p0_row = select(s0, val<LOGG_SH>{group_row_idx[4]}, val<LOGG_SH>{group_row_idx[0]});
+        val<LOGG_SH> p1_row = select(s1, val<LOGG_SH>{group_row_idx[5]}, val<LOGG_SH>{group_row_idx[1]});
+        val<LOGG_SH> p2_row = select(s2, val<LOGG_SH>{group_row_idx[6]}, val<LOGG_SH>{group_row_idx[2]});
+        val<LOGG_SH> p3_row = group_row_idx[3];
+        val<LOGG_SH> p4_row = select(s0, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
+        val<LOGG_SH> p5_row = select(s1, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
+        val<LOGG_SH> p6_row = select(s2, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
+        read_tag_pred_physical(p0_row, p1_row, p2_row, p3_row, p4_row, p5_row, p6_row, s0, s1, s2);
 
 #endif
         readt.fanout(hard<LINEINST+1>{});
@@ -1513,8 +1931,8 @@ struct my_bp_v1 : predictor {
         index1.fanout(hard<LINEINST+2>{});
         p2.fanout(hard<2>{});
         bindex.fanout(hard<LINEINST+2>{});
-        gindex.fanout(hard<4>{});
-        htag.fanout(hard<3>{});
+        gindex.fanout(hard<8>{});
+        htag.fanout(hard<32>{});
         readb.fanout(hard<2>{});
         readt.fanout(hard<4>{});
         readc.fanout(hard<2>{});
@@ -1689,6 +2107,7 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
 
+        val<1> extra_cycle_base = some_badpred1 | mispredict | (disagree_mask != hard<0>{});
 #ifdef MY_SC
         sc_sum.fanout(hard<3>{});
         // use_sc.fanout(hard<LINEINST*3>{});
@@ -1723,7 +2142,9 @@ struct my_bp_v1 : predictor {
             return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
         }}.fold_or();
 
-        val<1> extra_cycle = some_badpred1 | mispredict | (disagree_mask != hard<0>{}) | sc_need_update;
+        val<1> extra_cycle = extra_cycle_base | sc_need_update;
+#else
+        val<1> extra_cycle = extra_cycle_base;
 #endif
 
         extra_cycle.fanout(hard<NUMG*2+8>{});
@@ -1764,9 +2185,31 @@ struct my_bp_v1 : predictor {
 
 
         // overwrite the tag in the allocated entry (mispredict)
-        for (u64 i=0; i<NUMG; i++) {
-            execute_if(allocate[i], [&](){gtag[i].write(gindex[i],concat(last_offset,htag[i]));});
-        }
+        val<1> upd_s0 = share_route_bit[0];
+        val<1> upd_s1 = share_route_bit[1];
+        val<1> upd_s2 = share_route_bit[2];
+        upd_s0.fanout(hard<32>{});
+        upd_s1.fanout(hard<32>{});
+        upd_s2.fanout(hard<32>{});
+
+        arr<val<1>,NUMG_GROUP> tag_we = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i0 = 2 * g;
+            u64 i1 = i0 + 1;
+            return allocate[i0] | allocate[i1];
+        }};
+        arr<val<TAGW>,NUMG_GROUP> tag_row0 = arr<val<TAGW>,NUMG_GROUP>{[&](u64 g) -> val<TAGW> {
+            u64 i0 = 2 * g;
+            return select(allocate[i0], concat(last_offset, htag[i0]), val<TAGW>{snap_tag[g][0]});
+        }};
+        arr<val<TAGW>,NUMG_GROUP> tag_row1 = arr<val<TAGW>,NUMG_GROUP>{[&](u64 g) -> val<TAGW> {
+            u64 i1 = 2 * g + 1;
+            return select(allocate[i1], concat(last_offset, htag[i1]), val<TAGW>{snap_tag[g][1]});
+        }};
+        tag_we.fanout(hard<2>{});
+        group_row_idx.fanout(hard<4>{});
+        tag_row0.fanout(hard<2>{});
+        tag_row1.fanout(hard<2>{});
+        write_tag_physical(tag_we, tag_row0, tag_row1, upd_s0, upd_s1, upd_s2);
 
 
         // update the u bits
@@ -1784,13 +2227,27 @@ struct my_bp_v1 : predictor {
         val<NUMG> uclearmask = postmask & noalloc.replicate(hard<NUMG>{}).concat();
         arr<val<1>,NUMG> uclear = uclearmask.fo1().make_array(val<1>{});
         uclear.fanout(hard<2>{});
-
-        for (u64 i=0; i<NUMG; i++) {
-            execute_if(update_u[i].fo1() | allocate[i] | uclear[i], [&]() {
-                val<1> newu = goodpred[i].fo1() & ~allocate[i] & ~uclear[i];
-                ubit[i].write(gindex[i],newu.fo1(),extra_cycle);
-            });
-        }
+        arr<val<1>,NUMG_GROUP> u_we = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i0 = 2 * g;
+            u64 i1 = i0 + 1;
+            return update_u[i0] | allocate[i0] | uclear[i0] | update_u[i1] | allocate[i1] | uclear[i1];
+        }};
+        arr<val<1>,NUMG_GROUP> u_row0 = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i0 = 2 * g;
+            val<1> we0 = update_u[i0] | allocate[i0] | uclear[i0];
+            val<1> newu0 = goodpred[i0] & ~allocate[i0] & ~uclear[i0];
+            return select(we0, newu0, val<1>{snap_u[g][0]});
+        }};
+        arr<val<1>,NUMG_GROUP> u_row1 = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i1 = 2 * g + 1;
+            val<1> we1 = update_u[i1] | allocate[i1] | uclear[i1];
+            val<1> newu1 = goodpred[i1] & ~allocate[i1] & ~uclear[i1];
+            return select(we1, newu1, val<1>{snap_u[g][1]});
+        }};
+        u_we.fanout(hard<2>{});
+        u_row0.fanout(hard<2>{});
+        u_row1.fanout(hard<2>{});
+        write_ubit_physical(u_we, u_row0, u_row1, upd_s0, upd_s1, upd_s2, extra_cycle);
 #ifdef DEBUG_ENERGY
         energy_mark("UpdateAllocUBit");
 #endif
@@ -1830,27 +2287,48 @@ struct my_bp_v1 : predictor {
 
         // update incorrect global prediction if primary provider and the hysteresis is weak;
         // initialize global prediction in the allocated entry
-        for (u64 i=0; i<NUMG; i++) {
-            execute_if(g_weak[i].fo1() | allocate[i], [&](){
-                gpred[i].write(gindex[i],bdir[i]);
-            });
-        }
+        arr<val<1>,NUMG_GROUP> pred_we = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i0 = 2 * g;
+            u64 i1 = i0 + 1;
+            return g_weak[i0] | allocate[i0] | g_weak[i1] | allocate[i1];
+        }};
+        arr<val<1>,NUMG_GROUP> pred_row0 = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i0 = 2 * g;
+            val<1> we0 = g_weak[i0] | allocate[i0];
+            return select(we0, bdir[i0], val<1>{snap_pred[g][0]});
+        }};
+        arr<val<1>,NUMG_GROUP> pred_row1 = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i1 = 2 * g + 1;
+            val<1> we1 = g_weak[i1] | allocate[i1];
+            return select(we1, bdir[i1], val<1>{snap_pred[g][1]});
+        }};
+        pred_we.fanout(hard<2>{});
+        pred_row0.fanout(hard<2>{});
+        pred_row1.fanout(hard<2>{});
+        write_pred_physical(pred_we, pred_row0, pred_row1, upd_s0, upd_s1, upd_s2);
 
         // update global prediction hysteresis if primary provider or allocated entry
-#ifdef GATE
-        val<1> ghyst_read_en = ~gating;
-#else
-        val<1> ghyst_read_en = 1;
-#endif
-        ghyst_read_en.fanout(hard<2*NUMG + 1>{});
-
-        for (u64 i=0; i<NUMG; i++) {
-            val<1> do_ghyst_write = primary[i] | allocate[i];
-            // if allocated entry, set hysteresis to 0;
-            // otherwise, increment hysteresis if correct pred, decrement if incorrect
-            val<2> newhyst = select(allocate[i],val<2>{0},update_ctr(readh[i],~badpred1[i]));
-            ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,extra_cycle);
-        }
+        arr<val<1>,NUMG_GROUP> hyst_we = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
+            u64 i0 = 2 * g;
+            u64 i1 = i0 + 1;
+            return primary[i0] | allocate[i0] | primary[i1] | allocate[i1];
+        }};
+        arr<val<2>,NUMG_GROUP> hyst_row0 = arr<val<2>,NUMG_GROUP>{[&](u64 g) -> val<2> {
+            u64 i0 = 2 * g;
+            val<1> we0 = primary[i0] | allocate[i0];
+            val<2> newh0 = select(allocate[i0], val<2>{0}, update_ctr(readh[i0], ~badpred1[i0]));
+            return select(we0, newh0, val<2>{snap_hyst[g][0]});
+        }};
+        arr<val<2>,NUMG_GROUP> hyst_row1 = arr<val<2>,NUMG_GROUP>{[&](u64 g) -> val<2> {
+            u64 i1 = 2 * g + 1;
+            val<1> we1 = primary[i1] | allocate[i1];
+            val<2> newh1 = select(allocate[i1], val<2>{0}, update_ctr(readh[i1], ~badpred1[i1]));
+            return select(we1, newh1, val<2>{snap_hyst[g][1]});
+        }};
+        hyst_we.fanout(hard<2>{});
+        hyst_row0.fanout(hard<2>{});
+        hyst_row1.fanout(hard<2>{});
+        write_hyst_physical(hyst_we, hyst_row0, hyst_row1, upd_s0, upd_s1, upd_s2, extra_cycle);
 
 #ifdef RESET_UBITS
         uctr.fanout(hard<3>{});
@@ -1860,7 +2338,7 @@ struct my_bp_v1 : predictor {
         val<1> uctrsat = (uctr == hard<decltype(uctr)::maxval>{});
         uctrsat.fanout(hard<2>{});
         uctr = select(correct_pred,uctr,select(uctrsat,val<decltype(uctr)::size>{0},update_ctr(uctr,faralloc.fo1())));
-        execute_if(uctrsat,[&](){for (auto &uram : ubit) uram.reset();});
+        execute_if(uctrsat,[&](){for (auto &uram : ubit_p) uram.reset();});
 #endif
 #ifdef DEBUG_ENERGY
         energy_mark("UpdateGlobalTables");
