@@ -54,7 +54,7 @@ using namespace hcm;
 #ifdef DEBUG_ENERGY
     struct energy_monitor monitor;
 #endif
-template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=11, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
+template<u64 LOGLB=6, u64 NUMG=8, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=100, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
 struct my_bp_v1 : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
@@ -1570,9 +1570,10 @@ struct my_bp_v1 : predictor {
     }
 
 #ifdef MY_SC
-    void pipe_global_thre_delta(val<2,i64> new_delta)
+    void pipe_global_thre_delta(val<2,i64> new_delta, val<1> flush = val<1>{0})
     {
-        val<2,i64> apply_delta = global_thre_pipe[SC_GLOBAL_THRE_PIPE_STAGES-1];
+        flush.fanout(hard<SC_GLOBAL_THRE_PIPE_STAGES + 2>{});
+        val<2,i64> apply_delta = select(flush, val<2,i64>{0}, val<2,i64>{global_thre_pipe[SC_GLOBAL_THRE_PIPE_STAGES-1]});
         apply_delta.fanout(hard<2>{});
         val<1> apply_upd = apply_delta != val<2,i64>{0};
         val<1> apply_inc = apply_delta > val<2,i64>{0};
@@ -1580,9 +1581,9 @@ struct my_bp_v1 : predictor {
             global_thre = update_ctr(global_thre, apply_inc);
         });
         for (u64 i = SC_GLOBAL_THRE_PIPE_STAGES-1; i != 0; i--) {
-            global_thre_pipe[i] = global_thre_pipe[i-1];
+            global_thre_pipe[i] = select(flush, val<2,i64>{0}, val<2,i64>{global_thre_pipe[i-1]});
         }
-        global_thre_pipe[0] = new_delta;
+        global_thre_pipe[0] = select(flush, val<2,i64>{0}, new_delta);
     }
 
 #endif
@@ -1612,7 +1613,7 @@ struct my_bp_v1 : predictor {
                 true_block = 1;
             });
 #ifdef MY_SC
-            pipe_global_thre_delta(val<2,i64>{0});
+            pipe_global_thre_delta(val<2,i64>{0}, val<1>{0});
 #endif
 #ifdef DEBUG_ENERGY
             energy_mark("UpdateNoBranch");
@@ -1950,6 +1951,7 @@ struct my_bp_v1 : predictor {
             });
         }
 
+        // update global prediction hysteresis if primary provider or allocated entry
 #ifdef GATE
         val<1> ghyst_read_en = ~gating;
 #else
@@ -1957,7 +1959,6 @@ struct my_bp_v1 : predictor {
 #endif
         ghyst_read_en.fanout(hard<2*NUMG + 1>{});
 
-        // update global prediction hysteresis if primary provider or allocated entry
         for (u64 i=0; i<NUMG; i++) {
             val<1> do_ghyst_write = primary[i] | allocate[i];
             // if allocated entry, set hysteresis to 0;
@@ -1968,9 +1969,9 @@ struct my_bp_v1 : predictor {
             ghyst[i].write_update(gindex[i], newhyst.fo1(), do_ghyst_write,
                                   primary[i] & ~allocate[i], ~badpred1[i],
                                   gindex[i], ~extra_cycle, extra_cycle);
-  #else
+#else
             ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,gindex[i],~extra_cycle,extra_cycle);
-  #endif
+#endif
 #else
             ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,extra_cycle);
 #endif
@@ -2088,7 +2089,7 @@ struct my_bp_v1 : predictor {
         }
 #endif
 #endif
-        pipe_global_thre_delta(gthre_delta);
+        pipe_global_thre_delta(gthre_delta, mispredict);
 
         
 #ifdef SC_USE_BIAS
