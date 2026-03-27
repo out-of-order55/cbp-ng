@@ -1,90 +1,81 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
-
-#include "my_bp_v1_perf_events.hpp"
 
 namespace my_bp_v1_perf {
 
+template<std::size_t NUMG>
 struct PerfState {
-    std::uint64_t predictions = 0;
-    std::uint64_t correct = 0;
-    std::uint64_t mispredictions = 0;
-    std::uint64_t extra_cycle_total = 0;
-    std::uint64_t extra_cycle_badpred = 0;
-    std::uint64_t extra_cycle_mispredict = 0;
-    std::uint64_t extra_cycle_p1_update = 0;
-    std::uint64_t extra_cycle_sc_update = 0;
-    std::uint64_t gate_count = 0;
-    std::uint64_t gate_mispred = 0;
-    std::uint64_t gate_update_inc = 0;
-    std::uint64_t gate_update_dec = 0;
-    std::uint64_t bgehl_read_ops = 0;
-    std::uint64_t bgehl_write_ops = 0;
-    std::uint64_t bgehl_branch_slots = 0;
-    std::uint64_t bgehl_filter_allow = 0;
-    std::uint64_t bgehl_filter_block = 0;
-    std::uint64_t bgehl_nonzero_contrib = 0;
-    std::uint64_t bgehl_update_candidate = 0;
-    std::uint64_t bgehl_update_allow = 0;
-    std::uint64_t bgehl_update_block = 0;
-
-    void on_resolve(const ResolveEvent &event)
-    {
-        if (!event.is_branch) {
-            return;
-        }
-        ++predictions;
-        if (event.correct) {
-            ++correct;
-        } else {
-            ++mispredictions;
-        }
-    }
-
-    void on_extra_cycle(const ExtraCycleEvent &event)
-    {
-        extra_cycle_total += static_cast<std::uint64_t>(event.extra_cycle);
-        extra_cycle_badpred += static_cast<std::uint64_t>(event.badpred);
-        extra_cycle_mispredict += static_cast<std::uint64_t>(event.mispredict);
-        extra_cycle_p1_update += static_cast<std::uint64_t>(event.p1_update);
-        extra_cycle_sc_update += static_cast<std::uint64_t>(event.sc_update);
-    }
-
-    void on_gate(const GateEvent &event)
-    {
-        gate_count += static_cast<std::uint64_t>(event.gating);
-        gate_mispred += static_cast<std::uint64_t>(event.gating && event.mispredict);
-        gate_update_inc += static_cast<std::uint64_t>(event.gate_inc);
-        gate_update_dec += static_cast<std::uint64_t>(event.gate_dec);
-    }
-
-    void on_bgehl_read_ops(std::uint64_t read_ops)
-    {
-        bgehl_read_ops += read_ops;
-    }
-
-    void on_bgehl_write_ops(std::uint64_t write_ops)
-    {
-        bgehl_write_ops += write_ops;
-    }
-
-    void on_bgehl_slot(const BgehlSlotEvent &event)
-    {
-        if (!event.is_branch) {
-            return;
-        }
-        ++bgehl_branch_slots;
-        if (event.filter_open) {
-            ++bgehl_filter_allow;
-            bgehl_nonzero_contrib += static_cast<std::uint64_t>(event.nonzero_contrib);
-        } else {
-            ++bgehl_filter_block;
-        }
-        bgehl_update_candidate += static_cast<std::uint64_t>(event.update_candidate);
-        bgehl_update_allow += static_cast<std::uint64_t>(event.update_allow);
-        bgehl_update_block += static_cast<std::uint64_t>(event.update_block);
-    }
+    std::uint64_t perf_predictions = 0;
+    std::uint64_t perf_correct = 0;
+    std::array<std::uint64_t, NUMG> perf_provider_used = {};
+    std::array<std::uint64_t, NUMG> perf_provider_correct = {};
+    std::array<std::uint64_t, NUMG> perf_provider_wrong = {};
+    std::array<std::uint64_t, NUMG> perf_alt_used = {};
+    std::array<std::uint64_t, NUMG> perf_alt_correct = {};
+    std::array<std::uint64_t, NUMG> perf_alt_wrong = {};
+    std::uint64_t perf_bimodal_used = 0;
+    std::uint64_t perf_bimodal_correct = 0;
+    std::uint64_t perf_bimodal_wrong = 0;
+    std::uint64_t perf_mispred_blame_tage = 0;
+    std::uint64_t perf_mispred_blame_sc = 0;
+    std::uint64_t perf_mispred_blame_p1 = 0;
+    std::array<std::uint64_t, NUMG> perf_table_reads = {};
+    std::array<std::uint64_t, NUMG> perf_table_hits = {};
+    std::array<std::uint64_t, NUMG> perf_table_alloc = {};
+    std::uint64_t perf_alloc_failures = 0;
+    std::uint64_t perf_alloc_fail_highest = 0;
+    std::uint64_t perf_alloc_fail_noubit = 0;
+    std::uint64_t perf_extra_cycle_total = 0;
+    std::uint64_t perf_extra_cycle_badpred = 0;
+    std::uint64_t perf_extra_cycle_mispredict = 0;
+    std::uint64_t perf_extra_cycle_p1_update = 0;
+    std::uint64_t perf_gate_count = 0;
+    std::uint64_t perf_gate_mispred = 0;
+    std::uint64_t perf_gate_update_inc = 0;
+    std::uint64_t perf_gate_update_dec = 0;
+    std::uint64_t perf_extra_cycle_sc_update = 0;
+    std::uint64_t perf_sc_override = 0;
+    std::uint64_t perf_sc_override_correct = 0;
+    std::uint64_t perf_sc_use = 0;
+    std::uint64_t perf_sc_use_correct = 0;
+    std::uint64_t perf_sc_use_taken = 0;
+    std::uint64_t perf_sc_use_nottaken = 0;
+    std::uint64_t perf_sc_use_same_as_tage = 0;
+    std::uint64_t perf_sc_use_flip_tage = 0;
+    std::uint64_t perf_sc_use_weak = 0;
+    std::uint64_t perf_sc_use_mid = 0;
+    std::uint64_t perf_sc_use_sat = 0;
+    std::uint64_t perf_sc_stage_prov_hit = 0;
+    std::uint64_t perf_sc_stage_do_update = 0;
+    std::uint64_t perf_sc_stage_candidate = 0;
+    std::uint64_t perf_sc_stage_guard_pass = 0;
+    std::uint64_t perf_sc_skip_no_provider = 0;
+    std::uint64_t perf_sc_skip_no_do_update = 0;
+    std::uint64_t perf_sc_skip_guard = 0;
+    std::uint64_t perf_global_thre_update = 0;
+    std::uint64_t perf_global_thre_inc = 0;
+    std::uint64_t perf_global_thre_dec = 0;
+    std::uint64_t perf_thre_update = 0;
+    std::uint64_t perf_thre_update_inc = 0;
+    std::uint64_t perf_thre_update_dec = 0;
+    std::uint64_t perf_mispred_sc_not_used = 0;
+    std::uint64_t perf_mispred_sc_keep = 0;
+    std::uint64_t perf_mispred_sc_flip = 0;
+    std::uint64_t perf_mispred_sc_flip_harmful = 0;
+    std::uint64_t perf_mispred_sc_flip_both_wrong = 0;
+    std::uint64_t perf_bgehl_read_ops = 0;
+    std::uint64_t perf_bgehl_write_ops = 0;
+    std::uint64_t perf_bgehl_branch_slots = 0;
+    std::uint64_t perf_bgehl_filter_allow = 0;
+    std::uint64_t perf_bgehl_filter_block = 0;
+    std::uint64_t perf_bgehl_nonzero_contrib = 0;
+    std::uint64_t perf_bgehl_update_candidate = 0;
+    std::uint64_t perf_bgehl_update_allow = 0;
+    std::uint64_t perf_bgehl_update_block = 0;
+    std::array<std::array<std::uint64_t, 4>, NUMG> perf_conf = {};
 };
 
 } // namespace my_bp_v1_perf
