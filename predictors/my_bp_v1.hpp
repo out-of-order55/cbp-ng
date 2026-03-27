@@ -8,9 +8,13 @@
 #if !defined(SC_DISABLE_FGEHL)
 #define SC_FGEHL
 #endif
+#if !defined(SC_DISABLE_BGEHL)
+#define SC_BGEHL
+#endif
 // #define SC_DISABLE_BIAS
 // #define SC_DISABLE_GEHL
 // #define SC_DISABLE_FGEHL
+// #define SC_DISABLE_BGEHL
 
 #if !defined(SC_DISABLE_BIAS)
 #define SC_USE_BIAS
@@ -84,6 +88,10 @@ struct my_bp_v1 : predictor {
     static constexpr u64 LOGFGEHL = LOGGEHL;
     static constexpr u64 FHIST_BITS = 48;
 #endif
+#ifdef SC_BGEHL
+    static constexpr u64 LOGBGEHL = LOGGEHL;
+    static constexpr u64 BHIST_BITS = 48;
+#endif
     static constexpr u64 TOTAL_THREBITS = 10;
     static constexpr u64 GLOBAL_THREBITS = 9;
     static constexpr u64 PRE_PC_THREBITS = 9;
@@ -125,6 +133,9 @@ struct my_bp_v1 : predictor {
     static_assert(LOGGEHL > LOGLINEINST);
 #ifdef SC_FGEHL
     static_assert(LOGFGEHL > LOGLINEINST);
+#endif
+#ifdef SC_BGEHL
+    static_assert(LOGBGEHL > LOGLINEINST);
 #endif
     static constexpr u64 index1_bits = LOGP1-LOGLINEINST;
     static constexpr u64 bindex_bits = LOGB-LOGLINEINST;
@@ -1112,6 +1123,12 @@ struct my_bp_v1 : predictor {
     arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
     reg<FHIST_BITS> fhist;
 #endif
+#ifdef SC_BGEHL
+    reg<LOGBGEHL-LOGLINEINST> bgehl_idx;
+    ram<val<PERCWIDTH,i64>,(1<<(LOGBGEHL-LOGLINEINST))> bgehl[LINEINST] {"BGEHL"};
+    arr<reg<PERCWIDTH,i64>,LINEINST> bgehl_map;
+    reg<BHIST_BITS> bhist;
+#endif
     // intermediate update signals
     arr<reg<1>,LINEINST> sc_wrong_arr;
     arr<reg<1>,LINEINST> do_update_arr;
@@ -1441,6 +1458,17 @@ struct my_bp_v1 : predictor {
         }};
         fgehl_map.fanout(hard<2>{});
 #endif
+#ifdef SC_BGEHL
+        val<LOGBGEHL-LOGLINEINST> bgehl_base_index = inst_pc >> LOGLB;
+        val<BHIST_BITS> bh_mix = val<BHIST_BITS>{bhist} ^ (val<BHIST_BITS>{bhist} >> hard<13>{}) ^ (val<BHIST_BITS>{bhist} >> hard<29>{});
+        val<LOGBGEHL-LOGLINEINST> bidx = bgehl_base_index ^ val<LOGBGEHL-LOGLINEINST>{bh_mix};
+        bidx.fanout(hard<LINEINST+1>{});
+        bgehl_idx = bidx;
+        bgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            return bgehl[offset].read(bidx);
+        }};
+        bgehl_map.fanout(hard<2>{});
+#endif
 #ifdef DEBUG_ENERGY
         energy_mark("SCHistRead");
 #endif
@@ -1452,7 +1480,7 @@ struct my_bp_v1 : predictor {
 
         //100 ps 2.5 cycle
         sc_sum = arr<val<TOTAL_THREBITS,i64>,LINEINST>{[&](u64 offset){
-#if !defined(SC_USE_BIAS) && !defined(SC_USE_GEHL) && !defined(SC_FGEHL)
+#if !defined(SC_USE_BIAS) && !defined(SC_USE_GEHL) && !defined(SC_FGEHL) && !defined(SC_BGEHL)
             static_cast<void>(offset);
 #endif
 #ifdef SC_USE_BIAS
@@ -1484,8 +1512,15 @@ struct my_bp_v1 : predictor {
 #else
             val<TOTAL_THREBITS,i64> fgehl_ext = val<TOTAL_THREBITS,i64>{0};
 #endif
-            val<PERCWIDTH+1,i64> gehl_pair_sum = gehl0_ext + gehl1_ext;
-            val<PERCWIDTH+2,i64> sc_hist_sum = gehl_pair_sum + fgehl_ext;
+#ifdef SC_BGEHL
+            val<PERCWIDTH,i64> bgehl_v = bgehl_map[offset];
+            bgehl_v.fanout(hard<2>{});
+            val<1> bgehl_sign = val<1>{bgehl_v >> hard<PERCWIDTH-1>{}};
+            val<TOTAL_THREBITS,i64> bgehl_ext = concat(bgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bgehl_v});
+#else
+            val<TOTAL_THREBITS,i64> bgehl_ext = val<TOTAL_THREBITS,i64>{0};
+#endif
+            val<TOTAL_THREBITS,i64> sc_hist_sum = gehl0_ext + gehl1_ext + fgehl_ext + bgehl_ext;
             return sc_hist_sum + bias_ext;
         }};
         
@@ -2052,6 +2087,17 @@ struct my_bp_v1 : predictor {
             fhist = new_fhist;
         });
 #endif
+#if defined(MY_SC) && defined(SC_BGEHL)
+        val<64> last_branch_pc_b = branch_pc[num_branch-1];
+        val<1> last_branch_taken_b = branch_dir[num_branch-1];
+        val<1> last_backward = next_pc < last_branch_pc_b;
+        val<BHIST_BITS> next_pc_fold_b = val<BHIST_BITS>{next_pc >> 2};
+        val<BHIST_BITS> branch_pc_fold_b = val<BHIST_BITS>{last_branch_pc_b >> 1};
+        val<BHIST_BITS> new_bhist = (val<BHIST_BITS>{bhist} << hard<3>{}) ^ next_pc_fold_b ^ branch_pc_fold_b;
+        execute_if(last_branch_taken_b & last_backward, [&](){
+            bhist = new_bhist;
+        });
+#endif
 #ifdef DEBUG_ENERGY
         energy_mark("UpdateHistory");
 #endif
@@ -2105,7 +2151,7 @@ struct my_bp_v1 : predictor {
 #endif
             val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
             val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, sc_wrong_arr[offset]);
-#if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL)
+#if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL) || defined(SC_BGEHL)
             [[maybe_unused]] val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
 #endif
 #ifdef SC_USE_BIAS
@@ -2140,6 +2186,15 @@ struct my_bp_v1 : predictor {
                 fgehl[offset].write(fgehl_write_idx, update_ctr(old_fgehl, branch_taken[offset]));
             });
 #endif
+#ifdef SC_BGEHL
+            val<LOGBGEHL-LOGLINEINST> bgehl_write_idx = bgehl_idx;
+            val<PERCWIDTH,i64> old_bgehl = bgehl_map[offset];
+            bgehl_write_idx.fanout(hard<2>{});
+            old_bgehl.fanout(hard<2>{});
+            execute_if(sc_update_en, [&](){
+                bgehl[offset].write(bgehl_write_idx, update_ctr(old_bgehl, branch_taken[offset]));
+            });
+#endif
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
 #ifdef DEBUG_ENERGY
@@ -2152,6 +2207,9 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_FGEHL
         energy_mark("UpdateSCFgehl");
+#endif
+#ifdef SC_BGEHL
+        energy_mark("UpdateSCBgehl");
 #endif
 #endif
 #endif
