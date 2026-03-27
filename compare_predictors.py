@@ -36,7 +36,6 @@ import os
 import math
 import csv
 import argparse
-from collections import defaultdict
 
 # 预测器配置
 PREDICTORS = {
@@ -50,24 +49,16 @@ PREDICTORS = {
     }
 }
 
-# Reference MPKI 基准（从 docs/example_and_reference_predictor_results.csv 预计算）
-# MPKI = mispredictions / instructions * 1000
-REFERENCE_MPKI = {
-    'infra_22': 34973 / 39000011 * 1000,
-    'web_74': 88149 / 38999875 * 1000,
-    'xz-3.9139_0': 129243 / 12020327 * 1000,
-    'minizinc-3.2615_0': 37736 / 12020330 * 1000,
-    'int_145': 40758 / 38999986 * 1000,
-    'ntest-1.168389_0': 28094 / 12021627 * 1000,
-    'nodejs-zlib_3279': 161609 / 24372402 * 1000,
-    'rsbench-1.730_0': 317706 / 12020325 * 1000,
-    'web_205': 70805 / 13999869 * 1000,
-    'nodejs-octane_3483': 55193 / 21042413 * 1000,
-    'infra_61': 0,  # 需要根据实际 CSV 补充
-}
-
-MISPREDICTION_PENALTY = 8
 DEFAULT_CSV = 'docs/example_and_reference_predictor_results.csv'
+P2_TO_EXEC_STAGES = 9
+
+VFS_REF_IPC = 8.0
+VFS_REF_CPI = 0.0315
+VFS_REF_EPI = 1000.0
+VFS_ALPHA = 1.625
+VFS_BETA = 4 * VFS_ALPHA / (VFS_ALPHA - 1) ** 2
+VFS_GAMMA = 2 / (VFS_ALPHA - 1)
+VFS_CBP_ENERGY_RATIO = 0.05
 
 def load_ref_mpki_from_csv(csv_path):
     """从 CSV 加载 reference 预测器的 MPKI"""
@@ -132,6 +123,7 @@ def calc_storage(params):
         'bim': bim_total,
         'tage_subtotal': gtag_total + gpred_total + ghyst_total + ubit_total + bim_total,
         'total': p1_total + gtag_total + gpred_total + ghyst_total + ubit_total + bim_total,
+        'config': dict(params),
         'params': {
             'LINEINST': LINEINST, 'index1_bits': index1_bits,
             'bindex_bits': bindex_bits, 'HTAGBITS': HTAGBITS
@@ -247,6 +239,33 @@ def load_results_from_csv(csv_path, predictor_name):
 
     return results
 
+def compute_predictor_level_latencies(results, benchmarks):
+    """使用 predictor_metrics.py 的规则计算目录级 P1/P2 延迟"""
+    p1_lat = 0
+    p2_lat = 0
+    for bench in benchmarks:
+        p1_lat = max(p1_lat, math.ceil(results[bench]['p1_lat']))
+        p2_lat = max(p2_lat, math.ceil(results[bench]['p2_lat']))
+    return p1_lat, p2_lat
+
+def calc_prediction_cycles(data, p1_lat, p2_lat):
+    """按 predictor_metrics.py 当前公式计算预测周期数"""
+    pred_cycles = float(data['npred'])
+    extra_cycles = float(data['extra'])
+    divergences = float(data['diverge'])
+    divergences_at_end = float(data['diverge_at_end'])
+
+    if p2_lat <= p1_lat:
+        cycles = pred_cycles * max(1, p2_lat)
+    else:
+        cycles = (
+            pred_cycles * max(1, p1_lat)
+            + divergences * p2_lat
+            - divergences_at_end * max(1, p1_lat)
+        )
+
+    return cycles + extra_cycles
+
 def calc_metrics(data, p1_lat, p2_lat):
     """计算单个 benchmark 的指标"""
     if data['condbr'] == 0:
@@ -260,21 +279,15 @@ def calc_metrics(data, p1_lat, p2_lat):
 
     # 计算 IPC, CPI
     instructions = float(data['instructions'])
-    pred_cycles = float(data['npred'])
-    extra_cycles = float(data['extra'])
-    divergences = float(data['diverge'])
-    divergences_at_end = float(data['diverge_at_end'])
     mispredictions = float(data['misp'])
 
-    if p2_lat <= p1_lat:
-        cycles = pred_cycles * max(1, p2_lat)
-    else:
-        cycles = pred_cycles * max(1, p1_lat) + divergences * p2_lat - divergences_at_end * max(1, p1_lat)
-    cycles += extra_cycles
+    cycles = calc_prediction_cycles(data, p1_lat, p2_lat)
 
     ipc = instructions / cycles if cycles > 0 else 0
     mpi = mispredictions / instructions if instructions > 0 else 0
-    cpi = mpi * (MISPREDICTION_PENALTY + p2_lat)
+    cpi = mpi * (P2_TO_EXEC_STAGES + p2_lat - max(1, min(p1_lat, p2_lat)))
+    divergences = float(data['diverge'])
+    pred_cycles = float(data['npred'])
     dpi = divergences / instructions if instructions > 0 else 0
     ppi = pred_cycles / instructions if instructions > 0 else 0
 
@@ -290,42 +303,98 @@ def calc_metrics(data, p1_lat, p2_lat):
         'ppi': ppi
     }
 
+def summarize_predictor_metrics(results, benchmarks):
+    """按 predictor_metrics.py 当前定义汇总 common benchmarks 上的指标"""
+    p1_lat, p2_lat = compute_predictor_level_latencies(results, benchmarks)
+
+    count = 0
+    sum_inverse_ipc = 0.0
+    sum_cpi = 0.0
+    sum_epi = 0.0
+    sum_mpi = 0.0
+    sum_dpi = 0.0
+    sum_ppi = 0.0
+
+    for bench in benchmarks:
+        metrics = calc_metrics(results[bench], p1_lat, p2_lat)
+        if metrics['ipc'] <= 0:
+            continue
+        count += 1
+        sum_inverse_ipc += 1.0 / metrics['ipc']
+        sum_cpi += metrics['cpi']
+        sum_epi += metrics['epi']
+        sum_mpi += metrics['mpi']
+        sum_dpi += metrics['dpi']
+        sum_ppi += metrics['ppi']
+
+    if count == 0:
+        return {
+            'ipc': 0.0,
+            'cpi': 0.0,
+            'epi': 0.0,
+            'mpi': 0.0,
+            'dpi': 0.0,
+            'ppi': 0.0,
+            'mpki': 0.0,
+            'p1_latency': p1_lat,
+            'p2_latency': p2_lat,
+            'vfs': 0.0,
+        }
+
+    ipc = count / sum_inverse_ipc
+    cpi = sum_cpi / count
+    epi = sum_epi / count
+    mpi = sum_mpi / count
+    dpi = sum_dpi / count
+    ppi = sum_ppi / count
+
+    return {
+        'ipc': ipc,
+        'cpi': cpi,
+        'epi': epi,
+        'mpi': mpi,
+        'dpi': dpi,
+        'ppi': ppi,
+        'mpki': mpi * 1000.0,
+        'p1_latency': p1_lat,
+        'p2_latency': p2_lat,
+        'vfs': calc_vfs(ipc, cpi, epi),
+    }
+
 def calc_vfs(ipc, cpi, epi):
     """计算 VFS 分数"""
-    IPCcbp0 = 8
-    CPIcbp0 = 0.0315
-    EPIcbp0 = 1000
-    ALPHA = 1.625
-    BETA = 4 * ALPHA / (ALPHA - 1) ** 2
-    GAMMA = 2 / (ALPHA - 1)
-    cbp_energy_ratio = 0.05
-
-    WPI0 = IPCcbp0 * CPIcbp0
+    WPI0 = VFS_REF_IPC * VFS_REF_CPI
     WPI = ipc * cpi
-    speedup = (ipc / IPCcbp0) * (1 + WPI0) / (1 + WPI)
-    LAMBDA = 1 / (1 + WPI0 / 2) - cbp_energy_ratio
-    normalizedEPI = ((epi / EPIcbp0) * cbp_energy_ratio + LAMBDA * speedup ** GAMMA) * (1 + WPI / 2)
+    speedup = (ipc / VFS_REF_IPC) * (1 + WPI0) / (1 + WPI)
+    LAMBDA = 1 / (1 + WPI0 / 2) - VFS_CBP_ENERGY_RATIO
+    normalizedEPI = (
+        ((epi / VFS_REF_EPI) * VFS_CBP_ENERGY_RATIO + LAMBDA * speedup ** VFS_GAMMA)
+        * (1 + WPI / 2)
+    )
 
     if speedup * normalizedEPI <= 0:
         return 0
 
-    vfs = speedup * ALPHA * (1 - 2 / (1 + math.sqrt(1 + BETA / (speedup * normalizedEPI))))
+    vfs = speedup * VFS_ALPHA * (1 - 2 / (1 + math.sqrt(1 + VFS_BETA / (speedup * normalizedEPI))))
     return vfs
+
+def format_storage_config(storage):
+    """格式化打印存储配置"""
+    config = storage.get('config', {})
+    ordered_keys = ['LOGLB', 'NUMG', 'LOGG', 'LOGB', 'TAGW', 'GHIST', 'LOGP1', 'GHIST1']
+    parts = [f"{key}={config[key]}" for key in ordered_keys if key in config]
+    return ', '.join(parts) if parts else 'N/A'
 
 def print_storage_comparison(storage1, storage2, name1='tage', name2='my_bp'):
     """打印存储开销对比"""
     print("=" * 70)
     print("=== Storage Overhead Comparison ===")
     print("=" * 70)
-    print(f"\n{name1} parameters: LOGLB={PREDICTORS[name1]['LOGLB']}, NUMG={PREDICTORS[name1]['NUMG']}, "
-          f"LOGG={PREDICTORS[name1]['LOGG']}, LOGB={PREDICTORS[name1]['LOGB']}, "
-          f"TAGW={PREDICTORS[name1]['TAGW']}, LOGP1={PREDICTORS[name1]['LOGP1']}")
+    print(f"\n{name1} parameters: {format_storage_config(storage1)}")
     print(f"  LINEINST={storage1['params']['LINEINST']}, index1_bits={storage1['params']['index1_bits']}, "
           f"bindex_bits={storage1['params']['bindex_bits']}, HTAGBITS={storage1['params']['HTAGBITS']}")
 
-    print(f"\n{name2} parameters: LOGLB={PREDICTORS[name2]['LOGLB']}, NUMG={PREDICTORS[name2]['NUMG']}, "
-          f"LOGG={PREDICTORS[name2]['LOGG']}, LOGB={PREDICTORS[name2]['LOGB']}, "
-          f"TAGW={PREDICTORS[name2]['TAGW']}, LOGP1={PREDICTORS[name2]['LOGP1']}")
+    print(f"\n{name2} parameters: {format_storage_config(storage2)}")
     print(f"  LINEINST={storage2['params']['LINEINST']}, index1_bits={storage2['params']['index1_bits']}, "
           f"bindex_bits={storage2['params']['bindex_bits']}, HTAGBITS={storage2['params']['HTAGBITS']}")
 
@@ -419,6 +488,7 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
     return rows
 
 def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
+                             summary1, summary2,
                              name1='tage', name2='my_bp'):
     """打印总体统计"""
     print("\n" + "=" * 70)
@@ -427,12 +497,7 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
 
     # 收集所有指标
     acc1_list, acc2_list = [], []
-    mpki1_list, mpki2_list = [], []
     mpki_ref_list = []
-    epi1_list, epi2_list = [], []
-    ipc1_list, ipc2_list = [], []
-    cpi1_list, cpi2_list = [], []
-    vfs1_list, vfs2_list = [], []
 
     for bench in common_benchmarks:
         m1 = metrics1[bench]
@@ -441,44 +506,29 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
 
         acc1_list.append(m1['accuracy'])
         acc2_list.append(m2['accuracy'])
-        mpki1_list.append(m1['mpki'])
-        mpki2_list.append(m2['mpki'])
         if ref is not None:
             mpki_ref_list.append(ref)
-        epi1_list.append(m1['epi'])
-        epi2_list.append(m2['epi'])
-        ipc1_list.append(m1['ipc'])
-        ipc2_list.append(m2['ipc'])
-        cpi1_list.append(m1['cpi'])
-        cpi2_list.append(m2['cpi'])
-
-        v1 = calc_vfs(m1['ipc'], m1['cpi'], m1['epi'])
-        v2 = calc_vfs(m2['ipc'], m2['cpi'], m2['epi'])
-        vfs1_list.append(v1)
-        vfs2_list.append(v2)
 
     # 几何平均准确率
     geo_mean_acc1 = math.exp(sum(math.log(a) for a in acc1_list) / len(acc1_list))
     geo_mean_acc2 = math.exp(sum(math.log(a) for a in acc2_list) / len(acc2_list))
 
-    # 算术平均 MPKI
-    avg_mpki1 = sum(mpki1_list) / len(mpki1_list)
-    avg_mpki2 = sum(mpki2_list) / len(mpki2_list)
+    avg_mpki1 = summary1['mpki']
+    avg_mpki2 = summary2['mpki']
     avg_mpki_ref = sum(mpki_ref_list) / len(mpki_ref_list) if mpki_ref_list else None
 
-    # 算术平均
-    avg_epi1 = sum(epi1_list) / len(epi1_list)
-    avg_epi2 = sum(epi2_list) / len(epi2_list)
-
-    # 调和平均 IPC
-    harmonic_ipc1 = len(ipc1_list) / sum(1/i for i in ipc1_list)
-    harmonic_ipc2 = len(ipc2_list) / sum(1/i for i in ipc2_list)
-
-    avg_cpi1 = sum(cpi1_list) / len(cpi1_list)
-    avg_cpi2 = sum(cpi2_list) / len(cpi2_list)
-
-    avg_vfs1 = sum(vfs1_list) / len(vfs1_list)
-    avg_vfs2 = sum(vfs2_list) / len(vfs2_list)
+    avg_epi1 = summary1['epi']
+    avg_epi2 = summary2['epi']
+    harmonic_ipc1 = summary1['ipc']
+    harmonic_ipc2 = summary2['ipc']
+    avg_cpi1 = summary1['cpi']
+    avg_cpi2 = summary2['cpi']
+    avg_vfs1 = summary1['vfs']
+    avg_vfs2 = summary2['vfs']
+    avg_dpi1 = summary1['dpi']
+    avg_dpi2 = summary2['dpi']
+    avg_ppi1 = summary1['ppi']
+    avg_ppi2 = summary2['ppi']
 
     print(f"\n{'Metric':<25} {name1:>15} {name2:>15} {'vs Ref':>10} {'vs Ref':>10}")
     print("-" * 70)
@@ -510,6 +560,17 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
     print(f"Average CPI               {avg_cpi1:>13.6f} {avg_cpi2:>13.6f} "
           f"{'+' if d_cpi>0 else ''}{d_cpi:.2f}% (lower is better)")
 
+    d_dpi = ((avg_dpi2 - avg_dpi1) / avg_dpi1 * 100) if avg_dpi1 > 0 else 0
+    print(f"Average DPI               {avg_dpi1:>13.6f} {avg_dpi2:>13.6f} "
+          f"{'+' if d_dpi>0 else ''}{d_dpi:.2f}% (lower is better)")
+
+    d_ppi = ((avg_ppi2 - avg_ppi1) / avg_ppi1 * 100) if avg_ppi1 > 0 else 0
+    print(f"Average PPI               {avg_ppi1:>13.6f} {avg_ppi2:>13.6f} "
+          f"{'+' if d_ppi>0 else ''}{d_ppi:.2f}% (lower is better)")
+
+    print(f"P1/P2 Latency (cycles)   {summary1['p1_latency']:>6}/{summary1['p2_latency']:<6} "
+          f"{summary2['p1_latency']:>6}/{summary2['p2_latency']:<6}")
+
     d_vfs = ((avg_vfs2 - avg_vfs1) / avg_vfs1 * 100) if avg_vfs1 > 0 else 0
     print(f"Average VFS Score         {avg_vfs1:>13.4f} {avg_vfs2:>13.4f} "
           f"{'+' if d_vfs>0 else ''}{d_vfs:.2f}%")
@@ -522,6 +583,8 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
         'avg_epi1': avg_epi1, 'avg_epi2': avg_epi2,
         'harmonic_ipc1': harmonic_ipc1, 'harmonic_ipc2': harmonic_ipc2,
         'avg_cpi1': avg_cpi1, 'avg_cpi2': avg_cpi2,
+        'avg_dpi1': avg_dpi1, 'avg_dpi2': avg_dpi2,
+        'avg_ppi1': avg_ppi1, 'avg_ppi2': avg_ppi2,
         'avg_vfs1': avg_vfs1, 'avg_vfs2': avg_vfs2
     }
 
@@ -614,6 +677,8 @@ def main():
                         help='Label for base in output (e.g., "before", "v1", default: "base")')
     parser.add_argument('--compare-label', default='modified',
                         help='Label for compare in output (e.g., "after", "v2", default: "modified")')
+    parser.add_argument('--reference-csv', default=DEFAULT_CSV,
+                        help='Path to CSV file used to load reference MPKI (default: docs/example_and_reference_predictor_results.csv)')
 
     args = parser.parse_args()
 
@@ -665,13 +730,13 @@ def main():
 
     if args.storage1:
         storage1 = calc_storage(parse_storage_config(args.storage1))
-    elif name1 in PREDICTORS:
-        storage1 = calc_storage(PREDICTORS[name1])
+    elif args.base_predictor in PREDICTORS:
+        storage1 = calc_storage(PREDICTORS[args.base_predictor])
 
     if args.storage2:
         storage2 = calc_storage(parse_storage_config(args.storage2))
-    elif name2 in PREDICTORS:
-        storage2 = calc_storage(PREDICTORS[name2])
+    elif args.compare_predictor in PREDICTORS:
+        storage2 = calc_storage(PREDICTORS[args.compare_predictor])
 
     if storage1 and storage2:
         print_storage_comparison(storage1, storage2, name1, name2)
@@ -679,30 +744,25 @@ def main():
         print("\nNote: Storage comparison skipped (predictor configs not found or use --storage1/--storage2)")
 
     # 加载 reference MPKI
-    print(f"\nLoading reference MPKI from {args.base_csv}...")
-    ref_mpki = load_ref_mpki_from_csv(args.base_csv)
+    print(f"\nLoading reference MPKI from {args.reference_csv}...")
+    ref_mpki = load_ref_mpki_from_csv(args.reference_csv)
     print(f"  Loaded {len(ref_mpki)} benchmarks")
 
-    # 计算 P1/P2 延迟
-    p1_lat = 0
-    p2_lat = 0
-    for bench in common:
-        p1_lat = max(p1_lat, math.ceil(results1[bench]['p1_lat']))
-        p1_lat = max(p1_lat, math.ceil(results2[bench]['p1_lat']))
-        p2_lat = max(p2_lat, math.ceil(results1[bench]['p2_lat']))
-        p2_lat = max(p2_lat, math.ceil(results2[bench]['p2_lat']))
+    summary1 = summarize_predictor_metrics(results1, common)
+    summary2 = summarize_predictor_metrics(results2, common)
 
-    print(f"\nUsing latencies: P1={p1_lat}, P2={p2_lat}")
+    print(f"\n{name1} predictor_metrics latencies: P1={summary1['p1_latency']}, P2={summary1['p2_latency']}")
+    print(f"{name2} predictor_metrics latencies: P1={summary2['p1_latency']}, P2={summary2['p2_latency']}")
 
     # 计算每个 benchmark 的指标
-    metrics1 = {b: calc_metrics(results1[b], p1_lat, p2_lat) for b in common}
-    metrics2 = {b: calc_metrics(results2[b], p1_lat, p2_lat) for b in common}
+    metrics1 = {b: calc_metrics(results1[b], summary1['p1_latency'], summary1['p2_latency']) for b in common}
+    metrics2 = {b: calc_metrics(results2[b], summary2['p1_latency'], summary2['p2_latency']) for b in common}
 
     # 打印每 benchmark 对比（包含 reference MPKI）
     print_per_benchmark_comparison(common, metrics1, metrics2, results1, results2, ref_mpki, name1, name2)
 
     # 打印总体统计
-    overall = print_overall_statistics(common, metrics1, metrics2, ref_mpki, name1, name2)
+    overall = print_overall_statistics(common, metrics1, metrics2, ref_mpki, summary1, summary2, name1, name2)
 
     # 导出 CSV（包含 reference MPKI）
     export_csv(common, metrics1, metrics2, results1, results2, ref_mpki, args.output, name1, name2)

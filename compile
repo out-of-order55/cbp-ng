@@ -1,19 +1,20 @@
 #!/bin/bash
 
-FILE=$1
+# FILE=$1
+NAME=$1
 shift
 EXTRA=$@
 
-NAME="${FILE%.*}"
 
-if [ "$NAME" == "$FILE" ]; then
-    FILE="${FILE}.cpp"
-fi
 
+# if [ "$NAME" == "$FILE" ]; then
+#     FILE="${FILE}.cpp"
+# fi
+FILE="cbp.cpp"
 COMPILE="g++ -std=c++20"
 OPT="-O3"
 FLAGS="-Wall -Wextra -pedantic -Wold-style-cast  -Wno-deprecated-declarations -Wno-mismatched-tags"
 
 set -x
 
-$COMPILE -o $NAME $FILE -lz $OPT $FLAGS $EXTRA
+$COMPILE -o $NAME $FILE -lz -lsqlite3 $OPT $FLAGS $EXTRA
