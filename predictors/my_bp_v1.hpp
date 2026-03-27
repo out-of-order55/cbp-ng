@@ -59,7 +59,9 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <cstdint>
 #include <sqlite3.h>
+#include "my_bp_v1_perf.hpp"
 
 using namespace hcm;
 #ifdef DEBUG_ENERGY
@@ -198,6 +200,8 @@ struct my_bp_v1 : predictor {
     reg<LINEINST> block_entry; // one-hot vector
 
 #ifdef PERF_COUNTERS
+    my_bp_v1_perf::PerfState perf_event_state;
+
     // Store prediction source per offset (set in predict2, read in update_cycle)
     // 0=bimodal, 1=provider, 2=alt
     arr<reg<2>,LINEINST> pred_source_stored;
@@ -394,17 +398,28 @@ struct my_bp_v1 : predictor {
     {
         bool filter_open = static_cast<bool>(bgehl_imli_filter);
         for (u64 offset = 0; offset < LINEINST; offset++) {
-            if (!static_cast<bool>(is_branch[offset])) continue;
+            bool is_branch_slot = static_cast<bool>(is_branch[offset]);
+            if (!is_branch_slot) continue;
+            bool nonzero_contrib = filter_open && (static_cast<i64>(bgehl_map[offset]) != 0);
+            bool sc_update_candidate = static_cast<bool>(is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset]);
+
+            my_bp_v1_perf::BgehlSlotEvent bgehl_event;
+            bgehl_event.is_branch = true;
+            bgehl_event.filter_open = filter_open;
+            bgehl_event.nonzero_contrib = nonzero_contrib;
+            bgehl_event.update_candidate = sc_update_candidate;
+            bgehl_event.update_allow = sc_update_candidate;
+            my_bp_v1_perf::on_bgehl_slot(perf_event_state, bgehl_event);
+
             perf_bgehl_branch_slots++;
             if (filter_open) {
                 perf_bgehl_filter_allow++;
-                if (static_cast<i64>(bgehl_map[offset]) != 0)
+                if (nonzero_contrib)
                     perf_bgehl_nonzero_contrib++;
             } else {
                 perf_bgehl_filter_block++;
             }
 
-            bool sc_update_candidate = static_cast<bool>(is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset]);
             if (!sc_update_candidate) continue;
             perf_bgehl_update_candidate++;
             perf_bgehl_update_allow++;
@@ -721,6 +736,69 @@ struct my_bp_v1 : predictor {
                       << ")    │\n";
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
+        my_bp_v1_perf::print_phase_c1_summary(
+            std::cerr,
+            perf_event_state,
+            perf_predictions,
+            perf_correct,
+            total_mispred);
+
+        std::uint64_t legacy_gate_count = 0;
+        std::uint64_t legacy_gate_mispred = 0;
+        std::uint64_t legacy_gate_update_inc = 0;
+        std::uint64_t legacy_gate_update_dec = 0;
+#ifdef GATE
+        legacy_gate_count = perf_gate_count;
+        legacy_gate_mispred = perf_gate_mispred;
+        legacy_gate_update_inc = perf_gate_update_inc;
+        legacy_gate_update_dec = perf_gate_update_dec;
+#endif
+
+        std::uint64_t legacy_bgehl_read_ops = 0;
+        std::uint64_t legacy_bgehl_write_ops = 0;
+        std::uint64_t legacy_bgehl_branch_slots = 0;
+        std::uint64_t legacy_bgehl_filter_allow = 0;
+        std::uint64_t legacy_bgehl_filter_block = 0;
+        std::uint64_t legacy_bgehl_nonzero_contrib = 0;
+        std::uint64_t legacy_bgehl_update_candidate = 0;
+        std::uint64_t legacy_bgehl_update_allow = 0;
+        std::uint64_t legacy_bgehl_update_block = 0;
+#ifdef MY_SC
+#ifdef SC_BGEHL
+        legacy_bgehl_read_ops = perf_bgehl_read_ops;
+        legacy_bgehl_write_ops = perf_bgehl_write_ops;
+        legacy_bgehl_branch_slots = perf_bgehl_branch_slots;
+        legacy_bgehl_filter_allow = perf_bgehl_filter_allow;
+        legacy_bgehl_filter_block = perf_bgehl_filter_block;
+        legacy_bgehl_nonzero_contrib = perf_bgehl_nonzero_contrib;
+        legacy_bgehl_update_candidate = perf_bgehl_update_candidate;
+        legacy_bgehl_update_allow = perf_bgehl_update_allow;
+        legacy_bgehl_update_block = perf_bgehl_update_block;
+#endif
+#endif
+
+        my_bp_v1_perf::print_phase_c2_ec_gate_bgehl_summary(
+            std::cerr,
+            perf_event_state,
+            perf_extra_cycle_total,
+            perf_extra_cycle_badpred,
+            perf_extra_cycle_mispredict,
+            perf_extra_cycle_p1_update,
+            perf_extra_cycle_sc_update,
+            legacy_gate_count,
+            legacy_gate_mispred,
+            legacy_gate_update_inc,
+            legacy_gate_update_dec,
+            legacy_bgehl_read_ops,
+            legacy_bgehl_write_ops,
+            legacy_bgehl_branch_slots,
+            legacy_bgehl_filter_allow,
+            legacy_bgehl_filter_block,
+            legacy_bgehl_nonzero_contrib,
+            legacy_bgehl_update_candidate,
+            legacy_bgehl_update_allow,
+            legacy_bgehl_update_block);
+
         // Finalize SQLite trace
         close_trace_db();
         std::cerr << "│ Full exec trace written to: trace_v1.db                         │\n";
@@ -810,6 +888,16 @@ struct my_bp_v1 : predictor {
 #else
     void perf_count_extra_cycle(val<1> extra_cycle, val<1> some_badpred1, val<1> mispredict, val<1> p1_update) {
 #endif
+        my_bp_v1_perf::ExtraCycleEvent extra_cycle_event;
+        extra_cycle_event.extra_cycle = static_cast<bool>(extra_cycle);
+        extra_cycle_event.badpred = static_cast<bool>(some_badpred1);
+        extra_cycle_event.mispredict = static_cast<bool>(mispredict);
+        extra_cycle_event.p1_update = static_cast<bool>(p1_update);
+#ifdef MY_SC
+        extra_cycle_event.sc_update = static_cast<bool>(sc_need_update);
+#endif
+        my_bp_v1_perf::on_extra_cycle(perf_event_state, extra_cycle_event);
+
         perf_extra_cycle_total      += static_cast<u64>(extra_cycle);
         perf_extra_cycle_badpred    += static_cast<u64>(some_badpred1);
         perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
@@ -821,6 +909,13 @@ struct my_bp_v1 : predictor {
 
 #ifdef GATE
     void perf_count_gate(val<1> gating_local, val<1> mispredict_local, val<1> gate_inc, val<1> gate_dec) {
+        my_bp_v1_perf::GateEvent gate_event;
+        gate_event.gating = static_cast<bool>(gating_local);
+        gate_event.mispredict = static_cast<bool>(mispredict_local);
+        gate_event.gate_inc = static_cast<bool>(gate_inc);
+        gate_event.gate_dec = static_cast<bool>(gate_dec);
+        my_bp_v1_perf::on_gate(perf_event_state, gate_event);
+
         perf_gate_count      += static_cast<u64>(gating_local);
         perf_gate_mispred    += static_cast<u64>(gating_local & mispredict_local);
         perf_gate_update_inc += static_cast<u64>(gate_inc);
@@ -868,6 +963,11 @@ struct my_bp_v1 : predictor {
             val<1> actual = branch_taken[offset];
             val<1> predicted = (p2 >> offset) & val<1>{1};
             val<1> correct = (predicted == actual);
+            my_bp_v1_perf::ResolveEvent resolve_event;
+            resolve_event.offset = static_cast<std::uint8_t>(offset);
+            resolve_event.is_branch = true;
+            resolve_event.correct = static_cast<bool>(correct);
+            my_bp_v1_perf::on_resolve(perf_event_state, resolve_event);
 
             if (static_cast<bool>(correct)) {
                 perf_correct++;
@@ -1564,6 +1664,7 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_BGEHL
 #ifdef PERF_COUNTERS
+        my_bp_v1_perf::on_bgehl_read_ops(perf_event_state, LINEINST);
         perf_bgehl_read_ops += LINEINST;
 #endif
 #endif
@@ -2336,6 +2437,7 @@ struct my_bp_v1 : predictor {
 #endif
 #ifdef SC_BGEHL
 #ifdef PERF_COUNTERS
+            my_bp_v1_perf::on_bgehl_write_ops(perf_event_state, static_cast<u64>(sc_update_en));
             perf_bgehl_write_ops += static_cast<u64>(sc_update_en);
 #endif
 #endif
