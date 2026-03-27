@@ -5,31 +5,38 @@
 
 // #define GATE
 #define MY_SC
-#if !defined(SC_DISABLE_FGEHL)
-#define SC_FGEHL
-#endif
-#if !defined(SC_DISABLE_BGEHL)
-#define SC_BGEHL
-#endif
-// #define SC_DISABLE_BIAS
-// #define SC_DISABLE_GEHL
-// #define SC_DISABLE_FGEHL
-// #define SC_DISABLE_BGEHL
 
-#if !defined(SC_DISABLE_BIAS)
+#if (defined(SC_CFG_BASE) + defined(SC_CFG_MEDIUM) + defined(SC_CFG_FULL)) > 1
+#error "Select at most one of SC_CFG_BASE, SC_CFG_MEDIUM, SC_CFG_FULL"
+#endif
+
+#if !defined(SC_CFG_BASE) && !defined(SC_CFG_MEDIUM) && !defined(SC_CFG_FULL)
+#define SC_CFG_FULL
+#endif
+
+#if defined(SC_CFG_BASE)
 #define SC_USE_BIAS
 #endif
 
-#if !defined(SC_DISABLE_GEHL)
-#define SC_USE_GEHL
+#if defined(SC_CFG_MEDIUM)
+#define SC_USE_BIAS
+#define SC_USE_BRIMLI
 #endif
 
-#ifndef MY_BP_V1_GHYST_USE_WB_RWRAM
-#define MY_BP_V1_GHYST_USE_WB_RWRAM 0
+#if defined(SC_CFG_FULL)
+#define SC_USE_BIAS
+#define SC_FGEHL
+#define SC_BGEHL
+#define SC_USE_TAIMLI
+#define SC_USE_BRIMLI
 #endif
 
-#ifndef MY_BP_V1_GHYST_HIT_UPDATE
-#define MY_BP_V1_GHYST_HIT_UPDATE 0
+#if defined(SC_FGEHL) || defined(SC_USE_BRIMLI)
+#define SC_USE_FHIST
+#endif
+
+#if defined(SC_BGEHL) || defined(SC_USE_TAIMLI) || defined(SC_USE_BRIMLI)
+#define SC_USE_BHIST
 #endif
 
 #ifndef SC_GLOBAL_THRE_INIT
@@ -84,13 +91,18 @@ struct my_bp_v1 : predictor {
     static constexpr u64 NUMGEHL = 2;
     static constexpr u64 LOGGEHL = 10;
     static_assert(SC_GLOBAL_THRE_PIPE_STAGES >= 1);
-#ifdef SC_FGEHL
+#ifdef SC_USE_FHIST
     static constexpr u64 LOGFGEHL = LOGGEHL;
     static constexpr u64 FHIST_BITS = 48;
 #endif
-#ifdef SC_BGEHL
+#ifdef SC_USE_BHIST
     static constexpr u64 LOGBGEHL = LOGGEHL;
     static constexpr u64 BHIST_BITS = 48;
+    static constexpr u64 LOGIMLI = LOGGEHL;
+    static constexpr u64 IMLI_BITS = 6;
+    static constexpr u64 IMLI_REGION_SHIFT = 6;
+    static constexpr u64 IMLI_REGION_BITS = 16 - IMLI_REGION_SHIFT;
+    static constexpr u64 IMLI_FILTER_THRESHOLD = 12;
 #endif
     static constexpr u64 TOTAL_THREBITS = 10;
     static constexpr u64 GLOBAL_THREBITS = 9;
@@ -105,23 +117,7 @@ struct my_bp_v1 : predictor {
     static constexpr u64 LOGGATEBITS = 5;
     static constexpr u64 TAGGATEBITS = 8;
     static constexpr u64 CTRGATEBITS = 3;
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-  #if WB_RWRAM_DROP_OLDEST_ON_CONFLICT
-    #if MY_BP_V1_GHYST_HIT_UPDATE
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_drop_oldest_hit_update";
-    #else
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_drop_oldest_hit_overwrite";
-    #endif
-  #else
-    #if MY_BP_V1_GHYST_HIT_UPDATE
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_keep_oldest_hit_update";
-    #else
-    static constexpr const char *GHYST_IMPL_NAME = "wb_rwram_d1_keep_oldest_hit_overwrite";
-    #endif
-  #endif
-#else
     static constexpr const char *GHYST_IMPL_NAME = "rwram";
-#endif
 
 #ifdef USE_ALT
     static constexpr u64 METAPIPE = 2;
@@ -285,6 +281,17 @@ struct my_bp_v1 : predictor {
     u64 perf_mispred_sc_flip = 0;           // use_sc=1, sc!=tage, final wrong
     u64 perf_mispred_sc_flip_harmful = 0;   // flip, tage correct, sc wrong
     u64 perf_mispred_sc_flip_both_wrong = 0; // flip, tage wrong, sc wrong
+#ifdef SC_BGEHL
+    u64 perf_bgehl_read_ops = 0;           // logical BGEHL reads in prediction
+    u64 perf_bgehl_write_ops = 0;          // logical BGEHL writes in update
+    u64 perf_bgehl_branch_slots = 0;       // branch offsets that could consume BGEHL
+    u64 perf_bgehl_filter_allow = 0;       // branch offsets with IMLI filter open
+    u64 perf_bgehl_filter_block = 0;       // branch offsets with IMLI filter closed
+    u64 perf_bgehl_nonzero_contrib = 0;    // branch offsets where BGEHL contribution is non-zero
+    u64 perf_bgehl_update_candidate = 0;   // branch offsets with SC update candidate
+    u64 perf_bgehl_update_allow = 0;       // SC update candidates that reached BGEHL
+    u64 perf_bgehl_update_block = 0;       // SC update candidates blocked by IMLI filter
+#endif
 
 #endif
 
@@ -380,6 +387,31 @@ struct my_bp_v1 : predictor {
             sqlite3_exec(trace_db, "BEGIN;",  nullptr, nullptr, nullptr);
         }
     }
+
+#ifdef MY_SC
+#ifdef SC_BGEHL
+    void perf_count_bgehl(arr<val<1>,LINEINST> is_branch)
+    {
+        bool filter_open = static_cast<bool>(bgehl_imli_filter);
+        for (u64 offset = 0; offset < LINEINST; offset++) {
+            if (!static_cast<bool>(is_branch[offset])) continue;
+            perf_bgehl_branch_slots++;
+            if (filter_open) {
+                perf_bgehl_filter_allow++;
+                if (static_cast<i64>(bgehl_map[offset]) != 0)
+                    perf_bgehl_nonzero_contrib++;
+            } else {
+                perf_bgehl_filter_block++;
+            }
+
+            bool sc_update_candidate = static_cast<bool>(is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset]);
+            if (!sc_update_candidate) continue;
+            perf_bgehl_update_candidate++;
+            perf_bgehl_update_allow++;
+        }
+    }
+#endif
+#endif
 
     void print_perf_counters() {
         std::cerr << "\n╔════════════════════════════════════════════════════════════════╗\n";
@@ -620,25 +652,36 @@ struct my_bp_v1 : predictor {
 #endif
         std::cerr << "└────────────────────────────────────────────────────────���──────┘\n";
 
+#ifdef MY_SC
+#ifdef SC_BGEHL
+        std::cerr << "\n┌─ BGEHL Statistics ──────────────────────────────────────────────┐\n";
+        std::cerr << "│ ReadOps/WriteOps:        " << std::setw(36) << std::left
+                  << (std::to_string(perf_bgehl_read_ops) + " / " + std::to_string(perf_bgehl_write_ops)) << "│\n";
+        std::cerr << "│ Branch Slots:            " << std::setw(36) << std::left << perf_bgehl_branch_slots << "│\n";
+        std::cerr << "│ Filter Allow/Block:      " << std::setw(36) << std::left
+                  << (std::to_string(perf_bgehl_filter_allow) + " / " + std::to_string(perf_bgehl_filter_block)) << "│\n";
+        std::cerr << "│ Nonzero Contribution:    " << std::setw(36) << std::left
+                  << (std::to_string(perf_bgehl_nonzero_contrib) +
+                      (perf_bgehl_branch_slots ? " (" + std::to_string(100.0 * perf_bgehl_nonzero_contrib / perf_bgehl_branch_slots).substr(0,6) + "%)" : "")) << "│\n";
+        std::cerr << "│ Update Cand/Allow/Block: " << std::setw(36) << std::left
+                  << (std::to_string(perf_bgehl_update_candidate) + " / " +
+                      std::to_string(perf_bgehl_update_allow) + " / " +
+                      std::to_string(perf_bgehl_update_block)) << "│\n";
+        std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
+#endif
+#endif
+
         u64 ghyst_reads = 0;
         u64 ghyst_writes = 0;
         u64 ghyst_stale_reads = 0;
         u64 ghyst_drop_writes = 0;
         u64 ghyst_write_hit_events = 0;
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-        u64 ghyst_read_pending_hits = 0;
-        u64 ghyst_read_pending_depth1 = 0;
-#endif
         for (u64 j = 0; j < NUMG; j++) {
             ghyst_reads += ghyst[j].perf_total_reads();
             ghyst_writes += ghyst[j].perf_total_writes();
             ghyst_stale_reads += ghyst[j].perf_total_stale_reads();
             ghyst_drop_writes += ghyst[j].perf_total_drop_writes();
             ghyst_write_hit_events += ghyst[j].perf_total_write_updates();
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-            ghyst_read_pending_hits += ghyst[j].perf_total_read_pending_hits();
-            ghyst_read_pending_depth1 += ghyst[j].perf_total_read_pending_hit_depth(0);
-#endif
         }
         std::cerr << "\n┌─ GHyst RAM Statistics ──────────────────────────────────────────┐\n";
         std::cerr << "│ Impl:                   " << std::setw(36) << std::left << GHYST_IMPL_NAME << "│\n";
@@ -648,21 +691,8 @@ struct my_bp_v1 : predictor {
                   << (std::to_string(ghyst_stale_reads) + (ghyst_reads ? " (" + std::to_string(100.0 * ghyst_stale_reads / ghyst_reads).substr(0,6) + "%)" : "")) << "│\n";
         std::cerr << "│ Dropped Writes:         " << std::setw(36) << std::left
                   << (std::to_string(ghyst_drop_writes) + (ghyst_writes ? " (" + std::to_string(100.0 * ghyst_drop_writes / ghyst_writes).substr(0,6) + "%)" : "")) << "│\n";
-#if MY_BP_V1_GHYST_HIT_UPDATE
-        std::cerr << "│ Write Updates:          " << std::setw(36) << std::left
-                  << (std::to_string(ghyst_write_hit_events) + (ghyst_writes ? " (" + std::to_string(100.0 * ghyst_write_hit_events / ghyst_writes).substr(0,6) + "%)" : "")) << "│\n";
-#else
         std::cerr << "│ Write Hit Events:       " << std::setw(36) << std::left
                   << (std::to_string(ghyst_write_hit_events) + (ghyst_writes ? " (" + std::to_string(100.0 * ghyst_write_hit_events / ghyst_writes).substr(0,6) + "%)" : "")) << "│\n";
-#endif
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-        std::cerr << "│ Read Pending Hits:      " << std::setw(36) << std::left
-                  << (std::to_string(ghyst_read_pending_hits) + (ghyst_reads ? " (" + std::to_string(100.0 * ghyst_read_pending_hits / ghyst_reads).substr(0,6) + "%)" : "")) << "│\n";
-        std::cerr << "│ Pending Depth1:         " << std::setw(36) << std::left
-                  << (std::to_string(ghyst_read_pending_depth1) +
-                      (ghyst_read_pending_hits ? " (" + std::to_string(100.0 * ghyst_read_pending_depth1 / ghyst_read_pending_hits).substr(0,6) + "%)" : ""))
-                  << "│\n";
-#endif
         std::cerr << "└─────────────────────────────────────────────────────────────────┘\n";
 
         // Allocation failures
@@ -1121,14 +1151,36 @@ struct my_bp_v1 : predictor {
     reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
     ram<val<PERCWIDTH,i64>,(1<<(LOGFGEHL-LOGLINEINST))> fgehl[LINEINST] {"FGEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
+#endif
+#ifdef SC_USE_FHIST
     reg<FHIST_BITS> fhist;
 #endif
+#ifdef SC_USE_BHIST
 #ifdef SC_BGEHL
     reg<LOGBGEHL-LOGLINEINST> bgehl_idx;
     ram<val<PERCWIDTH,i64>,(1<<(LOGBGEHL-LOGLINEINST))> bgehl[LINEINST] {"BGEHL"};
     arr<reg<PERCWIDTH,i64>,LINEINST> bgehl_map;
-    reg<BHIST_BITS> bhist;
 #endif
+#ifdef SC_USE_TAIMLI
+    reg<LOGIMLI-LOGLINEINST> imlita_idx;
+    ram<val<PERCWIDTH,i64>,(1<<(LOGIMLI-LOGLINEINST))> imlita[LINEINST] {"IMLI target"};
+    arr<reg<PERCWIDTH,i64>,LINEINST> imlita_map;
+#endif
+#ifdef SC_USE_BRIMLI
+    reg<LOGIMLI-LOGLINEINST> imlibr_idx;
+    ram<val<PERCWIDTH,i64>,(1<<(LOGIMLI-LOGLINEINST))> imlibr[LINEINST] {"IMLI branch"};
+    arr<reg<PERCWIDTH,i64>,LINEINST> imlibr_map;
+#endif
+    reg<BHIST_BITS> bhist;
+    reg<IMLI_BITS> ta_imli;
+    reg<IMLI_BITS> br_imli;
+    reg<IMLI_REGION_BITS> last_backward_target_region;
+    reg<IMLI_REGION_BITS> last_backward_pc_region;
+#ifdef SC_BGEHL
+    reg<1> bgehl_imli_filter;
+#endif
+#endif
+
     // intermediate update signals
     arr<reg<1>,LINEINST> sc_wrong_arr;
     arr<reg<1>,LINEINST> do_update_arr;
@@ -1144,11 +1196,7 @@ struct my_bp_v1 : predictor {
     ram<val<TAGW>,(1<<LOGG)> gtag[NUMG] {"tags"}; // tags
     // rwram<TAGW,(1<<LOGG),4> gtag[NUMG] {"tags"}; // tags
     ram<val<1>,(1<<LOGG)> gpred[NUMG] {"gpred"}; // predictions
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-    wb_rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
-#else
     rwram<2,(1<<LOGG),4> ghyst[NUMG] {"ghyst"}; // hysteresis
-#endif
 
     rwram<1,(1<<LOGG),4> ubit[NUMG] {"u"}; // "useful" bits
     zone UPDATE_ONLY;
@@ -1458,16 +1506,67 @@ struct my_bp_v1 : predictor {
         }};
         fgehl_map.fanout(hard<2>{});
 #endif
+#ifdef SC_USE_BHIST
 #ifdef SC_BGEHL
+#ifdef SC_USE_TAIMLI
+        val<1> ta_imli_small = val<IMLI_BITS>{ta_imli} < val<IMLI_BITS>{IMLI_FILTER_THRESHOLD};
+#else
+        val<1> ta_imli_small = val<1>{1};
+#endif
+#ifdef SC_USE_BRIMLI
+        val<1> br_imli_small = val<IMLI_BITS>{br_imli} < val<IMLI_BITS>{IMLI_FILTER_THRESHOLD};
+#else
+        val<1> br_imli_small = val<1>{1};
+#endif
+        val<1> bgehl_hist_ok = ta_imli_small & br_imli_small;
         val<LOGBGEHL-LOGLINEINST> bgehl_base_index = inst_pc >> LOGLB;
         val<BHIST_BITS> bh_mix = val<BHIST_BITS>{bhist} ^ (val<BHIST_BITS>{bhist} >> hard<13>{}) ^ (val<BHIST_BITS>{bhist} >> hard<29>{});
         val<LOGBGEHL-LOGLINEINST> bidx = bgehl_base_index ^ val<LOGBGEHL-LOGLINEINST>{bh_mix};
+        bgehl_hist_ok.fanout(hard<LINEINST+3>{});
         bidx.fanout(hard<LINEINST+1>{});
         bgehl_idx = bidx;
+        bgehl_imli_filter = bgehl_hist_ok;
         bgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
             return bgehl[offset].read(bidx);
         }};
         bgehl_map.fanout(hard<2>{});
+#endif
+#ifdef SC_USE_TAIMLI
+        val<IMLI_BITS> bhist_low_imli = val<IMLI_BITS>{bhist};
+        val<1> ta_imli_zero = val<IMLI_BITS>{ta_imli} == val<IMLI_BITS>{0};
+        val<1> ta_imli_alias = val<IMLI_BITS>{br_imli} == val<IMLI_BITS>{ta_imli};
+        val<IMLI_BITS> f_ta_imli = select(ta_imli_zero | ta_imli_alias, bhist_low_imli, val<IMLI_BITS>{ta_imli});
+        val<LOGIMLI-LOGLINEINST> imli_base_index_ta = inst_pc >> LOGLB;
+        val<LOGIMLI-LOGLINEINST> ta_idx = imli_base_index_ta ^ val<LOGIMLI-LOGLINEINST>{f_ta_imli} ^ val<LOGIMLI-LOGLINEINST>{inst_pc >> 4};
+        ta_idx.fanout(hard<LINEINST+1>{});
+        imlita_idx = ta_idx;
+        imlita_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            return imlita[offset].read(ta_idx);
+        }};
+        imlita_map.fanout(hard<2>{});
+#endif
+#ifdef SC_USE_BRIMLI
+    #ifdef SC_FGEHL
+        val<IMLI_BITS> fhist_low_imli = val<IMLI_BITS>{fhist};
+    #else
+        val<IMLI_BITS> fhist_low_imli = val<IMLI_BITS>{bhist};
+    #endif
+        val<1> br_imli_zero = val<IMLI_BITS>{br_imli} == val<IMLI_BITS>{0};
+        val<IMLI_BITS> f_br_imli = select(br_imli_zero, fhist_low_imli, val<IMLI_BITS>{br_imli});
+        val<LOGIMLI-LOGLINEINST> imli_base_index_br = inst_pc >> LOGLB;
+        val<LOGIMLI-LOGLINEINST> br_idx = imli_base_index_br ^ val<LOGIMLI-LOGLINEINST>{f_br_imli} ^ val<LOGIMLI-LOGLINEINST>{inst_pc >> 6};
+        br_idx.fanout(hard<LINEINST+1>{});
+        imlibr_idx = br_idx;
+        imlibr_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
+            return imlibr[offset].read(br_idx);
+        }};
+        imlibr_map.fanout(hard<2>{});
+#endif
+#ifdef SC_BGEHL
+#ifdef PERF_COUNTERS
+        perf_bgehl_read_ops += LINEINST;
+#endif
+#endif
 #endif
 #ifdef DEBUG_ENERGY
         energy_mark("SCHistRead");
@@ -1512,15 +1611,38 @@ struct my_bp_v1 : predictor {
 #else
             val<TOTAL_THREBITS,i64> fgehl_ext = val<TOTAL_THREBITS,i64>{0};
 #endif
+#ifdef SC_USE_BHIST
 #ifdef SC_BGEHL
             val<PERCWIDTH,i64> bgehl_v = bgehl_map[offset];
             bgehl_v.fanout(hard<2>{});
             val<1> bgehl_sign = val<1>{bgehl_v >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> bgehl_ext = concat(bgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bgehl_v});
+            val<TOTAL_THREBITS,i64> raw_bgehl_ext = concat(bgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bgehl_v});
+            val<TOTAL_THREBITS,i64> bgehl_ext = select(bgehl_hist_ok, raw_bgehl_ext, val<TOTAL_THREBITS,i64>{0});
 #else
             val<TOTAL_THREBITS,i64> bgehl_ext = val<TOTAL_THREBITS,i64>{0};
 #endif
-            val<TOTAL_THREBITS,i64> sc_hist_sum = gehl0_ext + gehl1_ext + fgehl_ext + bgehl_ext;
+#ifdef SC_USE_TAIMLI
+            val<PERCWIDTH,i64> imlita_v = imlita_map[offset];
+            imlita_v.fanout(hard<2>{});
+            val<1> imlita_sign = val<1>{imlita_v >> hard<PERCWIDTH-1>{}};
+            val<TOTAL_THREBITS,i64> imlita_ext = concat(imlita_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{imlita_v});
+#else
+            val<TOTAL_THREBITS,i64> imlita_ext = val<TOTAL_THREBITS,i64>{0};
+#endif
+#ifdef SC_USE_BRIMLI
+            val<PERCWIDTH,i64> imlibr_v = imlibr_map[offset];
+            imlibr_v.fanout(hard<2>{});
+            val<1> imlibr_sign = val<1>{imlibr_v >> hard<PERCWIDTH-1>{}};
+            val<TOTAL_THREBITS,i64> imlibr_ext = concat(imlibr_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{imlibr_v});
+#else
+            val<TOTAL_THREBITS,i64> imlibr_ext = val<TOTAL_THREBITS,i64>{0};
+#endif
+#else
+            val<TOTAL_THREBITS,i64> bgehl_ext = val<TOTAL_THREBITS,i64>{0};
+            val<TOTAL_THREBITS,i64> imlita_ext = val<TOTAL_THREBITS,i64>{0};
+            val<TOTAL_THREBITS,i64> imlibr_ext = val<TOTAL_THREBITS,i64>{0};
+#endif
+            val<TOTAL_THREBITS,i64> sc_hist_sum = gehl0_ext + gehl1_ext + fgehl_ext + bgehl_ext + imlita_ext + imlibr_ext;
             return sc_hist_sum + bias_ext;
         }};
         
@@ -1629,11 +1751,6 @@ struct my_bp_v1 : predictor {
         val<64> &next_pc = block_end_info.next_pc;
         // updates for all conditional branches in the predicted block
         if (num_branch == 0) {
-            for (u64 i=0; i<NUMG; i++) {
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-                ghyst[i].write(gindex[i],val<2>{0},val<1>{0},gindex[i],val<1>{1},val<1>{0});
-#endif
-            }
             // no conditional branch in this block
             val<1> line_end = block_entry >> (LINEINST-block_size);
             // update global history if previous block ended on a mispredicted not-taken branch
@@ -1999,17 +2116,7 @@ struct my_bp_v1 : predictor {
             // if allocated entry, set hysteresis to 0;
             // otherwise, increment hysteresis if correct pred, decrement if incorrect
             val<2> newhyst = select(allocate[i],val<2>{0},update_ctr(readh[i],~badpred1[i]));
-#if MY_BP_V1_GHYST_USE_WB_RWRAM
-  #if MY_BP_V1_GHYST_HIT_UPDATE
-            ghyst[i].write_update(gindex[i], newhyst.fo1(), do_ghyst_write,
-                                  primary[i] & ~allocate[i], ~badpred1[i],
-                                  gindex[i], ~extra_cycle, extra_cycle);
-#else
-            ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,gindex[i],~extra_cycle,extra_cycle);
-#endif
-#else
             ghyst[i].write(gindex[i],newhyst.fo1(),do_ghyst_write,extra_cycle);
-#endif
         }
 
 #ifdef RESET_UBITS
@@ -2087,15 +2194,28 @@ struct my_bp_v1 : predictor {
             fhist = new_fhist;
         });
 #endif
-#if defined(MY_SC) && defined(SC_BGEHL)
+#if defined(MY_SC) && defined(SC_USE_BHIST)
         val<64> last_branch_pc_b = branch_pc[num_branch-1];
         val<1> last_branch_taken_b = branch_dir[num_branch-1];
         val<1> last_backward = next_pc < last_branch_pc_b;
         val<BHIST_BITS> next_pc_fold_b = val<BHIST_BITS>{next_pc >> 2};
         val<BHIST_BITS> branch_pc_fold_b = val<BHIST_BITS>{last_branch_pc_b >> 1};
         val<BHIST_BITS> new_bhist = (val<BHIST_BITS>{bhist} << hard<3>{}) ^ next_pc_fold_b ^ branch_pc_fold_b;
-        execute_if(last_branch_taken_b & last_backward, [&](){
+        val<16> next_pc_low16_b = next_pc;
+        val<16> branch_pc_low16_b = last_branch_pc_b;
+        val<IMLI_REGION_BITS> next_pc_region_b = next_pc_low16_b >> hard<IMLI_REGION_SHIFT>{};
+        val<IMLI_REGION_BITS> branch_pc_region_b = branch_pc_low16_b >> hard<IMLI_REGION_SHIFT>{};
+        val<1> same_target_region = next_pc_region_b == val<IMLI_REGION_BITS>{last_backward_target_region};
+        val<1> same_branch_region = branch_pc_region_b == val<IMLI_REGION_BITS>{last_backward_pc_region};
+        val<IMLI_BITS> ta_imli_inc = update_ctr(val<IMLI_BITS>{ta_imli}, val<1>{1});
+        val<IMLI_BITS> br_imli_inc = update_ctr(val<IMLI_BITS>{br_imli}, val<1>{1});
+        val<1> do_backward_hist_update = last_branch_taken_b & last_backward;
+        execute_if(do_backward_hist_update, [&](){
             bhist = new_bhist;
+            ta_imli = select(same_target_region, ta_imli_inc, val<IMLI_BITS>{0});
+            br_imli = select(same_branch_region, br_imli_inc, val<IMLI_BITS>{0});
+            last_backward_target_region = next_pc_region_b;
+            last_backward_pc_region = branch_pc_region_b;
         });
 #endif
 #ifdef DEBUG_ENERGY
@@ -2186,6 +2306,7 @@ struct my_bp_v1 : predictor {
                 fgehl[offset].write(fgehl_write_idx, update_ctr(old_fgehl, branch_taken[offset]));
             });
 #endif
+#ifdef SC_USE_BHIST
 #ifdef SC_BGEHL
             val<LOGBGEHL-LOGLINEINST> bgehl_write_idx = bgehl_idx;
             val<PERCWIDTH,i64> old_bgehl = bgehl_map[offset];
@@ -2194,6 +2315,30 @@ struct my_bp_v1 : predictor {
             execute_if(sc_update_en, [&](){
                 bgehl[offset].write(bgehl_write_idx, update_ctr(old_bgehl, branch_taken[offset]));
             });
+#endif
+#ifdef SC_USE_TAIMLI
+            val<LOGIMLI-LOGLINEINST> imlita_write_idx = imlita_idx;
+            val<PERCWIDTH,i64> old_imlita = imlita_map[offset];
+            imlita_write_idx.fanout(hard<2>{});
+            old_imlita.fanout(hard<2>{});
+            execute_if(sc_update_en, [&](){
+                imlita[offset].write(imlita_write_idx, update_ctr(old_imlita, branch_taken[offset]));
+            });
+#endif
+#ifdef SC_USE_BRIMLI
+            val<LOGIMLI-LOGLINEINST> imlibr_write_idx = imlibr_idx;
+            val<PERCWIDTH,i64> old_imlibr = imlibr_map[offset];
+            imlibr_write_idx.fanout(hard<2>{});
+            old_imlibr.fanout(hard<2>{});
+            execute_if(sc_update_en, [&](){
+                imlibr[offset].write(imlibr_write_idx, update_ctr(old_imlibr, branch_taken[offset]));
+            });
+#endif
+#ifdef SC_BGEHL
+#ifdef PERF_COUNTERS
+            perf_bgehl_write_ops += static_cast<u64>(sc_update_en);
+#endif
+#endif
 #endif
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
@@ -2216,6 +2361,11 @@ struct my_bp_v1 : predictor {
 
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
+#ifdef MY_SC
+#ifdef SC_BGEHL
+        perf_count_bgehl(is_branch);
+#endif
+#endif
         perf_count_end_of_cycle(is_branch, branch_taken, mispredict, allocate, postmask, noalloc);
 #endif
 #endif
