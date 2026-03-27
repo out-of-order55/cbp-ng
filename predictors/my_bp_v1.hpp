@@ -25,7 +25,7 @@
 #endif
 
 #ifndef MY_BP_V1_GHYST_USE_WB_RWRAM
-#define MY_BP_V1_GHYST_USE_WB_RWRAM 1
+#define MY_BP_V1_GHYST_USE_WB_RWRAM 0
 #endif
 
 #ifndef MY_BP_V1_GHYST_HIT_UPDATE
