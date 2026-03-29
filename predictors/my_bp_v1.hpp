@@ -57,6 +57,14 @@
 #define SC_GLOBAL_THRE_PIPE_STAGES 2
 #endif
 
+#ifndef MY_BP_V1_SHARE_DISABLE_LEVEL
+#define MY_BP_V1_SHARE_DISABLE_LEVEL 0
+#endif
+
+#if MY_BP_V1_SHARE_DISABLE_LEVEL < 0 || MY_BP_V1_SHARE_DISABLE_LEVEL > 3
+#error "MY_BP_V1_SHARE_DISABLE_LEVEL must be in [0, 3]"
+#endif
+
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
@@ -84,6 +92,24 @@ struct my_bp_v1 : predictor {
     // P2 is a TAGE, P1 is a gshare
     static_assert(LOGLB>2);
     static_assert(NUMG>0);
+
+    template<u64 RouteIdx>
+    val<1> effective_share_route_bit(val<1> route_bit) const
+    {
+        static_assert(RouteIdx < 3, "RouteIdx must be 0, 1, or 2");
+        (void)route_bit;
+#if MY_BP_V1_SHARE_DISABLE_LEVEL == 0
+        return route_bit;
+#elif MY_BP_V1_SHARE_DISABLE_LEVEL == 1
+        if constexpr (RouteIdx == 0) return val<1>{0};
+        return route_bit;
+#elif MY_BP_V1_SHARE_DISABLE_LEVEL == 2
+        if constexpr (RouteIdx <= 1) return val<1>{0};
+        return route_bit;
+#else
+        return val<1>{0};
+#endif
+    }
 
 #ifdef DEBUG_ENERGY
     void energy_cycle_reset()
@@ -297,6 +323,20 @@ struct my_bp_v1 : predictor {
 #define perf_bgehl_update_candidate perf_event_state.perf_bgehl_update_candidate
 #define perf_bgehl_update_allow perf_event_state.perf_bgehl_update_allow
 #define perf_bgehl_update_block perf_event_state.perf_bgehl_update_block
+#define perf_share_route_zero perf_event_state.perf_share_route_zero
+#define perf_share_route_one perf_event_state.perf_share_route_one
+#define perf_group_idx_mismatch perf_event_state.perf_group_idx_mismatch
+#define perf_group_idx_samples perf_event_state.perf_group_idx_samples
+#define perf_logical_tag_hit_phys perf_event_state.perf_logical_tag_hit_phys
+#define perf_logical_sel_phys perf_event_state.perf_logical_sel_phys
+#define perf_phys_slot0_hit perf_event_state.perf_phys_slot0_hit
+#define perf_phys_slot1_hit perf_event_state.perf_phys_slot1_hit
+#define perf_phys_any_hit perf_event_state.perf_phys_any_hit
+#define perf_phys_dual_slot_hit perf_event_state.perf_phys_dual_slot_hit
+#define perf_phys_tag_w perf_event_state.perf_phys_tag_w
+#define perf_phys_pred_w perf_event_state.perf_phys_pred_w
+#define perf_phys_hyst_w perf_event_state.perf_phys_hyst_w
+#define perf_phys_u_w perf_event_state.perf_phys_u_w
 #define perf_conf perf_event_state.perf_conf
 
     // SQLite streaming trace
@@ -500,6 +540,100 @@ struct my_bp_v1 : predictor {
     }
 
 #ifdef CHEATING_MODE
+    static_assert(NUMG == 14, "share-table perf counters currently assume NUMG=14");
+    static constexpr u64 NUMP_PHYS = NUMP;
+
+    u64 perf_logical_to_phys(u64 logical_table, bool s0, bool s1, bool s2) const
+    {
+        switch (logical_table) {
+        case 0:
+        case 1:
+            return s0 ? 4 : 0;
+        case 2:
+        case 3:
+            return s1 ? 5 : 1;
+        case 4:
+        case 5:
+            return s2 ? 6 : 2;
+        case 6:
+        case 7:
+            return 3;
+        case 8:
+        case 9:
+            return s0 ? 0 : 4;
+        case 10:
+        case 11:
+            return s1 ? 1 : 5;
+        case 12:
+        case 13:
+            return s2 ? 2 : 6;
+        default:
+            return logical_table / 2;
+        }
+    }
+
+    void perf_count_share_and_idx_mismatch_per_branch()
+    {
+        bool s[3] = {
+            static_cast<bool>(val<1>{share_route_bit[0]}),
+            static_cast<bool>(val<1>{share_route_bit[1]}),
+            static_cast<bool>(val<1>{share_route_bit[2]})
+        };
+        for (u64 i = 0; i < 3; i++) {
+            if (s[i]) perf_share_route_one[i]++;
+            else perf_share_route_zero[i]++;
+        }
+
+        perf_group_idx_samples++;
+        for (u64 g = 0; g < NUMP_PHYS; g++) {
+            u64 i0 = 2 * g;
+            u64 i1 = i0 + 1;
+            if (static_cast<u64>(gindex[i0]) != static_cast<u64>(gindex[i1])) {
+                perf_group_idx_mismatch[g]++;
+            }
+        }
+    }
+
+    void perf_count_logical_physical_maps_per_branch(val<NUMG+1> match_mask, bool has_selected, u64 selected_table)
+    {
+        bool s0 = static_cast<bool>(val<1>{share_route_bit[0]});
+        bool s1 = static_cast<bool>(val<1>{share_route_bit[1]});
+        bool s2 = static_cast<bool>(val<1>{share_route_bit[2]});
+
+        u64 hit_mask = static_cast<u64>(val<NUMG>{match_mask} & hard<(1ULL << NUMG) - 1>{});
+        std::array<bool, NUMP_PHYS> slot0_hit {};
+        std::array<bool, NUMP_PHYS> slot1_hit {};
+
+        for (u64 j = 0; j < NUMG; j++) {
+            if (((hit_mask >> j) & 1ULL) == 0) continue;
+            u64 phys = perf_logical_to_phys(j, s0, s1, s2);
+            perf_logical_tag_hit_phys[j][phys]++;
+            if ((j & 1ULL) == 0) slot0_hit[phys] = true;
+            else slot1_hit[phys] = true;
+        }
+
+        if (has_selected && selected_table < NUMG) {
+            u64 sel_phys = perf_logical_to_phys(selected_table, s0, s1, s2);
+            perf_logical_sel_phys[selected_table][sel_phys]++;
+        }
+
+        for (u64 p = 0; p < NUMP_PHYS; p++) {
+            bool any_hit = slot0_hit[p] || slot1_hit[p];
+            if (slot0_hit[p]) perf_phys_slot0_hit[p]++;
+            if (slot1_hit[p]) perf_phys_slot1_hit[p]++;
+            if (any_hit) perf_phys_any_hit[p]++;
+            if (slot0_hit[p] && slot1_hit[p]) perf_phys_dual_slot_hit[p]++;
+        }
+    }
+
+    template<typename TArray>
+    void perf_count_phys_write(TArray &counter, u64 phys, val<1> we)
+    {
+        if (static_cast<bool>(we)) {
+            counter[phys]++;
+        }
+    }
+
 #ifdef USE_ALT
     void perf_store_prediction_source(val<1> metasign) {
 #else
@@ -595,18 +729,32 @@ struct my_bp_v1 : predictor {
             u64 src = static_cast<u64>(val<2>{pred_source_stored[offset]});
             val<NUMG> prov_mask = val<NUMG+1>{pred_match1_stored[offset]} & hard<(1<<NUMG)-1>{};
             val<NUMG> alt_mask  = val<NUMG+1>{pred_match2_stored[offset]} & hard<(1<<NUMG)-1>{};
+            u64 selected_table = NUMG;
+            bool has_selected_table = false;
 
             if (src == 2) {
                 for (u64 j=0; j<NUMG; j++) {
-                    if (static_cast<u64>(alt_mask >> j) & 1) { perf_alt_used[j]++; break; }
+                    if (static_cast<u64>(alt_mask >> j) & 1) {
+                        perf_alt_used[j]++;
+                        selected_table = j;
+                        has_selected_table = true;
+                        break;
+                    }
                 }
             } else if (src == 1) {
                 for (u64 j=0; j<NUMG; j++) {
-                    if (static_cast<u64>(prov_mask >> j) & 1) { perf_provider_used[j]++; break; }
+                    if (static_cast<u64>(prov_mask >> j) & 1) {
+                        perf_provider_used[j]++;
+                        selected_table = j;
+                        has_selected_table = true;
+                        break;
+                    }
                 }
             } else {
                 perf_bimodal_used++;
             }
+            perf_count_share_and_idx_mismatch_per_branch();
+            perf_count_logical_physical_maps_per_branch(match[offset], has_selected_table, selected_table);
 
             val<1> actual = branch_taken[offset];
             val<1> predicted = (p2 >> offset) & val<1>{1};
@@ -696,18 +844,7 @@ struct my_bp_v1 : predictor {
             }
 
             u64 pred_source = src;
-            u64 pred_table  = NUMG;
-            if (pred_source == 2) {
-                u64 amask = static_cast<u64>(alt_mask);
-                for (u64 j = 0; j < NUMG; j++) {
-                    if ((amask >> j) & 1) { pred_table = j; break; }
-                }
-            } else if (pred_source == 1) {
-                u64 pmask2 = static_cast<u64>(prov_mask);
-                for (u64 j = 0; j < NUMG; j++) {
-                    if ((pmask2 >> j) & 1) { pred_table = j; break; }
-                }
-            }
+            u64 pred_table  = has_selected_table ? selected_table : NUMG;
 
             u64 is_last = (offset == static_cast<u64>(branch_offset[num_branch-1]));
             u64 is_misp = static_cast<u64>(mispredict);
@@ -1057,16 +1194,16 @@ struct my_bp_v1 : predictor {
         val<1> s1,
         val<1> s2)
     {
-        p0_row.fanout(hard<2>{});
-        p1_row.fanout(hard<2>{});
-        p2_row.fanout(hard<2>{});
-        p3_row.fanout(hard<2>{});
-        p4_row.fanout(hard<2>{});
-        p5_row.fanout(hard<2>{});
-        p6_row.fanout(hard<2>{});
-        s0.fanout(hard<8>{});
-        s1.fanout(hard<8>{});
-        s2.fanout(hard<8>{});
+        p0_row.fanout(hard<4>{});
+        p1_row.fanout(hard<4>{});
+        p2_row.fanout(hard<4>{});
+        p3_row.fanout(hard<4>{});
+        p4_row.fanout(hard<4>{});
+        p5_row.fanout(hard<4>{});
+        p6_row.fanout(hard<4>{});
+        s0.fanout(hard<16>{});
+        s1.fanout(hard<16>{});
+        s2.fanout(hard<16>{});
 
         arr<val<TAGW>,2> tag_p0 = gtag_p[0].read(p0_row);
         arr<val<TAGW>,2> tag_p1 = gtag_p[1].read(p1_row);
@@ -1194,6 +1331,12 @@ struct my_bp_v1 : predictor {
         arr<val<TAGW>,NUMG_GROUP> &tag_row1,
         val<1> upd_s0, val<1> upd_s1, val<1> upd_s2)
     {
+        tag_we.fanout(hard<2>{});
+        tag_row0.fanout(hard<2>{});
+        tag_row1.fanout(hard<2>{});
+        upd_s0.fanout(hard<4>{});
+        upd_s1.fanout(hard<4>{});
+        upd_s2.fanout(hard<4>{});
         auto make_tag_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> arr<val<TAGW>,2> {
             return arr<val<TAGW>,2>{[&](u64 slot) -> val<TAGW> {
                 val<TAGW> a = (slot == 0) ? tag_row0[g_sel0] : tag_row1[g_sel0];
@@ -1207,6 +1350,11 @@ struct my_bp_v1 : predictor {
         val<1> tag_p0_we = tag_p0_a | tag_p0_b;
         val<LOGG_SH> tag_p0_addr = select(tag_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         arr<val<TAGW>,2> tag_p0_row = make_tag_row(0, 4, tag_p0_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 0, tag_p0_we);
+#endif
+#endif
         execute_if(tag_p0_we, [&](){ gtag_p[0].write(tag_p0_addr, tag_p0_row); });
 
         val<1> tag_p4_a = tag_we[0] &  upd_s0;
@@ -1214,6 +1362,11 @@ struct my_bp_v1 : predictor {
         val<1> tag_p4_we = tag_p4_a | tag_p4_b;
         val<LOGG_SH> tag_p4_addr = select(tag_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         arr<val<TAGW>,2> tag_p4_row = make_tag_row(0, 4, tag_p4_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 4, tag_p4_we);
+#endif
+#endif
         execute_if(tag_p4_we, [&](){ gtag_p[4].write(tag_p4_addr, tag_p4_row); });
 
         val<1> tag_p1_a = tag_we[1] & ~upd_s1;
@@ -1221,6 +1374,11 @@ struct my_bp_v1 : predictor {
         val<1> tag_p1_we = tag_p1_a | tag_p1_b;
         val<LOGG_SH> tag_p1_addr = select(tag_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         arr<val<TAGW>,2> tag_p1_row = make_tag_row(1, 5, tag_p1_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 1, tag_p1_we);
+#endif
+#endif
         execute_if(tag_p1_we, [&](){ gtag_p[1].write(tag_p1_addr, tag_p1_row); });
 
         val<1> tag_p5_a = tag_we[1] &  upd_s1;
@@ -1228,6 +1386,11 @@ struct my_bp_v1 : predictor {
         val<1> tag_p5_we = tag_p5_a | tag_p5_b;
         val<LOGG_SH> tag_p5_addr = select(tag_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         arr<val<TAGW>,2> tag_p5_row = make_tag_row(1, 5, tag_p5_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 5, tag_p5_we);
+#endif
+#endif
         execute_if(tag_p5_we, [&](){ gtag_p[5].write(tag_p5_addr, tag_p5_row); });
 
         val<1> tag_p2_a = tag_we[2] & ~upd_s2;
@@ -1235,6 +1398,11 @@ struct my_bp_v1 : predictor {
         val<1> tag_p2_we = tag_p2_a | tag_p2_b;
         val<LOGG_SH> tag_p2_addr = select(tag_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         arr<val<TAGW>,2> tag_p2_row = make_tag_row(2, 6, tag_p2_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 2, tag_p2_we);
+#endif
+#endif
         execute_if(tag_p2_we, [&](){ gtag_p[2].write(tag_p2_addr, tag_p2_row); });
 
         val<1> tag_p6_a = tag_we[2] &  upd_s2;
@@ -1242,12 +1410,22 @@ struct my_bp_v1 : predictor {
         val<1> tag_p6_we = tag_p6_a | tag_p6_b;
         val<LOGG_SH> tag_p6_addr = select(tag_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         arr<val<TAGW>,2> tag_p6_row = make_tag_row(2, 6, tag_p6_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 6, tag_p6_we);
+#endif
+#endif
         execute_if(tag_p6_we, [&](){ gtag_p[6].write(tag_p6_addr, tag_p6_row); });
 
         val<1> tag_p3_we = tag_we[3];
         arr<val<TAGW>,2> tag_p3_row = arr<val<TAGW>,2>{[&](u64 slot) -> val<TAGW> {
             return (slot == 0) ? tag_row0[3] : tag_row1[3];
         }};
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_tag_w, 3, tag_p3_we);
+#endif
+#endif
         execute_if(tag_p3_we, [&](){ gtag_p[3].write(group_row_idx[3], tag_p3_row); });
     }
 
@@ -1257,6 +1435,12 @@ struct my_bp_v1 : predictor {
         arr<val<1>,NUMG_GROUP> &pred_row1,
         val<1> upd_s0, val<1> upd_s1, val<1> upd_s2)
     {
+        pred_we.fanout(hard<2>{});
+        pred_row0.fanout(hard<2>{});
+        pred_row1.fanout(hard<2>{});
+        upd_s0.fanout(hard<4>{});
+        upd_s1.fanout(hard<4>{});
+        upd_s2.fanout(hard<4>{});
         auto make_pred_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> arr<val<1>,2> {
             return arr<val<1>,2>{[&](u64 slot) -> val<1> {
                 val<1> a = (slot == 0) ? pred_row0[g_sel0] : pred_row1[g_sel0];
@@ -1270,6 +1454,11 @@ struct my_bp_v1 : predictor {
         val<1> pred_p0_we = pred_p0_a | pred_p0_b;
         val<LOGG_SH> pred_p0_addr = select(pred_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         arr<val<1>,2> pred_p0_row = make_pred_row(0, 4, pred_p0_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 0, pred_p0_we);
+#endif
+#endif
         execute_if(pred_p0_we, [&](){ gpred_p[0].write(pred_p0_addr, pred_p0_row); });
 
         val<1> pred_p4_a = pred_we[0] &  upd_s0;
@@ -1277,6 +1466,11 @@ struct my_bp_v1 : predictor {
         val<1> pred_p4_we = pred_p4_a | pred_p4_b;
         val<LOGG_SH> pred_p4_addr = select(pred_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         arr<val<1>,2> pred_p4_row = make_pred_row(0, 4, pred_p4_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 4, pred_p4_we);
+#endif
+#endif
         execute_if(pred_p4_we, [&](){ gpred_p[4].write(pred_p4_addr, pred_p4_row); });
 
         val<1> pred_p1_a = pred_we[1] & ~upd_s1;
@@ -1284,6 +1478,11 @@ struct my_bp_v1 : predictor {
         val<1> pred_p1_we = pred_p1_a | pred_p1_b;
         val<LOGG_SH> pred_p1_addr = select(pred_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         arr<val<1>,2> pred_p1_row = make_pred_row(1, 5, pred_p1_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 1, pred_p1_we);
+#endif
+#endif
         execute_if(pred_p1_we, [&](){ gpred_p[1].write(pred_p1_addr, pred_p1_row); });
 
         val<1> pred_p5_a = pred_we[1] &  upd_s1;
@@ -1291,6 +1490,11 @@ struct my_bp_v1 : predictor {
         val<1> pred_p5_we = pred_p5_a | pred_p5_b;
         val<LOGG_SH> pred_p5_addr = select(pred_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         arr<val<1>,2> pred_p5_row = make_pred_row(1, 5, pred_p5_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 5, pred_p5_we);
+#endif
+#endif
         execute_if(pred_p5_we, [&](){ gpred_p[5].write(pred_p5_addr, pred_p5_row); });
 
         val<1> pred_p2_a = pred_we[2] & ~upd_s2;
@@ -1298,6 +1502,11 @@ struct my_bp_v1 : predictor {
         val<1> pred_p2_we = pred_p2_a | pred_p2_b;
         val<LOGG_SH> pred_p2_addr = select(pred_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         arr<val<1>,2> pred_p2_row = make_pred_row(2, 6, pred_p2_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 2, pred_p2_we);
+#endif
+#endif
         execute_if(pred_p2_we, [&](){ gpred_p[2].write(pred_p2_addr, pred_p2_row); });
 
         val<1> pred_p6_a = pred_we[2] &  upd_s2;
@@ -1305,12 +1514,22 @@ struct my_bp_v1 : predictor {
         val<1> pred_p6_we = pred_p6_a | pred_p6_b;
         val<LOGG_SH> pred_p6_addr = select(pred_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         arr<val<1>,2> pred_p6_row = make_pred_row(2, 6, pred_p6_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 6, pred_p6_we);
+#endif
+#endif
         execute_if(pred_p6_we, [&](){ gpred_p[6].write(pred_p6_addr, pred_p6_row); });
 
         val<1> pred_p3_we = pred_we[3];
         arr<val<1>,2> pred_p3_row = arr<val<1>,2>{[&](u64 slot) -> val<1> {
             return (slot == 0) ? pred_row0[3] : pred_row1[3];
         }};
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_pred_w, 3, pred_p3_we);
+#endif
+#endif
         execute_if(pred_p3_we, [&](){ gpred_p[3].write(group_row_idx[3], pred_p3_row); });
     }
 
@@ -1321,6 +1540,12 @@ struct my_bp_v1 : predictor {
         val<1> upd_s0, val<1> upd_s1, val<1> upd_s2,
         val<1> noconflict)
     {
+        hyst_we.fanout(hard<2>{});
+        hyst_row0.fanout(hard<2>{});
+        hyst_row1.fanout(hard<2>{});
+        upd_s0.fanout(hard<4>{});
+        upd_s1.fanout(hard<4>{});
+        upd_s2.fanout(hard<4>{});
         noconflict.fanout(hard<NUMP + 1>{});
         auto make_hyst_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> val<4> {
             val<2> lo = select(pick0, hyst_row0[g_sel0], hyst_row0[g_sel1]);
@@ -1333,6 +1558,11 @@ struct my_bp_v1 : predictor {
         val<1> h_p0_we = h_p0_a | h_p0_b;
         val<LOGG_SH> h_p0_addr = select(h_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         val<4> h_p0_row = make_hyst_row(0, 4, h_p0_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 0, h_p0_we);
+#endif
+#endif
         ghyst_p[0].write(h_p0_addr, h_p0_row, h_p0_we, noconflict);
 
         val<1> h_p4_a = hyst_we[0] &  upd_s0;
@@ -1340,6 +1570,11 @@ struct my_bp_v1 : predictor {
         val<1> h_p4_we = h_p4_a | h_p4_b;
         val<LOGG_SH> h_p4_addr = select(h_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         val<4> h_p4_row = make_hyst_row(0, 4, h_p4_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 4, h_p4_we);
+#endif
+#endif
         ghyst_p[4].write(h_p4_addr, h_p4_row, h_p4_we, noconflict);
 
         val<1> h_p1_a = hyst_we[1] & ~upd_s1;
@@ -1347,6 +1582,11 @@ struct my_bp_v1 : predictor {
         val<1> h_p1_we = h_p1_a | h_p1_b;
         val<LOGG_SH> h_p1_addr = select(h_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         val<4> h_p1_row = make_hyst_row(1, 5, h_p1_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 1, h_p1_we);
+#endif
+#endif
         ghyst_p[1].write(h_p1_addr, h_p1_row, h_p1_we, noconflict);
 
         val<1> h_p5_a = hyst_we[1] &  upd_s1;
@@ -1354,6 +1594,11 @@ struct my_bp_v1 : predictor {
         val<1> h_p5_we = h_p5_a | h_p5_b;
         val<LOGG_SH> h_p5_addr = select(h_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         val<4> h_p5_row = make_hyst_row(1, 5, h_p5_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 5, h_p5_we);
+#endif
+#endif
         ghyst_p[5].write(h_p5_addr, h_p5_row, h_p5_we, noconflict);
 
         val<1> h_p2_a = hyst_we[2] & ~upd_s2;
@@ -1361,6 +1606,11 @@ struct my_bp_v1 : predictor {
         val<1> h_p2_we = h_p2_a | h_p2_b;
         val<LOGG_SH> h_p2_addr = select(h_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         val<4> h_p2_row = make_hyst_row(2, 6, h_p2_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 2, h_p2_we);
+#endif
+#endif
         ghyst_p[2].write(h_p2_addr, h_p2_row, h_p2_we, noconflict);
 
         val<1> h_p6_a = hyst_we[2] &  upd_s2;
@@ -1368,10 +1618,20 @@ struct my_bp_v1 : predictor {
         val<1> h_p6_we = h_p6_a | h_p6_b;
         val<LOGG_SH> h_p6_addr = select(h_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         val<4> h_p6_row = make_hyst_row(2, 6, h_p6_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 6, h_p6_we);
+#endif
+#endif
         ghyst_p[6].write(h_p6_addr, h_p6_row, h_p6_we, noconflict);
 
         val<1> h_p3_we = hyst_we[3];
         val<4> h_p3_row = concat(hyst_row1[3], hyst_row0[3]);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_hyst_w, 3, h_p3_we);
+#endif
+#endif
         ghyst_p[3].write(group_row_idx[3], h_p3_row, h_p3_we, noconflict);
     }
 
@@ -1382,6 +1642,12 @@ struct my_bp_v1 : predictor {
         val<1> upd_s0, val<1> upd_s1, val<1> upd_s2,
         val<1> noconflict)
     {
+        u_we.fanout(hard<2>{});
+        u_row0.fanout(hard<2>{});
+        u_row1.fanout(hard<2>{});
+        upd_s0.fanout(hard<4>{});
+        upd_s1.fanout(hard<4>{});
+        upd_s2.fanout(hard<4>{});
         noconflict.fanout(hard<NUMP + 1>{});
         auto make_u_row = [&](u64 g_sel0, u64 g_sel1, val<1> pick0) -> val<2> {
             val<1> lo = select(pick0, u_row0[g_sel0], u_row0[g_sel1]);
@@ -1394,6 +1660,11 @@ struct my_bp_v1 : predictor {
         val<1> u_p0_we = u_p0_a | u_p0_b;
         val<LOGG_SH> u_p0_addr = select(u_p0_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         val<2> u_p0_row = make_u_row(0, 4, u_p0_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 0, u_p0_we);
+#endif
+#endif
         ubit_p[0].write(u_p0_addr, u_p0_row, u_p0_we, noconflict);
 
         val<1> u_p4_a = u_we[0] &  upd_s0;
@@ -1401,6 +1672,11 @@ struct my_bp_v1 : predictor {
         val<1> u_p4_we = u_p4_a | u_p4_b;
         val<LOGG_SH> u_p4_addr = select(u_p4_a, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
         val<2> u_p4_row = make_u_row(0, 4, u_p4_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 4, u_p4_we);
+#endif
+#endif
         ubit_p[4].write(u_p4_addr, u_p4_row, u_p4_we, noconflict);
 
         val<1> u_p1_a = u_we[1] & ~upd_s1;
@@ -1408,6 +1684,11 @@ struct my_bp_v1 : predictor {
         val<1> u_p1_we = u_p1_a | u_p1_b;
         val<LOGG_SH> u_p1_addr = select(u_p1_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         val<2> u_p1_row = make_u_row(1, 5, u_p1_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 1, u_p1_we);
+#endif
+#endif
         ubit_p[1].write(u_p1_addr, u_p1_row, u_p1_we, noconflict);
 
         val<1> u_p5_a = u_we[1] &  upd_s1;
@@ -1415,6 +1696,11 @@ struct my_bp_v1 : predictor {
         val<1> u_p5_we = u_p5_a | u_p5_b;
         val<LOGG_SH> u_p5_addr = select(u_p5_a, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
         val<2> u_p5_row = make_u_row(1, 5, u_p5_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 5, u_p5_we);
+#endif
+#endif
         ubit_p[5].write(u_p5_addr, u_p5_row, u_p5_we, noconflict);
 
         val<1> u_p2_a = u_we[2] & ~upd_s2;
@@ -1422,6 +1708,11 @@ struct my_bp_v1 : predictor {
         val<1> u_p2_we = u_p2_a | u_p2_b;
         val<LOGG_SH> u_p2_addr = select(u_p2_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         val<2> u_p2_row = make_u_row(2, 6, u_p2_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 2, u_p2_we);
+#endif
+#endif
         ubit_p[2].write(u_p2_addr, u_p2_row, u_p2_we, noconflict);
 
         val<1> u_p6_a = u_we[2] &  upd_s2;
@@ -1429,10 +1720,20 @@ struct my_bp_v1 : predictor {
         val<1> u_p6_we = u_p6_a | u_p6_b;
         val<LOGG_SH> u_p6_addr = select(u_p6_a, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
         val<2> u_p6_row = make_u_row(2, 6, u_p6_a);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 6, u_p6_we);
+#endif
+#endif
         ubit_p[6].write(u_p6_addr, u_p6_row, u_p6_we, noconflict);
 
         val<1> u_p3_we = u_we[3];
         val<2> u_p3_row = concat(u_row1[3], u_row0[3]);
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_phys_write(perf_phys_u_w, 3, u_p3_we);
+#endif
+#endif
         ubit_p[3].write(group_row_idx[3], u_p3_row, u_p3_we, noconflict);
     }
 
@@ -1465,16 +1766,22 @@ struct my_bp_v1 : predictor {
         for (u64 g=0; g<NUMG_GROUP; g++) {
             group_row_idx[g] = val<LOGG_SH>{gindex[2*g]};
         }
-        group_row_idx.fanout(hard<8>{});
-        share_route_bit[0] = val<1>{group_row_idx[0]};
-        share_route_bit[1] = val<1>{group_row_idx[1]};
-        share_route_bit[2] = val<1>{group_row_idx[2]};
-        val<1> s0 = share_route_bit[0];
-        val<1> s1 = share_route_bit[1];
-        val<1> s2 = share_route_bit[2];
-        s0.fanout(hard<32>{});
-        s1.fanout(hard<32>{});
-        s2.fanout(hard<32>{});
+        group_row_idx.fanout(hard<3>{});
+        val<1> s0_eff = effective_share_route_bit<0>(val<1>{group_row_idx[0]});
+        val<1> s1_eff = effective_share_route_bit<1>(val<1>{group_row_idx[1]});
+        val<1> s2_eff = effective_share_route_bit<2>(val<1>{group_row_idx[2]});
+        s0_eff.fanout(hard<2>{});
+        s1_eff.fanout(hard<2>{});
+        s2_eff.fanout(hard<2>{});
+        share_route_bit[0] = s0_eff;
+        share_route_bit[1] = s1_eff;
+        share_route_bit[2] = s2_eff;
+        val<1> s0 = s0_eff;
+        val<1> s1 = s1_eff;
+        val<1> s2 = s2_eff;
+        s0.fanout(hard<3>{});
+        s1.fanout(hard<3>{});
+        s2.fanout(hard<3>{});
 #ifdef GATE
 
             
@@ -2205,10 +2512,10 @@ struct my_bp_v1 : predictor {
             u64 i1 = 2 * g + 1;
             return select(allocate[i1], concat(last_offset, htag[i1]), val<TAGW>{snap_tag[g][1]});
         }};
-        tag_we.fanout(hard<2>{});
-        group_row_idx.fanout(hard<4>{});
-        tag_row0.fanout(hard<2>{});
-        tag_row1.fanout(hard<2>{});
+        // tag_we.fanout(hard<2>{});
+        // group_row_idx.fanout(hard<4>{});
+        // tag_row0.fanout(hard<2>{});
+        // tag_row1.fanout(hard<2>{});
         write_tag_physical(tag_we, tag_row0, tag_row1, upd_s0, upd_s1, upd_s2);
 
 
@@ -2657,5 +2964,19 @@ struct my_bp_v1 : predictor {
 #undef perf_bgehl_update_candidate
 #undef perf_bgehl_update_allow
 #undef perf_bgehl_update_block
+#undef perf_share_route_zero
+#undef perf_share_route_one
+#undef perf_group_idx_mismatch
+#undef perf_group_idx_samples
+#undef perf_logical_tag_hit_phys
+#undef perf_logical_sel_phys
+#undef perf_phys_slot0_hit
+#undef perf_phys_slot1_hit
+#undef perf_phys_any_hit
+#undef perf_phys_dual_slot_hit
+#undef perf_phys_tag_w
+#undef perf_phys_pred_w
+#undef perf_phys_hyst_w
+#undef perf_phys_u_w
 #undef perf_conf
 #endif

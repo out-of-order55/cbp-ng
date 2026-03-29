@@ -8,6 +8,9 @@ namespace my_bp_v1_perf {
 
 template<std::size_t NUMG>
 struct PerfState {
+    static_assert(NUMG % 2 == 0, "my_bp_v1 perf state expects even NUMG");
+    static constexpr std::size_t NUMP = NUMG / 2;
+
     std::uint64_t perf_predictions = 0;
     std::uint64_t perf_correct = 0;
     std::array<std::uint64_t, NUMG> perf_provider_used = {};
@@ -75,6 +78,20 @@ struct PerfState {
     std::uint64_t perf_bgehl_update_candidate = 0;
     std::uint64_t perf_bgehl_update_allow = 0;
     std::uint64_t perf_bgehl_update_block = 0;
+    std::array<std::uint64_t, 3> perf_share_route_zero = {};
+    std::array<std::uint64_t, 3> perf_share_route_one = {};
+    std::array<std::uint64_t, NUMP> perf_group_idx_mismatch = {};
+    std::uint64_t perf_group_idx_samples = 0;
+    std::array<std::array<std::uint64_t, NUMP>, NUMG> perf_logical_tag_hit_phys = {};
+    std::array<std::array<std::uint64_t, NUMP>, NUMG> perf_logical_sel_phys = {};
+    std::array<std::uint64_t, NUMP> perf_phys_slot0_hit = {};
+    std::array<std::uint64_t, NUMP> perf_phys_slot1_hit = {};
+    std::array<std::uint64_t, NUMP> perf_phys_any_hit = {};
+    std::array<std::uint64_t, NUMP> perf_phys_dual_slot_hit = {};
+    std::array<std::uint64_t, NUMP> perf_phys_tag_w = {};
+    std::array<std::uint64_t, NUMP> perf_phys_pred_w = {};
+    std::array<std::uint64_t, NUMP> perf_phys_hyst_w = {};
+    std::array<std::uint64_t, NUMP> perf_phys_u_w = {};
     std::array<std::array<std::uint64_t, 4>, NUMG> perf_conf = {};
 };
 
