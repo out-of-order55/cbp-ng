@@ -3,7 +3,14 @@
 #define USE_ALT
 #define RESET_UBITS
 
-// #define GATE
+#if defined(GATE)
+#error "GATE configuration has been removed from my_bp_v1."
+#endif
+
+#if defined(DEBUG_ENERGY)
+#error "DEBUG_ENERGY configuration has been removed from my_bp_v1."
+#endif
+
 #ifndef MY_BP_V1_DISABLE_SC
 #define MY_SC
 #endif
