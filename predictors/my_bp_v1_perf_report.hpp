@@ -180,15 +180,6 @@ inline PerfReportTotals print_main_perf_report(
     os << std::setw(7) << std::right << state.perf_thre_update_inc << " inc │ ";
     os << std::setw(7) << std::right << state.perf_thre_update_dec << " dec │\n";
 #endif
-#ifdef GATE
-    os << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
-    os << "│ Gate cnt │ " << state.perf_gate_count << " │ ";
-    os << "misp=" << state.perf_gate_mispred;
-    if (state.perf_gate_count > 0) {
-        os << " (" << std::fixed << std::setprecision(1) << (100.0 * state.perf_gate_mispred / state.perf_gate_count) << "%)";
-    }
-    os << " │ inc=" << state.perf_gate_update_inc << " dec=" << state.perf_gate_update_dec << " │\n";
-#endif
 
     os << "├──────────┼───────┼─────────┼──────────┼────────────┤\n";
     os << "│ Total    │ " << std::setw(5) << std::right << total_all << " │ ";

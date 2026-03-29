@@ -35,10 +35,6 @@ struct PerfState {
     std::uint64_t perf_extra_cycle_badpred = 0;
     std::uint64_t perf_extra_cycle_mispredict = 0;
     std::uint64_t perf_extra_cycle_p1_update = 0;
-    std::uint64_t perf_gate_count = 0;
-    std::uint64_t perf_gate_mispred = 0;
-    std::uint64_t perf_gate_update_inc = 0;
-    std::uint64_t perf_gate_update_dec = 0;
     std::uint64_t perf_extra_cycle_sc_update = 0;
     std::uint64_t perf_sc_override = 0;
     std::uint64_t perf_sc_override_correct = 0;

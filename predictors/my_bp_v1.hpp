@@ -75,9 +75,6 @@
 #include "../cbp.hpp"
 #include "../harcom.hpp"
 #include "common.hpp"
-#ifdef DEBUG_ENERGY
-#include "tutorial/energy_monitor.hpp"
-#endif
 #include <iomanip>
 #include <sstream>
 #include <array>
@@ -90,9 +87,6 @@
 #include "my_bp_v1_perf.hpp"
 
 using namespace hcm;
-#ifdef DEBUG_ENERGY
-    struct energy_monitor monitor;
-#endif
 template<u64 LOGLB=6, u64 NUMG=14, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=300, u64 LOGP1=14, u64 GHIST1=10,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
 struct my_bp_v1 : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
@@ -118,19 +112,6 @@ struct my_bp_v1 : predictor {
 #endif
     }
 
-#ifdef DEBUG_ENERGY
-    void energy_cycle_reset()
-    {
-        monitor.last_file = "reset";
-        monitor.last_line = 0;
-        monitor.last_energy_fJ = panel.energy_fJ();
-    }
-
-    void energy_mark(const char *label)
-    {
-        monitor.record(label, 0);
-    }
-#endif
 
     //TODO:need review
     static constexpr u64 PERCWIDTH = 6;
@@ -160,9 +141,6 @@ struct my_bp_v1 : predictor {
     static constexpr u64 UCTRBITS = 8;
     static constexpr u64 PATHBITS = 6;
 
-    static constexpr u64 LOGGATEBITS = 5;
-    static constexpr u64 TAGGATEBITS = 8;
-    static constexpr u64 CTRGATEBITS = 3;
     static constexpr const char *GHYST_IMPL_NAME = "rwram";
 
 #ifdef USE_ALT
@@ -287,10 +265,6 @@ struct my_bp_v1 : predictor {
 #define perf_extra_cycle_badpred perf_event_state.perf_extra_cycle_badpred
 #define perf_extra_cycle_mispredict perf_event_state.perf_extra_cycle_mispredict
 #define perf_extra_cycle_p1_update perf_event_state.perf_extra_cycle_p1_update
-#define perf_gate_count perf_event_state.perf_gate_count
-#define perf_gate_mispred perf_event_state.perf_gate_mispred
-#define perf_gate_update_inc perf_event_state.perf_gate_update_inc
-#define perf_gate_update_dec perf_event_state.perf_gate_update_dec
 #define perf_extra_cycle_sc_update perf_event_state.perf_extra_cycle_sc_update
 #define perf_sc_override perf_event_state.perf_sc_override
 #define perf_sc_override_correct perf_event_state.perf_sc_override_correct
@@ -703,14 +677,6 @@ struct my_bp_v1 : predictor {
 #endif
     }
 
-#ifdef GATE
-    void perf_count_gate(val<1> gating_local, val<1> mispredict_local, val<1> gate_inc, val<1> gate_dec) {
-        perf_gate_count      += static_cast<u64>(gating_local);
-        perf_gate_mispred    += static_cast<u64>(gating_local & mispredict_local);
-        perf_gate_update_inc += static_cast<u64>(gate_inc);
-        perf_gate_update_dec += static_cast<u64>(gate_dec);
-    }
-#endif
 
     void perf_count_end_of_cycle(
         arr<val<1>,LINEINST> is_branch,
@@ -793,11 +759,6 @@ struct my_bp_v1 : predictor {
                     perf_bimodal_wrong++;
                 }
 
-#ifdef GATE
-                if (static_cast<bool>(gating)) {
-                    perf_mispred_blame_p1++;
-                } else
-#endif
                 {
 #ifdef MY_SC
                     val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
@@ -987,25 +948,6 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
 
-#ifdef GATE
-    // ram<val<TAGGATEBITS>,(1<<LOGGATEBITS)> gate_tag {"gate_tag"};
-    // ram<val<1>,(1<<LOGGATEBITS)> gate_pred {"gate_pred"};
-    // ram<val<CTRGATEBITS-1>,(1<<LOGGATEBITS)> gate_hyst {"gate_hyst"};
-    // reg<1> gating;
-    // reg<TAGGATEBITS> atag[2];
-    // reg<1> apred[2];
-
-    arr<reg<TAGGATEBITS>,(1<<LOGGATEBITS)> gate_tag[3];
-    arr<reg<CTRGATEBITS>,(1<<LOGGATEBITS)> gate_ctr[3];
-    reg<LOGGATEBITS> gate_idx;
-    reg<1> gate_hit;
-    reg<TAGGATEBITS> line_tag;
-    reg<CTRGATEBITS> read_gate_ctr;
-    reg<1> gating;
-    reg<TAGGATEBITS> atag[2];
-    reg<1> apred[2];
-    reg<LOGGATEBITS> aidx[2];//for update
-#endif  
     
     // Cluster P1 + bpred + SC tables to reduce dominant SC-path wire distance.
     zone P1_SC_CLUSTER;
@@ -1111,9 +1053,6 @@ struct my_bp_v1 : predictor {
 #ifdef PERF_COUNTERS
         print_perf_counters();
 #endif
-#ifdef DEBUG_ENERGY
-        monitor.report();
-#endif
     }
 
 
@@ -1127,14 +1066,8 @@ struct my_bp_v1 : predictor {
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
-#ifdef DEBUG_ENERGY
-        energy_cycle_reset();
-#endif
         inst_pc.fanout(hard<3>{});
         new_block(inst_pc);
-#ifdef GATE
-        gate_predict2(inst_pc);
-#endif
 
         val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<2>{});
@@ -1151,9 +1084,6 @@ struct my_bp_v1 : predictor {
         readp1.fanout(hard<2>{});
         p1 = readp1.concat();
         p1.fanout(hard<LINEINST>{});
-#ifdef DEBUG_ENERGY
-        energy_mark("P1Predict");
-#endif
         return (block_entry & p1) != hard<0>{};
     };
 
@@ -1161,34 +1091,6 @@ struct my_bp_v1 : predictor {
     {
         return ((block_entry<<block_size) & p1) != hard<0>{};
     };
-#ifdef GATE
-    void gate_predict2([[maybe_unused]] val<64> inst_pc)
-    {
-        inst_pc.fanout(hard<3>{});
-        gate_idx = inst_pc >> LOGLB;
-        gate_idx.fanout(hard<2*(1<<LOGGATEBITS)>{});
-        line_tag = (inst_pc >> (LOGLB+LOGGATEBITS)) ^ (inst_pc >> (LOGLB+LOGGATEBITS+TAGGATEBITS));
-        val<TAGGATEBITS> tag =  (inst_pc >> (LOGLB+LOGGATEBITS)) ^ (inst_pc >> (LOGLB+LOGGATEBITS+TAGGATEBITS));
-
-        // aidx[0] = lineaddr;
-        
-        val<TAGGATEBITS> read_tag = arr<val<TAGGATEBITS>,(1<<LOGGATEBITS)>{[&](u64 i){
-            return select(gate_idx == val<LOGGATEBITS>{i}, val<TAGGATEBITS>{gate_tag[2][i]}, val<TAGGATEBITS>{0});
-        }}.fold_or();
-        read_gate_ctr = arr<val<CTRGATEBITS>,(1<<LOGGATEBITS)>{[&](u64 i){
-            return select(gate_idx == val<LOGGATEBITS>{i}, val<CTRGATEBITS>{gate_ctr[2][i]}, val<CTRGATEBITS>{0});
-        }}.fold_or();
-        
-        // atag[1] = atag[0];
-        // apred[1] = apred[0];
-        // apred[0] = read_pred;
-        // atag[0] = read_tag;
-        read_tag.fanout(hard<2>{});
-        tag.fanout(hard<2>{});
-        gate_hit = (read_tag == tag);
-        gating = ((read_tag == tag) & (read_gate_ctr == val<CTRGATEBITS>{7}));
-    };
-#endif
     void read_tag_pred_physical(
         val<LOGG_SH> p0_row,
         val<LOGG_SH> p1_row,
@@ -1748,8 +1650,6 @@ struct my_bp_v1 : predictor {
         val<std::max(bindex_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<1+NUMG*2>{});
         gfolds.fanout(hard<2>{});
-        // val<1> gate = gate_predict2(inst_pc);
-
         // compute indexes
         bindex = lineaddr;
         bindex.fanout(hard<LINEINST>{});
@@ -1789,33 +1689,6 @@ struct my_bp_v1 : predictor {
         s0.fanout(hard<3>{});
         s1.fanout(hard<3>{});
         s2.fanout(hard<3>{});
-#ifdef GATE
-
-            
-            gating.fanout(hard<4>{});
-            execute_if(~gating, [&](){
-                val<LOGG_SH> p0_row = select(s0, val<LOGG_SH>{group_row_idx[4]}, val<LOGG_SH>{group_row_idx[0]});
-                val<LOGG_SH> p1_row = select(s1, val<LOGG_SH>{group_row_idx[5]}, val<LOGG_SH>{group_row_idx[1]});
-                val<LOGG_SH> p2_row = select(s2, val<LOGG_SH>{group_row_idx[6]}, val<LOGG_SH>{group_row_idx[2]});
-                val<LOGG_SH> p3_row = group_row_idx[3];
-                val<LOGG_SH> p4_row = select(s0, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
-                val<LOGG_SH> p5_row = select(s1, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
-                val<LOGG_SH> p6_row = select(s2, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
-                read_tag_pred_physical(p0_row, p1_row, p2_row, p3_row, p4_row, p5_row, p6_row, s0, s1, s2);
-            });
-
-#else
-
-        val<LOGG_SH> p0_row = select(s0, val<LOGG_SH>{group_row_idx[4]}, val<LOGG_SH>{group_row_idx[0]});
-        val<LOGG_SH> p1_row = select(s1, val<LOGG_SH>{group_row_idx[5]}, val<LOGG_SH>{group_row_idx[1]});
-        val<LOGG_SH> p2_row = select(s2, val<LOGG_SH>{group_row_idx[6]}, val<LOGG_SH>{group_row_idx[2]});
-        val<LOGG_SH> p3_row = group_row_idx[3];
-        val<LOGG_SH> p4_row = select(s0, val<LOGG_SH>{group_row_idx[0]}, val<LOGG_SH>{group_row_idx[4]});
-        val<LOGG_SH> p5_row = select(s1, val<LOGG_SH>{group_row_idx[1]}, val<LOGG_SH>{group_row_idx[5]});
-        val<LOGG_SH> p6_row = select(s2, val<LOGG_SH>{group_row_idx[2]}, val<LOGG_SH>{group_row_idx[6]});
-        read_tag_pred_physical(p0_row, p1_row, p2_row, p3_row, p4_row, p5_row, p6_row, s0, s1, s2);
-
-#endif
         readt.fanout(hard<LINEINST+1>{});
         readc.fanout(hard<3>{});
 #ifdef MY_SC
@@ -1824,9 +1697,6 @@ struct my_bp_v1 : predictor {
         readu.fanout(hard<2>{});
         notumask = ~readu.concat();
         notumask.fanout(hard<2>{});
-#ifdef DEBUG_ENERGY
-        energy_mark("TAGERead");
-#endif
 
         // gather prediction bits for each offset
         val<NUMG> gpreds = readc.concat();
@@ -1913,9 +1783,6 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
 #endif
-#ifdef DEBUG_ENERGY
-        energy_mark("TAGESelect");
-#endif
     }
 #ifdef MY_SC
     void sc_predict(val<64> inst_pc){
@@ -1940,9 +1807,6 @@ struct my_bp_v1 : predictor {
             return result;
         }};
         tage_info.fanout(hard<2>{});
-#ifdef DEBUG_ENERGY
-        energy_mark("SCBiasRead");
-#endif
         bias_map.fanout(hard<2>{});
         bias_high_idx = bias_pc_high_index;
 #endif
@@ -2032,9 +1896,6 @@ struct my_bp_v1 : predictor {
         perf_bgehl_read_ops += LINEINST;
 #endif
 #endif
-#endif
-#ifdef DEBUG_ENERGY
-        energy_mark("SCHistRead");
 #endif
 
         threshold = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
@@ -2136,40 +1997,22 @@ struct my_bp_v1 : predictor {
             val<1> tage_pred = tage_p2.make_array(val<1>{})[offset];
             return select(use_sc[offset],sc_pred[offset],tage_pred);
         }}.concat();
-#ifdef DEBUG_ENERGY
-        energy_mark("SCSelect");
-#endif
     }
 #endif
     val<1> predict2(val<64> inst_pc)
     {
         tage_pred(inst_pc);
-#ifdef GATE
-    gating.fanout(hard<2>{});
-    p1.fanout(hard<2>{});        
-    #ifndef MY_SC
-        p2 = select(gating,p1,tage_p2);
-    #else
-        sc_predict(inst_pc);
-        p2 = select(gating,p1,sc_p2);
-    #endif
-#else
-    #ifndef MY_SC
+#ifndef MY_SC
         p2 = tage_p2;
-    #else
+#else
         sc_predict(inst_pc);
         p2 = sc_p2;
-    #endif
 #endif
-        // p2 = tage_p2;
         p2.fanout(hard<LINEINST>{});
         val<1> taken = (block_entry & p2) != hard<0>{};
         taken.fanout(hard<2>{});
 
         reuse_prediction(~val<1>{block_entry>>(LINEINST-1)});
-#ifdef DEBUG_ENERGY
-        energy_mark("Predict2Final");
-#endif
         return taken;
     }
 
@@ -2232,13 +2075,8 @@ struct my_bp_v1 : predictor {
 #ifdef MY_SC
             pipe_global_thre_delta(val<2,i64>{0}, val<1>{0});
 #endif
-#ifdef DEBUG_ENERGY
-            energy_mark("UpdateNoBranch");
-            energy_mark("CycleEnd");
-#endif
             return; // stop here
         }
-        //TODO: gate
         mispredict.fanout(hard<3>{});
         val<1> correct_pred = ~mispredict;
         correct_pred.fanout(hard<NUMG+2>{});
@@ -2371,7 +2209,6 @@ struct my_bp_v1 : predictor {
 
         // do P1 and P2 agree?
         val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask;
-        //TODO:gate
         disagree_mask.fanout(hard<2+2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
@@ -2383,22 +2220,12 @@ struct my_bp_v1 : predictor {
                 return ~table1_hyst[offset].read(index1); // hyst=0 means weak
             });
         };
-
-
-
-        //TODO:gate
         // read the bimodal hysteresis if bimodal caused a misprediction
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
             // returns 1 iff cause of misprediction and hysteresis is weak
-#ifdef GATE
-            return execute_if(bhyst_bim_primary[offset].fo1() & primary_wrong[offset] & (~gating), [&](){
-                return ~bhyst[offset].read(bindex); // hyst=0 means weak
-            });
-#else
             return execute_if(bhyst_bim_primary[offset].fo1() & primary_wrong[offset], [&](){
                 return ~bhyst[offset].read(bindex); // hyst=0 means weak
             });
-#endif
         };
 
         // determine which primary global predictions are incorrect with a weak hysteresis
@@ -2406,12 +2233,6 @@ struct my_bp_v1 : predictor {
             // returns 1 iff incorrect primary prediction and hysteresis is weak
             return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
         };
-#ifdef GATE
-        arr<val<1>,NUMG> g_sat = [&] (u64 i) -> val<1> {
-            // returns 1 iff incorrect primary prediction and hysteresis is weak
-            return primary[i] & (readh[i]==hard<3>{});
-        };
-#endif
         // need extra cycle for modifying prediction bits and for TAGE allocation
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
 #ifdef CHEATING_MODE
@@ -2472,9 +2293,6 @@ struct my_bp_v1 : predictor {
         perf_count_extra_cycle(extra_cycle, some_badpred1, mispredict, p1_update);
 #endif
 #endif
-#endif
-#ifdef DEBUG_ENERGY
-        energy_mark("UpdatePrep");
 #endif
 
 #ifdef USE_ALT
@@ -2562,9 +2380,6 @@ struct my_bp_v1 : predictor {
         u_row0.fanout(hard<2>{});
         u_row1.fanout(hard<2>{});
         write_ubit_physical(u_we, u_row0, u_row1, upd_s0, upd_s1, upd_s2, extra_cycle);
-#ifdef DEBUG_ENERGY
-        energy_mark("UpdateAllocUBit");
-#endif
 
         // update P1 prediction if P1 and P2 disagree and the hysteresis bit is weak
         auto p2_split = p2.make_array(val<1>{});
@@ -2574,6 +2389,7 @@ struct my_bp_v1 : predictor {
                 table1_pred[offset].write(index1,p2_split[offset].fo1());
             });
         }
+        
         // update P1 hysteresis
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(is_branch[offset],[&](){
@@ -2595,9 +2411,6 @@ struct my_bp_v1 : predictor {
                 bhyst[offset].write(bindex,~primary_wrong[offset]);
             });
         }
-#ifdef DEBUG_ENERGY
-        energy_mark("UpdateLocalTables");
-#endif
 
         // update incorrect global prediction if primary provider and the hysteresis is weak;
         // initialize global prediction in the allocated entry
@@ -2654,48 +2467,7 @@ struct my_bp_v1 : predictor {
         uctr = select(correct_pred,uctr,select(uctrsat,val<decltype(uctr)::size>{0},update_ctr(uctr,faralloc.fo1())));
         execute_if(uctrsat,[&](){for (auto &uram : ubit_p) uram.reset();});
 #endif
-#ifdef DEBUG_ENERGY
-        energy_mark("UpdateGlobalTables");
-#endif
 
-#ifdef GATE
-
-        gate_hit.fanout(hard<3>{});
-        
-        val<1> gate_alloc = (disagree_mask == hard<0>{}) & (~mispredict) & (~gating) & (~gate_hit) & g_sat.fold_or();
-        val<1> gate_inc = (disagree_mask == hard<0>{}) & (~mispredict) & gate_hit &  g_sat.fold_or();
-        val<1> gate_dec = mispredict & gate_hit;
-        
-        gate_idx.fanout(hard<(1<<LOGGATEBITS)>{});
-        line_tag.fanout(hard<(1<<LOGGATEBITS)>{});
-        gate_alloc.fanout(hard<(1<<LOGGATEBITS)>{});
-        gate_inc.fanout(hard<(1<<LOGGATEBITS)*2>{});
-        gate_dec.fanout(hard<(1<<LOGGATEBITS)>{});
-        gate_ctr[0].fanout(hard<4>{});
-        gate_ctr[1].fanout(hard<2>{});
-        // gate_ctr[2].fanout(hard<3>{});
-        // gate_inc
-        for (u64 i=0; i<(1<<LOGGATEBITS); i++) {
-            val<1> tag_match = gate_idx == val<LOGGATEBITS>{i};
-            tag_match.fanout(hard<2>{});
-            //one pipe delay
-            gate_tag[2][i] = gate_tag[1][i];
-            gate_ctr[2][i] = gate_ctr[1][i];
-            gate_tag[1][i] = gate_tag[0][i];
-            gate_ctr[1][i] = gate_ctr[0][i];
-            execute_if(tag_match & gate_alloc, [&](){
-                gate_tag[0][i] = line_tag;
-            });
-            execute_if(tag_match & (gate_inc | gate_dec), [&](){
-                gate_ctr[0][i] = select(gate_inc, update_ctr(gate_ctr[0][i], val<1>{1}), gate_ctr[0][i]>>1);
-            });
-        }
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-        perf_count_gate(gating, mispredict, gate_inc, gate_dec);
-#endif
-#endif
-#endif
 
         // update global history
         val<1> line_end = block_entry >> (LINEINST-block_size);
@@ -2742,9 +2514,6 @@ struct my_bp_v1 : predictor {
             last_backward_target_region = next_pc_region_b;
             last_backward_pc_region = branch_pc_region_b;
         });
-#endif
-#ifdef DEBUG_ENERGY
-        energy_mark("UpdateHistory");
 #endif
 
 
@@ -2867,21 +2636,6 @@ struct my_bp_v1 : predictor {
 #endif
             thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
         }
-#ifdef DEBUG_ENERGY
-        energy_mark("UpdateSCThre1");
-#ifdef SC_USE_BIAS
-        energy_mark("UpdateSCBias");
-#endif
-#ifdef SC_USE_GEHL
-        energy_mark("UpdateSCGehl");
-#endif
-#ifdef SC_FGEHL
-        energy_mark("UpdateSCFgehl");
-#endif
-#ifdef SC_BGEHL
-        energy_mark("UpdateSCBgehl");
-#endif
-#endif
 #endif
 
 #ifdef CHEATING_MODE
@@ -2896,9 +2650,6 @@ struct my_bp_v1 : predictor {
 #endif
 
 
-#ifdef DEBUG_ENERGY
-        energy_mark("CycleEnd");
-#endif
         num_branch = 0; // done
     }
 };
@@ -2928,10 +2679,6 @@ struct my_bp_v1 : predictor {
 #undef perf_extra_cycle_badpred
 #undef perf_extra_cycle_mispredict
 #undef perf_extra_cycle_p1_update
-#undef perf_gate_count
-#undef perf_gate_mispred
-#undef perf_gate_update_inc
-#undef perf_gate_update_dec
 #undef perf_extra_cycle_sc_update
 #undef perf_sc_override
 #undef perf_sc_override_correct
