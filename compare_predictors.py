@@ -240,13 +240,17 @@ def load_results_from_csv(csv_path, predictor_name):
     return results
 
 def compute_predictor_level_latencies(results, benchmarks):
-    """使用 predictor_metrics.py 的规则计算目录级 P1/P2 延迟"""
-    p1_lat = 0
-    p2_lat = 0
+    """计算目录级 P1/P2 最大延迟（不取整，保留浮点）"""
+    p1_lat = 0.0
+    p2_lat = 0.0
     for bench in benchmarks:
-        p1_lat = max(p1_lat, math.ceil(results[bench]['p1_lat']))
-        p2_lat = max(p2_lat, math.ceil(results[bench]['p2_lat']))
+        p1_lat = max(p1_lat, float(results[bench]['p1_lat']))
+        p2_lat = max(p2_lat, float(results[bench]['p2_lat']))
     return p1_lat, p2_lat
+
+def compute_trace_level_latencies(data):
+    """按单条 trace 的输出延迟（浮点原值）"""
+    return float(data['p1_lat']), float(data['p2_lat'])
 
 def calc_prediction_cycles(data, p1_lat, p2_lat):
     """按 predictor_metrics.py 当前公式计算预测周期数"""
@@ -303,8 +307,13 @@ def calc_metrics(data, p1_lat, p2_lat):
         'ppi': ppi
     }
 
+def calc_metrics_per_trace_latency(data):
+    """按该 trace 自身的 P1/P2 延迟计算指标"""
+    trace_p1_lat, trace_p2_lat = compute_trace_level_latencies(data)
+    return calc_metrics(data, trace_p1_lat, trace_p2_lat)
+
 def summarize_predictor_metrics(results, benchmarks):
-    """按 predictor_metrics.py 当前定义汇总 common benchmarks 上的指标"""
+    """按 per-trace 延迟口径汇总 common benchmarks 上的指标"""
     p1_lat, p2_lat = compute_predictor_level_latencies(results, benchmarks)
 
     count = 0
@@ -316,7 +325,7 @@ def summarize_predictor_metrics(results, benchmarks):
     sum_ppi = 0.0
 
     for bench in benchmarks:
-        metrics = calc_metrics(results[bench], p1_lat, p2_lat)
+        metrics = calc_metrics_per_trace_latency(results[bench])
         if metrics['ipc'] <= 0:
             continue
         count += 1
@@ -755,8 +764,8 @@ def main():
     print(f"{name2} predictor_metrics latencies: P1={summary2['p1_latency']}, P2={summary2['p2_latency']}")
 
     # 计算每个 benchmark 的指标
-    metrics1 = {b: calc_metrics(results1[b], summary1['p1_latency'], summary1['p2_latency']) for b in common}
-    metrics2 = {b: calc_metrics(results2[b], summary2['p1_latency'], summary2['p2_latency']) for b in common}
+    metrics1 = {b: calc_metrics_per_trace_latency(results1[b]) for b in common}
+    metrics2 = {b: calc_metrics_per_trace_latency(results2[b]) for b in common}
 
     # 打印每 benchmark 对比（包含 reference MPKI）
     print_per_benchmark_comparison(common, metrics1, metrics2, results1, results2, ref_mpki, name1, name2)
