@@ -78,6 +78,10 @@
 #define MY_BP_V1_P1_MICRO_TAGE 0
 #endif
 
+#ifndef MY_BP_V1_P1_AHEAD
+#define MY_BP_V1_P1_AHEAD 0
+#endif
+
 #if MY_BP_V1_SHARE_DISABLE_LEVEL < 0 || MY_BP_V1_SHARE_DISABLE_LEVEL > 3
 #error "MY_BP_V1_SHARE_DISABLE_LEVEL must be in [0, 3]"
 #endif
@@ -233,8 +237,14 @@ struct my_bp_v1 : predictor {
     reg<1> true_block = 1;
 
     // for P1
+    static constexpr u64 P1A_PIPE = 2;
     reg<GHIST1> global_history1;
     reg<index1_bits> index1;
+    reg<1> p1a_valid[P1A_PIPE];
+    reg<64-LOGLB> p1a_line_pc[P1A_PIPE];
+    reg<index1_bits> p1a_index[P1A_PIPE];
+    reg<LINEINST> p1a_pred_vec[P1A_PIPE];
+    reg<index1_bits> p1_idx_used;
     arr<reg<1>,LINEINST> readp1; // prediction bits read from P1 table for each offset
     reg<LINEINST> p1; // P1 predictions
 
@@ -1201,6 +1211,7 @@ struct my_bp_v1 : predictor {
     zone P1_SC_CLUSTER;
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
+    rwram<1,(1<<index1_bits),4> table1_pred_ahead[LINEINST] {"P1 pred ahead"}; // ahead path with buffered writes
     ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
     #ifdef MY_SC
     //bias_pc is concat pc and tage
@@ -1430,28 +1441,62 @@ struct my_bp_v1 : predictor {
         block_size = 1;
     }
 
+    val<index1_bits> p1_compute_index(val<64> inst_pc)
+    {
+        val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
+        if constexpr (GHIST1 <= index1_bits) {
+            return lineaddr ^ (val<index1_bits>{global_history1} << (index1_bits-GHIST1));
+        } else {
+            return global_history1.make_array(val<index1_bits>{}).append(lineaddr).fold_xor();
+        }
+    }
+
+    void p1_prefetch_next_line(val<64> next_pc)
+    {
+        val<64-LOGLB> next_line_pc = next_pc >> LOGLB;
+        val<index1_bits> next_idx = p1_compute_index(next_pc);
+        next_idx.fanout(hard<LINEINST + 2>{});
+        arr<val<1>,LINEINST> next_readp1 = [&](u64 offset) -> val<1> {
+            return table1_pred_ahead[offset].read(next_idx);
+        };
+
+        p1a_valid[1] = p1a_valid[0];
+        p1a_line_pc[1] = p1a_line_pc[0];
+        p1a_index[1] = p1a_index[0];
+        p1a_pred_vec[1] = p1a_pred_vec[0];
+
+        p1a_valid[0] = 1;
+        p1a_line_pc[0] = next_line_pc;
+        p1a_index[0] = next_idx;
+        p1a_pred_vec[0] = next_readp1.concat();
+    }
+
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
-        inst_pc.fanout(hard<32>{});
+        inst_pc.fanout(hard<40>{});
         new_block(inst_pc);
 
-        val<std::max(index1_bits,GHIST1)> lineaddr = inst_pc >> LOGLB;
-        lineaddr.fanout(hard<2>{});
-        if constexpr (GHIST1 <= index1_bits) {
-            index1 = lineaddr ^ (val<index1_bits>{global_history1}<<(index1_bits-GHIST1));
-        } else {
-            index1 = global_history1.make_array(val<index1_bits>{}).append(lineaddr).fold_xor();
-        }
-
-        index1.fanout(hard<LINEINST>{});
+        val<64-LOGLB> cur_line_pc = inst_pc >> LOGLB;
+        cur_line_pc.fanout(hard<4>{});
+        val<index1_bits> cur_idx = p1_compute_index(inst_pc);
+        cur_idx.fanout(hard<LINEINST + 6>{});
+        index1 = cur_idx;
+#if MY_BP_V1_P1_AHEAD
+        val<1> p1a_ready = val<1>{p1a_valid[1]};
+        p1a_ready.fanout(hard<2>{});
+        val<LINEINST> p1_vec = select(p1a_ready, val<LINEINST>{p1a_pred_vec[1]}, val<LINEINST>{0});
+        p1_idx_used = select(p1a_ready.fo1(), val<index1_bits>{p1a_index[1]}, cur_idx);
+#else
         for (u64 offset=0; offset<LINEINST; offset++) {
-            readp1[offset] = table1_pred[offset].read(index1);
+            readp1[offset] = table1_pred[offset].read(cur_idx);
         }
+        val<LINEINST> p1_vec = readp1.concat();
+        p1_idx_used = cur_idx;
+#endif
 #if MY_BP_V1_P1_MICRO_TAGE
-        readp1.fanout(hard<2>{});
-        val<LINEINST> gshare_line = readp1.concat();
+        val<LINEINST> gshare_line = p1_vec;
         auto gshare_split = gshare_line.make_array(val<1>{});
-        val<64> line_base_pc = (inst_pc >> LOGLB) << LOGLB;
+        val<64> line_base_pc = val<64>{cur_line_pc} << LOGLB;
         val<1> pipe_line_valid = val<1>{mt_pipe_valid};
         line_base_pc.fanout(hard<LINEINST>{});
         pipe_line_valid.fanout(hard<LINEINST>{});
@@ -1463,8 +1508,11 @@ struct my_bp_v1 : predictor {
         mt_hash_pack issue_h = mt_hash(inst_pc);
         mt_issue(inst_pc, issue_h);
 #else
-        readp1.fanout(hard<2>{});
-        p1 = readp1.concat();
+        p1 = p1_vec;
+#endif
+#if MY_BP_V1_P1_AHEAD
+        val<64> next_line_pc = (val<64>{cur_line_pc} + val<64>{1}) << LOGLB;
+        p1_prefetch_next_line(next_line_pc);
 #endif
         p1.fanout(hard<LINEINST>{});
         val<1> p1_taken = (block_entry & p1) != hard<0>{};
@@ -2480,7 +2528,7 @@ struct my_bp_v1 : predictor {
         mispredict.fanout(hard<3>{});
         val<1> correct_pred = ~mispredict;
         correct_pred.fanout(hard<NUMG+2>{});
-        index1.fanout(hard<LINEINST+2>{});
+        p1_idx_used.fanout(hard<LINEINST+2>{});
         p2.fanout(hard<2>{});
         bindex.fanout(hard<LINEINST+2>{});
         gindex.fanout(hard<8>{});
@@ -2785,18 +2833,26 @@ struct my_bp_v1 : predictor {
         // P1 update policy:
         // - if P1 is correct: update hysteresis;
         // - if P1 is wrong: update pred of the provider that produced P1.
-        for (u64 offset=0; offset<LINEINST; offset++) {
+        arr<val<1>,LINEINST> p1_pred_write_req = [&](u64 offset) -> val<1> {
             val<1> p1_correct = p1_split[offset] == branch_taken[offset];
 #if MY_BP_V1_P1_MICRO_TAGE
             val<1> p1_from_gshare = ~val<1>{mt_meta_hit[offset]};
 #else
             val<1> p1_from_gshare = val<1>{1};
 #endif
+            return is_branch[offset] & ~p1_correct & p1_from_gshare;
+        };
+        for (u64 offset=0; offset<LINEINST; offset++) {
+            val<1> p1_correct = p1_split[offset] == branch_taken[offset];
             execute_if(is_branch[offset] & p1_correct, [&](){
-                table1_hyst[offset].write(index1, is_branch[offset]);
+                table1_hyst[offset].write(p1_idx_used, is_branch[offset]);
             });
-            execute_if(is_branch[offset] & ~p1_correct & p1_from_gshare, [&](){
-                table1_pred[offset].write(index1, branch_taken[offset]);
+            execute_if(p1_pred_write_req[offset], [&](){
+#if MY_BP_V1_P1_AHEAD
+                table1_pred_ahead[offset].write(p1_idx_used, branch_taken[offset], val<1>{0});
+#else
+                table1_pred[offset].write(p1_idx_used, branch_taken[offset]);
+#endif
             });
         }
 
@@ -3257,7 +3313,6 @@ struct my_bp_v1 : predictor {
         perf_count_end_of_cycle(is_branch, branch_taken, mispredict, allocate, postmask, noalloc);
 #endif
 #endif
-
 
         num_branch = 0; // done
     }
