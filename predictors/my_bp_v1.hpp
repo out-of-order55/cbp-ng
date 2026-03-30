@@ -11,47 +11,8 @@
 #error "DEBUG_ENERGY configuration has been removed from my_bp_v1."
 #endif
 
-#ifndef MY_BP_V1_DISABLE_SC
-#define MY_BP_V1_DISABLE_SC 1
-#endif
-
-#if !MY_BP_V1_DISABLE_SC
-#define MY_SC
-#endif
-
-#ifdef MY_SC
-#if (defined(SC_CFG_BASE) + defined(SC_CFG_MEDIUM) + defined(SC_CFG_FULL)) > 1
-#error "Select at most one of SC_CFG_BASE, SC_CFG_MEDIUM, SC_CFG_FULL"
-#endif
-
-#if !defined(SC_CFG_BASE) && !defined(SC_CFG_MEDIUM) && !defined(SC_CFG_FULL)
-#define SC_CFG_FULL
-#endif
-
-#if defined(SC_CFG_BASE)
-#define SC_USE_BIAS
-#endif
-
-#if defined(SC_CFG_MEDIUM)
-#define SC_USE_BIAS
-#define SC_USE_BRIMLI
-#endif
-
-#if defined(SC_CFG_FULL)
-#define SC_USE_BIAS
-#define SC_FGEHL
-#define SC_BGEHL
-#define SC_USE_TAIMLI
-#define SC_USE_BRIMLI
-#endif
-
-#if defined(SC_FGEHL) || defined(SC_USE_BRIMLI)
-#define SC_USE_FHIST
-#endif
-
-#if defined(SC_BGEHL) || defined(SC_USE_TAIMLI) || defined(SC_USE_BRIMLI)
-#define SC_USE_BHIST
-#endif
+#if defined(MY_BP_V1_DISABLE_SC) || defined(MY_SC) || defined(SC_CFG_BASE) || defined(SC_CFG_MEDIUM) || defined(SC_CFG_FULL) || defined(SC_USE_BIAS) || defined(SC_FGEHL) || defined(SC_BGEHL) || defined(SC_USE_TAIMLI) || defined(SC_USE_BRIMLI) || defined(SC_USE_FHIST) || defined(SC_USE_BHIST) || defined(SC_GLOBAL_THRE_INIT) || defined(SC_GLOBAL_THRE_PIPE_STAGES)
+#error "SC configuration has been removed from my_bp_v1."
 #endif
 
 #ifndef MY_BP_V1_PERF_ENABLE_TRACE_DB
@@ -60,14 +21,6 @@
 
 #ifndef MY_BP_V1_PERF_PRINT_TRACE
 #define MY_BP_V1_PERF_PRINT_TRACE 1
-#endif
-
-#ifndef SC_GLOBAL_THRE_INIT
-#define SC_GLOBAL_THRE_INIT 23
-#endif
-
-#ifndef SC_GLOBAL_THRE_PIPE_STAGES
-#define SC_GLOBAL_THRE_PIPE_STAGES 2
 #endif
 
 #ifndef MY_BP_V1_SHARE_DISABLE_LEVEL
@@ -159,24 +112,6 @@ struct my_bp_v1 : predictor {
     static constexpr u64 PERCWIDTH = 6;
     static constexpr u64 NUMGEHL = 2;
     static constexpr u64 LOGGEHL = 10;
-    static_assert(SC_GLOBAL_THRE_PIPE_STAGES >= 1);
-#ifdef SC_USE_FHIST
-    static constexpr u64 LOGFGEHL = LOGGEHL;
-    static constexpr u64 FHIST_BITS = 48;
-#endif
-#ifdef SC_USE_BHIST
-    static constexpr u64 LOGBGEHL = LOGGEHL;
-    static constexpr u64 BHIST_BITS = 48;
-    static constexpr u64 LOGIMLI = LOGGEHL;
-    static constexpr u64 IMLI_BITS = 6;
-    static constexpr u64 IMLI_REGION_SHIFT = 6;
-    static constexpr u64 IMLI_REGION_BITS = 16 - IMLI_REGION_SHIFT;
-    static constexpr u64 IMLI_FILTER_THRESHOLD = 12;
-#endif
-    static constexpr u64 TOTAL_THREBITS = 10;
-    static constexpr u64 GLOBAL_THREBITS = 9;
-    static constexpr u64 PRE_PC_THREBITS = 9;
-    // static constexpr u64 LOGTHREBITS = 5;
 
     static constexpr u64 MINHIST = 2;
     static constexpr u64 METABITS = 4;
@@ -192,13 +127,6 @@ struct my_bp_v1 : predictor {
     static constexpr u64 LINEINST = 1<<LOGLINEINST;
     static_assert(LOGP1 > LOGLINEINST);
     static_assert(LOGB > LOGLINEINST);
-    static_assert(LOGGEHL > LOGLINEINST);
-#ifdef SC_FGEHL
-    static_assert(LOGFGEHL > LOGLINEINST);
-#endif
-#ifdef SC_BGEHL
-    static_assert(LOGBGEHL > LOGLINEINST);
-#endif
     static_assert(LOGP1 > LOGLINEINST);
     static constexpr u64 index1_bits = LOGP1-LOGLINEINST;
     static constexpr u64 bindex_bits = LOGB-LOGLINEINST;
@@ -277,17 +205,11 @@ struct my_bp_v1 : predictor {
 
 
     arr<reg<1>,LINEINST> pred2; // alternate P2 prediction for each offset
-    arr<reg<1>,LINEINST> use_sc; // alternate P2 prediction for each offset
     reg<LINEINST> p2; // final P2 predictions
     reg<LINEINST> tage_p2; // final P2 predictions
-    reg<LINEINST> sc_p2; // final P2 predictions
-    arr<reg<1>,LINEINST> sc_pred;
     arr<reg<NUMG+1>,LINEINST> match; // all matches for each offset
     arr<reg<NUMG+1>,LINEINST> match1; // longest match for each offset
     arr<reg<NUMG+1>,LINEINST> match2; // second longest match for each offset
-    arr<reg<1>,LINEINST> prov_weak;
-    arr<reg<1>,LINEINST> prov_mid; 
-    arr<reg<1>,LINEINST> prov_sat;  
     // for P2
     reg<bindex_bits> bindex; // bimodal table index
     arr<reg<LOGG>,NUMG> gindex; // global tables indexes
@@ -347,7 +269,6 @@ struct my_bp_v1 : predictor {
 #define perf_bimodal_correct perf_event_state.perf_bimodal_correct
 #define perf_bimodal_wrong perf_event_state.perf_bimodal_wrong
 #define perf_mispred_blame_tage perf_event_state.perf_mispred_blame_tage
-#define perf_mispred_blame_sc perf_event_state.perf_mispred_blame_sc
 #define perf_mispred_blame_p1 perf_event_state.perf_mispred_blame_p1
 #define perf_table_reads perf_event_state.perf_table_reads
 #define perf_table_hits perf_event_state.perf_table_hits
@@ -359,45 +280,6 @@ struct my_bp_v1 : predictor {
 #define perf_extra_cycle_badpred perf_event_state.perf_extra_cycle_badpred
 #define perf_extra_cycle_mispredict perf_event_state.perf_extra_cycle_mispredict
 #define perf_extra_cycle_p1_update perf_event_state.perf_extra_cycle_p1_update
-#define perf_extra_cycle_sc_update perf_event_state.perf_extra_cycle_sc_update
-#define perf_sc_override perf_event_state.perf_sc_override
-#define perf_sc_override_correct perf_event_state.perf_sc_override_correct
-#define perf_sc_use perf_event_state.perf_sc_use
-#define perf_sc_use_correct perf_event_state.perf_sc_use_correct
-#define perf_sc_use_taken perf_event_state.perf_sc_use_taken
-#define perf_sc_use_nottaken perf_event_state.perf_sc_use_nottaken
-#define perf_sc_use_same_as_tage perf_event_state.perf_sc_use_same_as_tage
-#define perf_sc_use_flip_tage perf_event_state.perf_sc_use_flip_tage
-#define perf_sc_use_weak perf_event_state.perf_sc_use_weak
-#define perf_sc_use_mid perf_event_state.perf_sc_use_mid
-#define perf_sc_use_sat perf_event_state.perf_sc_use_sat
-#define perf_sc_stage_prov_hit perf_event_state.perf_sc_stage_prov_hit
-#define perf_sc_stage_do_update perf_event_state.perf_sc_stage_do_update
-#define perf_sc_stage_candidate perf_event_state.perf_sc_stage_candidate
-#define perf_sc_stage_guard_pass perf_event_state.perf_sc_stage_guard_pass
-#define perf_sc_skip_no_provider perf_event_state.perf_sc_skip_no_provider
-#define perf_sc_skip_no_do_update perf_event_state.perf_sc_skip_no_do_update
-#define perf_sc_skip_guard perf_event_state.perf_sc_skip_guard
-#define perf_global_thre_update perf_event_state.perf_global_thre_update
-#define perf_global_thre_inc perf_event_state.perf_global_thre_inc
-#define perf_global_thre_dec perf_event_state.perf_global_thre_dec
-#define perf_thre_update perf_event_state.perf_thre_update
-#define perf_thre_update_inc perf_event_state.perf_thre_update_inc
-#define perf_thre_update_dec perf_event_state.perf_thre_update_dec
-#define perf_mispred_sc_not_used perf_event_state.perf_mispred_sc_not_used
-#define perf_mispred_sc_keep perf_event_state.perf_mispred_sc_keep
-#define perf_mispred_sc_flip perf_event_state.perf_mispred_sc_flip
-#define perf_mispred_sc_flip_harmful perf_event_state.perf_mispred_sc_flip_harmful
-#define perf_mispred_sc_flip_both_wrong perf_event_state.perf_mispred_sc_flip_both_wrong
-#define perf_bgehl_read_ops perf_event_state.perf_bgehl_read_ops
-#define perf_bgehl_write_ops perf_event_state.perf_bgehl_write_ops
-#define perf_bgehl_branch_slots perf_event_state.perf_bgehl_branch_slots
-#define perf_bgehl_filter_allow perf_event_state.perf_bgehl_filter_allow
-#define perf_bgehl_filter_block perf_event_state.perf_bgehl_filter_block
-#define perf_bgehl_nonzero_contrib perf_event_state.perf_bgehl_nonzero_contrib
-#define perf_bgehl_update_candidate perf_event_state.perf_bgehl_update_candidate
-#define perf_bgehl_update_allow perf_event_state.perf_bgehl_update_allow
-#define perf_bgehl_update_block perf_event_state.perf_bgehl_update_block
 #define perf_share_route_zero perf_event_state.perf_share_route_zero
 #define perf_share_route_one perf_event_state.perf_share_route_one
 #define perf_group_idx_mismatch perf_event_state.perf_group_idx_mismatch
@@ -464,12 +346,12 @@ struct my_bp_v1 : predictor {
             "pred_source TEXT, pred_table INTEGER, bim_index INTEGER,"
             "hit INTEGER, hit_table INTEGER, hit_gtag INTEGER, hit_gindex INTEGER,"
             "alloc INTEGER, alloc_table INTEGER, alloc_gindex INTEGER, alloc_tag INTEGER,"
-            "conf INTEGER, sc_override INTEGER, sc_dir INTEGER, sc_sum INTEGER, threshold INTEGER"
+            "conf INTEGER"
             ");",
             nullptr, nullptr, nullptr);
         sqlite3_exec(trace_db, "BEGIN;", nullptr, nullptr, nullptr);
         sqlite3_prepare_v2(trace_db,
-            "INSERT INTO trace VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+            "INSERT INTO trace VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
             -1, &trace_stmt, nullptr);
     }
 
@@ -502,14 +384,14 @@ struct my_bp_v1 : predictor {
                       u64 pred_source, u64 pred_table, u64 bim_index,
                       u64 hit, u64 hit_table, u64 hit_gtag, u64 hit_gindex,
                       u64 alloc, u64 alloc_table, u64 alloc_gindex, u64 alloc_tag,
-                      u64 conf, u64 sc_override, i64 sc_dir, i64 sc_sum_val, u64 threshold_val) {
+                      u64 conf) {
 #if !MY_BP_V1_PERF_ENABLE_TRACE_DB
         (void)cycle; (void)pc; (void)offset;
         (void)actual_dir; (void)predicted_dir; (void)mispredict;
         (void)pred_source; (void)pred_table; (void)bim_index;
         (void)hit; (void)hit_table; (void)hit_gtag; (void)hit_gindex;
         (void)alloc; (void)alloc_table; (void)alloc_gindex; (void)alloc_tag;
-        (void)conf; (void)sc_override; (void)sc_dir; (void)sc_sum_val; (void)threshold_val;
+        (void)conf;
         return;
 #endif
         if (!trace_stmt) return;
@@ -535,44 +417,12 @@ struct my_bp_v1 : predictor {
         sqlite3_bind_int64(trace_stmt, 17, alloc ? static_cast<i64>(alloc_gindex) : -1);
         sqlite3_bind_int64(trace_stmt, 18, alloc ? static_cast<i64>(alloc_tag)    : -1);
         sqlite3_bind_int64(trace_stmt, 19, static_cast<i64>(conf));
-        sqlite3_bind_int64(trace_stmt, 20, static_cast<i64>(sc_override));
-        sqlite3_bind_int64(trace_stmt, 21, sc_dir);
-        sqlite3_bind_int64(trace_stmt, 22, sc_sum_val);
-        sqlite3_bind_int64(trace_stmt, 23, static_cast<i64>(threshold_val));
         sqlite3_step(trace_stmt);
         if (trace_seq % 100000 == 0) {
             sqlite3_exec(trace_db, "COMMIT;", nullptr, nullptr, nullptr);
             sqlite3_exec(trace_db, "BEGIN;",  nullptr, nullptr, nullptr);
         }
     }
-
-#ifdef MY_SC
-#ifdef SC_BGEHL
-    void perf_count_bgehl(arr<val<1>,LINEINST> is_branch)
-    {
-        bool filter_open = static_cast<bool>(bgehl_imli_filter);
-        for (u64 offset = 0; offset < LINEINST; offset++) {
-            bool is_branch_slot = static_cast<bool>(is_branch[offset]);
-            if (!is_branch_slot) continue;
-            bool nonzero_contrib = filter_open && (static_cast<i64>(bgehl_map[offset]) != 0);
-            bool sc_update_candidate = static_cast<bool>(is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset]);
-
-            perf_bgehl_branch_slots++;
-            if (filter_open) {
-                perf_bgehl_filter_allow++;
-                if (nonzero_contrib)
-                    perf_bgehl_nonzero_contrib++;
-            } else {
-                perf_bgehl_filter_block++;
-            }
-
-            if (!sc_update_candidate) continue;
-            perf_bgehl_update_candidate++;
-            perf_bgehl_update_allow++;
-        }
-    }
-#endif
-#endif
 
     void print_perf_counters() {
         u64 ghyst_reads = 0;
@@ -912,18 +762,11 @@ struct my_bp_v1 : predictor {
         }
     }
 
-#ifdef MY_SC
-    void perf_count_extra_cycle(val<1> extra_cycle, val<1> some_badpred1, val<1> mispredict, val<1> p1_update, val<1> sc_need_update) {
-#else
     void perf_count_extra_cycle(val<1> extra_cycle, val<1> some_badpred1, val<1> mispredict, val<1> p1_update) {
-#endif
         perf_extra_cycle_total      += static_cast<u64>(extra_cycle);
         perf_extra_cycle_badpred    += static_cast<u64>(some_badpred1);
         perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
         perf_extra_cycle_p1_update  += static_cast<u64>(p1_update);
-#ifdef MY_SC
-        perf_extra_cycle_sc_update  += static_cast<u64>(sc_need_update);
-#endif
     }
 
 
@@ -1008,34 +851,7 @@ struct my_bp_v1 : predictor {
                     perf_bimodal_wrong++;
                 }
 
-                {
-#ifdef MY_SC
-                    val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
-                    val<1> use_sc_bit = use_sc[offset];
-                    val<1> sc_pred_bit = sc_pred[offset];
-
-                    if (static_cast<bool>(use_sc_bit)) {
-                        if (static_cast<bool>(sc_pred_bit == tage_p2_bit)) {
-                            perf_mispred_sc_keep++;
-                            perf_mispred_blame_tage++;
-                        } else {
-                            perf_mispred_sc_flip++;
-                            if (static_cast<bool>(tage_p2_bit == actual)) {
-                                perf_mispred_sc_flip_harmful++;
-                                perf_mispred_blame_sc++;
-                            } else {
-                                perf_mispred_sc_flip_both_wrong++;
-                                perf_mispred_blame_tage++;
-                            }
-                        }
-                    } else {
-                        perf_mispred_sc_not_used++;
-                        perf_mispred_blame_tage++;
-                    }
-#else
-                    perf_mispred_blame_tage++;
-#endif
-                }
+                perf_mispred_blame_tage++;
             }
 
             u64 pc_val = 0;
@@ -1085,21 +901,6 @@ struct my_bp_v1 : predictor {
                               static_cast<u64>(static_cast<u64>(alt_mask) ? [&]{ for(u64 j=0;j<NUMG;j++) if((static_cast<u64>(alt_mask)>>j)&1) return j; return (u64)0; }() : 0);
                     if (tbl < NUMG) conf_val = static_cast<u64>(readh[tbl]);
                 }
-
-                u64 sc_override_val = 0;
-                i64 sc_dir_val = -1;
-                i64 sc_sum_val = 0;
-                u64 threshold_val = 0;
-#ifdef MY_SC
-                {
-                    u64 p2_bit     = static_cast<u64>((p2     >> offset) & val<1>{1});
-                    u64 tage_p2_bit= static_cast<u64>((tage_p2>> offset) & val<1>{1});
-                    sc_override_val = (p2_bit != tage_p2_bit) ? 1 : 0;
-                    if (sc_override_val) sc_dir_val = static_cast<i64>(p2_bit);
-                    sc_sum_val   = static_cast<i64>(sc_sum[offset]);
-                    threshold_val = static_cast<u64>(threshold[offset]);
-                }
-#endif
                 insert_trace(
                     static_cast<u64>(panel.cycle), pc_val, offset,
                     static_cast<u64>(actual), static_cast<u64>(predicted),
@@ -1108,7 +909,7 @@ struct my_bp_v1 : predictor {
                     hit_found, hit_table, hit_gtag, hit_gindex,
                     is_misp & is_last & alloc_found,
                     alloc_table, alloc_gindex_val, alloc_tag_val,
-                    conf_val, sc_override_val, sc_dir_val, sc_sum_val, threshold_val);
+                    conf_val);
             }
 
             if (pred_source == 1 || pred_source == 2) {
@@ -1131,143 +932,16 @@ struct my_bp_v1 : predictor {
             }
         }
 
-#ifdef MY_SC
-        for (u64 offset=0; offset<LINEINST; offset++) {
-            if (!static_cast<bool>(is_branch[offset])) continue;
-            val<1> p2_bit = (p2 >> offset) & val<1>{1};
-            val<1> tage_p2_bit = (tage_p2 >> offset) & val<1>{1};
-            val<1> actual = branch_taken[offset];
-            val<1> sc_override = (p2_bit != tage_p2_bit);
-            val<1> use_sc_bit = use_sc[offset];
-            val<1> sc_pred_bit = sc_pred[offset];
-            val<1> prov_hit = prov_hit_arr[offset];
-            val<1> do_update = do_update_arr[offset];
-            val<1> thre_guard = thre_guard_arr[offset];
-
-            if (static_cast<bool>(use_sc_bit)) {
-                perf_sc_use++;
-                perf_sc_use_correct += static_cast<u64>(sc_pred_bit == actual);
-                if (static_cast<bool>(sc_pred_bit))
-                    perf_sc_use_taken++;
-                else
-                    perf_sc_use_nottaken++;
-                if (static_cast<bool>(sc_pred_bit == tage_p2_bit))
-                    perf_sc_use_same_as_tage++;
-                else
-                    perf_sc_use_flip_tage++;
-                if (static_cast<bool>(prov_weak[offset]))
-                    perf_sc_use_weak++;
-                if (static_cast<bool>(prov_mid[offset]))
-                    perf_sc_use_mid++;
-                if (static_cast<bool>(prov_sat[offset]))
-                    perf_sc_use_sat++;
-            }
-
-            if (static_cast<bool>(prov_hit))
-                perf_sc_stage_prov_hit++;
-            if (static_cast<bool>(do_update))
-                perf_sc_stage_do_update++;
-            if (static_cast<bool>(prov_hit & do_update))
-                perf_sc_stage_candidate++;
-            if (static_cast<bool>(prov_hit & do_update & thre_guard))
-                perf_sc_stage_guard_pass++;
-
-            if (!static_cast<bool>(prov_hit)) {
-                perf_sc_skip_no_provider++;
-            } else if (!static_cast<bool>(do_update)) {
-                perf_sc_skip_no_do_update++;
-            } else if (!static_cast<bool>(thre_guard)) {
-                perf_sc_skip_guard++;
-            }
-
-            if (static_cast<bool>(sc_override)) {
-                perf_sc_override++;
-                perf_sc_override_correct += static_cast<u64>(p2_bit == actual);
-            }
-            if (static_cast<bool>(is_branch[offset] & do_update_arr[offset] & thre_guard_arr[offset] & prov_hit_arr[offset])) {
-                perf_thre_update++;
-                if (static_cast<bool>(sc_wrong_arr[offset]))
-                    perf_thre_update_inc++;
-                else
-                    perf_thre_update_dec++;
-            }
-        }
-#endif
     }
 #endif
 #endif
 
     
-    // Cluster P1 + bpred + SC tables to reduce dominant SC-path wire distance.
-    zone P1_SC_CLUSTER;
+    // Cluster P1 + bpred tables.
+    zone P1_CLUSTER;
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
     ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
-    #ifdef MY_SC
-    //bias_pc is concat pc and tage
-    //idx = (pc>>(LOGLB+2)) 2bit tage info(prov_weak,prov_taken)
-    arr<reg<TOTAL_THREBITS>,LINEINST> threshold;
-#ifdef SC_USE_BIAS
-    ram<arr<val<PERCWIDTH,i64>,4>,(1<<(LOGBIAS-LOGLINEINST-2))> bias_pc[LINEINST] {"Bias pc"};
-    arr<reg<PERCWIDTH,i64>,LINEINST> bias_bank_map[4];
-    arr<reg<PERCWIDTH,i64>,4> bias_lmap;
-    arr<reg<PERCWIDTH,i64>,LINEINST> bias_map;
-    arr<reg<2>,LINEINST> tage_info;
-    reg<LOGBIAS-LOGLINEINST-2> bias_high_idx;
-#endif
-
-    arr<reg<PRE_PC_THREBITS>,LINEINST> thre1;
-    reg<GLOBAL_THREBITS> global_thre = val<GLOBAL_THREBITS>{SC_GLOBAL_THRE_INIT};
-    arr<reg<2,i64>,SC_GLOBAL_THRE_PIPE_STAGES> global_thre_pipe;
-    arr<reg<TOTAL_THREBITS,i64>,LINEINST> sc_sum;
-#ifdef SC_USE_GEHL
-    arr<reg<LOGGEHL-LOGLINEINST>,NUMGEHL> gehl_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGGEHL-LOGLINEINST))> gehl[NUMGEHL][LINEINST] {"GEHL"};
-    arr<reg<PERCWIDTH,i64>,LINEINST> gehl_map[NUMGEHL];
-#endif
-#ifdef SC_FGEHL
-    reg<LOGFGEHL-LOGLINEINST> fgehl_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGFGEHL-LOGLINEINST))> fgehl[LINEINST] {"FGEHL"};
-    arr<reg<PERCWIDTH,i64>,LINEINST> fgehl_map;
-#endif
-#ifdef SC_USE_FHIST
-    reg<FHIST_BITS> fhist;
-#endif
-#ifdef SC_USE_BHIST
-#ifdef SC_BGEHL
-    reg<LOGBGEHL-LOGLINEINST> bgehl_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGBGEHL-LOGLINEINST))> bgehl[LINEINST] {"BGEHL"};
-    arr<reg<PERCWIDTH,i64>,LINEINST> bgehl_map;
-#endif
-#ifdef SC_USE_TAIMLI
-    reg<LOGIMLI-LOGLINEINST> imlita_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGIMLI-LOGLINEINST))> imlita[LINEINST] {"IMLI target"};
-    arr<reg<PERCWIDTH,i64>,LINEINST> imlita_map;
-#endif
-#ifdef SC_USE_BRIMLI
-    reg<LOGIMLI-LOGLINEINST> imlibr_idx;
-    ram<val<PERCWIDTH,i64>,(1<<(LOGIMLI-LOGLINEINST))> imlibr[LINEINST] {"IMLI branch"};
-    arr<reg<PERCWIDTH,i64>,LINEINST> imlibr_map;
-#endif
-    reg<BHIST_BITS> bhist;
-    reg<IMLI_BITS> ta_imli;
-    reg<IMLI_BITS> br_imli;
-    reg<IMLI_REGION_BITS> last_backward_target_region;
-    reg<IMLI_REGION_BITS> last_backward_pc_region;
-#ifdef SC_BGEHL
-    reg<1> bgehl_imli_filter;
-#endif
-#endif
-
-    // intermediate update signals
-    arr<reg<1>,LINEINST> sc_wrong_arr;
-    arr<reg<1>,LINEINST> do_update_arr;
-    arr<reg<1>,LINEINST> prov_hit_arr;
-    arr<reg<1>,LINEINST> thre_guard_arr;
-    // rwram<PERCWIDTH,(1<<LOGBIAS)/NUMBANKS,NUMBANKS> bias_pc {"Bias pc"};
-
-    
-    #endif
     // Put TAGE tables in a dedicated cluster.
     zone TAGE_CLUSTER;
     // P2 (TAGE)
@@ -2035,9 +1709,6 @@ struct my_bp_v1 : predictor {
 
         readt.fanout(hard<LINEINST+1>{});
         readc.fanout(hard<3>{});
-#ifdef MY_SC
-        readh.fanout(hard<1+4*LINEINST>{});
-#endif
         readu.fanout(hard<2>{});
         notumask = ~readu.concat();
         notumask.fanout(hard<2>{});
@@ -2067,20 +1738,8 @@ struct my_bp_v1 : predictor {
             match1[offset] = match[offset].one_hot();
 
         }
-#ifdef MY_SC
-        match1.fanout(hard<3+3*NUMG>{});
-#else
         match1.fanout(hard<3>{});
-#endif
         for (u64 offset=0; offset<LINEINST; offset++) {
-#ifdef MY_SC
-            arr<val<1>,NUMG> weakctr = [&](int i) {return (readh[i]==hard<0>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
-            arr<val<1>,NUMG> midctr = [&](int i) {return ((readh[i]==hard<1>{}) | (readh[i]==hard<2>{})) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
-            arr<val<1>,NUMG> highctr = [&](int i) {return (readh[i]==hard<3>{}) & (val<NUMG>{match1[offset]}!=val<NUMG>{0});};
-            prov_weak[offset] = weakctr.fold_or();
-            prov_mid[offset] = midctr.fold_or();
-            prov_sat[offset] = highctr.fold_or();
-#endif
             pred1[offset] = (match1[offset] & preds[offset]) != hard<0>{};
         }
         pred1.fanout(hard<3>{});
@@ -2128,230 +1787,10 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
     }
-#ifdef MY_SC
-    void sc_predict(val<64> inst_pc){
-
-        // inst_pc.fanout(hard<5>{});
-        match1.fanout(hard<2>{});
-        prov_weak.fanout(hard<2>{});
-        // bias
-#ifdef SC_USE_BIAS
-        val<LOGBIAS-LOGLINEINST-2> bias_pc_high_index =  inst_pc>>(LOGLB+2);
-        bias_pc_high_index.fanout(hard<(LINEINST+1)>{});
-        bias_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            arr<val<PERCWIDTH,i64>,4> bank_out = bias_pc[offset].read(bias_pc_high_index);
-            for (u64 bank = 0; bank < 4; bank++) {
-                bias_bank_map[bank][offset] = bank_out[bank];
-            }
-            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
-            val<1> prov_pred = pred1[offset] & prov_hit;
-            val<1> is_prov_weak =  prov_weak[offset];
-            tage_info[offset] = concat(prov_pred,is_prov_weak);
-            val<PERCWIDTH,i64> result = bank_out.select(tage_info[offset]);
-            return result;
-        }};
-        tage_info.fanout(hard<2>{});
-        bias_map.fanout(hard<2>{});
-        bias_high_idx = bias_pc_high_index;
-#endif
-#ifdef SC_USE_GEHL
-        val<LOGGEHL-LOGLINEINST> gehl_base_index = inst_pc >> LOGLB;
-        gfolds.fanout(hard<NUMGEHL>{});
-        gehl_base_index.fanout(hard<NUMGEHL>{});
-        for (u64 k = 0; k < NUMGEHL; k++) {
-            val<LOGGEHL-LOGLINEINST> idx = gehl_base_index ^ val<LOGGEHL-LOGLINEINST>{gfolds.template get<0>(k+1)};
-            idx.fanout(hard<LINEINST+1>{});
-            gehl_idx[k] = idx;
-            gehl_map[k] = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-                return gehl[k][offset].read(idx);
-            }};
-            gehl_map[k].fanout(hard<2>{});
-        }
-#endif
-#ifdef SC_FGEHL
-        val<LOGFGEHL-LOGLINEINST> fgehl_base_index = inst_pc >> LOGLB;
-        val<FHIST_BITS> fh_mix = val<FHIST_BITS>{fhist} ^ (val<FHIST_BITS>{fhist} >> hard<13>{}) ^ (val<FHIST_BITS>{fhist} >> hard<29>{});
-        val<LOGFGEHL-LOGLINEINST> fidx = fgehl_base_index ^ val<LOGFGEHL-LOGLINEINST>{fh_mix};
-        fidx.fanout(hard<LINEINST+1>{});
-        fgehl_idx = fidx;
-        fgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            return fgehl[offset].read(fidx);
-        }};
-        fgehl_map.fanout(hard<2>{});
-#endif
-#ifdef SC_USE_BHIST
-#ifdef SC_BGEHL
-#ifdef SC_USE_TAIMLI
-        val<1> ta_imli_small = val<IMLI_BITS>{ta_imli} < val<IMLI_BITS>{IMLI_FILTER_THRESHOLD};
-#else
-        val<1> ta_imli_small = val<1>{1};
-#endif
-#ifdef SC_USE_BRIMLI
-        val<1> br_imli_small = val<IMLI_BITS>{br_imli} < val<IMLI_BITS>{IMLI_FILTER_THRESHOLD};
-#else
-        val<1> br_imli_small = val<1>{1};
-#endif
-        val<1> bgehl_hist_ok = ta_imli_small & br_imli_small;
-        val<LOGBGEHL-LOGLINEINST> bgehl_base_index = inst_pc >> LOGLB;
-        val<BHIST_BITS> bh_mix = val<BHIST_BITS>{bhist} ^ (val<BHIST_BITS>{bhist} >> hard<13>{}) ^ (val<BHIST_BITS>{bhist} >> hard<29>{});
-        val<LOGBGEHL-LOGLINEINST> bidx = bgehl_base_index ^ val<LOGBGEHL-LOGLINEINST>{bh_mix};
-        bgehl_hist_ok.fanout(hard<LINEINST+3>{});
-        bidx.fanout(hard<LINEINST+1>{});
-        bgehl_idx = bidx;
-        bgehl_imli_filter = bgehl_hist_ok;
-        bgehl_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            return bgehl[offset].read(bidx);
-        }};
-        bgehl_map.fanout(hard<2>{});
-#endif
-#ifdef SC_USE_TAIMLI
-        val<IMLI_BITS> bhist_low_imli = val<IMLI_BITS>{bhist};
-        val<1> ta_imli_zero = val<IMLI_BITS>{ta_imli} == val<IMLI_BITS>{0};
-        val<1> ta_imli_alias = val<IMLI_BITS>{br_imli} == val<IMLI_BITS>{ta_imli};
-        val<IMLI_BITS> f_ta_imli = select(ta_imli_zero | ta_imli_alias, bhist_low_imli, val<IMLI_BITS>{ta_imli});
-        val<LOGIMLI-LOGLINEINST> imli_base_index_ta = inst_pc >> LOGLB;
-        val<LOGIMLI-LOGLINEINST> ta_idx = imli_base_index_ta ^ val<LOGIMLI-LOGLINEINST>{f_ta_imli} ^ val<LOGIMLI-LOGLINEINST>{inst_pc >> 4};
-        ta_idx.fanout(hard<LINEINST+1>{});
-        imlita_idx = ta_idx;
-        imlita_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            return imlita[offset].read(ta_idx);
-        }};
-        imlita_map.fanout(hard<2>{});
-#endif
-#ifdef SC_USE_BRIMLI
-    #ifdef SC_FGEHL
-        val<IMLI_BITS> fhist_low_imli = val<IMLI_BITS>{fhist};
-    #else
-        val<IMLI_BITS> fhist_low_imli = val<IMLI_BITS>{bhist};
-    #endif
-        val<1> br_imli_zero = val<IMLI_BITS>{br_imli} == val<IMLI_BITS>{0};
-        val<IMLI_BITS> f_br_imli = select(br_imli_zero, fhist_low_imli, val<IMLI_BITS>{br_imli});
-        val<LOGIMLI-LOGLINEINST> imli_base_index_br = inst_pc >> LOGLB;
-        val<LOGIMLI-LOGLINEINST> br_idx = imli_base_index_br ^ val<LOGIMLI-LOGLINEINST>{f_br_imli} ^ val<LOGIMLI-LOGLINEINST>{inst_pc >> 6};
-        br_idx.fanout(hard<LINEINST+1>{});
-        imlibr_idx = br_idx;
-        imlibr_map = arr<val<PERCWIDTH,i64>,LINEINST>{[&](u64 offset){
-            return imlibr[offset].read(br_idx);
-        }};
-        imlibr_map.fanout(hard<2>{});
-#endif
-#ifdef SC_BGEHL
-#ifdef PERF_COUNTERS
-        perf_bgehl_read_ops += LINEINST;
-#endif
-#endif
-#endif
-
-        threshold = arr<val<TOTAL_THREBITS>,LINEINST>{[&](u64 offset){
-            return global_thre + thre1[offset];
-        }};
-        threshold.fanout(hard<4>{});
-
-        //100 ps 2.5 cycle
-        sc_sum = arr<val<TOTAL_THREBITS,i64>,LINEINST>{[&](u64 offset){
-#if !defined(SC_USE_BIAS) && !defined(SC_USE_GEHL) && !defined(SC_FGEHL) && !defined(SC_BGEHL)
-            static_cast<void>(offset);
-#endif
-#ifdef SC_USE_BIAS
-            val<PERCWIDTH,i64> bias = bias_map[offset];
-            bias.fanout(hard<2>{});
-            val<1> bias_sign = val<1>{bias >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> bias_ext = concat(bias_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bias});
-#else
-            val<TOTAL_THREBITS,i64> bias_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-#ifdef SC_USE_GEHL
-            val<PERCWIDTH,i64> gehl0 = gehl_map[0][offset];
-            val<PERCWIDTH,i64> gehl1 = gehl_map[1][offset];
-            gehl0.fanout(hard<2>{});
-            gehl1.fanout(hard<2>{});
-            val<1> gehl0_sign = val<1>{gehl0 >> hard<PERCWIDTH-1>{}};
-            val<1> gehl1_sign = val<1>{gehl1 >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> gehl0_ext = concat(gehl0_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{gehl0});
-            val<TOTAL_THREBITS,i64> gehl1_ext = concat(gehl1_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{gehl1});
-#else
-            val<TOTAL_THREBITS,i64> gehl0_ext = val<TOTAL_THREBITS,i64>{0};
-            val<TOTAL_THREBITS,i64> gehl1_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-#ifdef SC_FGEHL
-            val<PERCWIDTH,i64> fgehl_v = fgehl_map[offset];
-            fgehl_v.fanout(hard<2>{});
-            val<1> fgehl_sign = val<1>{fgehl_v >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> fgehl_ext = concat(fgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{fgehl_v});
-#else
-            val<TOTAL_THREBITS,i64> fgehl_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-#ifdef SC_USE_BHIST
-#ifdef SC_BGEHL
-            val<PERCWIDTH,i64> bgehl_v = bgehl_map[offset];
-            bgehl_v.fanout(hard<2>{});
-            val<1> bgehl_sign = val<1>{bgehl_v >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> raw_bgehl_ext = concat(bgehl_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{bgehl_v});
-            val<TOTAL_THREBITS,i64> bgehl_ext = select(bgehl_hist_ok, raw_bgehl_ext, val<TOTAL_THREBITS,i64>{0});
-#else
-            val<TOTAL_THREBITS,i64> bgehl_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-#ifdef SC_USE_TAIMLI
-            val<PERCWIDTH,i64> imlita_v = imlita_map[offset];
-            imlita_v.fanout(hard<2>{});
-            val<1> imlita_sign = val<1>{imlita_v >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> imlita_ext = concat(imlita_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{imlita_v});
-#else
-            val<TOTAL_THREBITS,i64> imlita_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-#ifdef SC_USE_BRIMLI
-            val<PERCWIDTH,i64> imlibr_v = imlibr_map[offset];
-            imlibr_v.fanout(hard<2>{});
-            val<1> imlibr_sign = val<1>{imlibr_v >> hard<PERCWIDTH-1>{}};
-            val<TOTAL_THREBITS,i64> imlibr_ext = concat(imlibr_sign.replicate(hard<TOTAL_THREBITS-PERCWIDTH>{}).concat(), val<PERCWIDTH>{imlibr_v});
-#else
-            val<TOTAL_THREBITS,i64> imlibr_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-#else
-            val<TOTAL_THREBITS,i64> bgehl_ext = val<TOTAL_THREBITS,i64>{0};
-            val<TOTAL_THREBITS,i64> imlita_ext = val<TOTAL_THREBITS,i64>{0};
-            val<TOTAL_THREBITS,i64> imlibr_ext = val<TOTAL_THREBITS,i64>{0};
-#endif
-            val<TOTAL_THREBITS,i64> sc_hist_sum = gehl0_ext + gehl1_ext + fgehl_ext + bgehl_ext + imlita_ext + imlibr_ext;
-            return sc_hist_sum + bias_ext;
-        }};
-        
-        sc_sum.fanout(hard<4>{});
-        //100 ps
-        use_sc = arr<val<1>,LINEINST>{[&](u64 offset){
-            val<1> prov_hit  = val<NUMG>{match1[offset]}!=val<NUMG>{0};
-            val<1> is_prov_weak =  prov_weak[offset]; 
-            val<1> is_prov_mid = prov_mid[offset].fo1();
-            val<1> is_prov_high = prov_sat[offset].fo1();
-            // return prov_hit & (
-            //         ((is_prov_weak) & (sc_sum[offset]>(threshold[offset]>>3))));
-            val<TOTAL_THREBITS> abs_sc = select(sc_sum[offset]>val<TOTAL_THREBITS,i64>{0}, val<TOTAL_THREBITS>{sc_sum[offset]}, val<TOTAL_THREBITS>{val<TOTAL_THREBITS,i64>{0}-sc_sum[offset]});
-            abs_sc.fanout(hard<3>{});
-            return prov_hit & (((is_prov_high) & (abs_sc>(threshold[offset]>>hard<1>{})))|
-                    ((is_prov_mid) & (abs_sc>(threshold[offset]>>hard<2>{})))|
-                    ((is_prov_weak) & (abs_sc>(threshold[offset]>>hard<3>{}))));
-        }};
-        use_sc.fanout(hard<2>{});
-        sc_pred = arr<val<1>,LINEINST>{[&](u64 offset){
-            return sc_sum[offset] > val<TOTAL_THREBITS,i64>{0};
-        }};
-        sc_pred.fanout(hard<2>{});
-        //70ps
-        sc_p2 = arr<val<1>,LINEINST> {[&](u64 offset){
-            val<1> tage_pred = tage_p2.make_array(val<1>{})[offset];
-            return select(use_sc[offset],sc_pred[offset],tage_pred);
-        }}.concat();
-    }
-#endif
     val<1> predict2(val<64> inst_pc)
     {
         tage_pred(inst_pc);
-#ifndef MY_SC
         p2 = tage_p2;
-#else
-        sc_predict(inst_pc);
-        p2 = sc_p2;
-#endif
         p2.fanout(hard<LINEINST>{});
         val<1> taken = (block_entry & p2) != hard<0>{};
         taken.fanout(hard<2>{});
@@ -2378,25 +1817,6 @@ struct my_bp_v1 : predictor {
         num_branch++;
     }
 
-#ifdef MY_SC
-    void pipe_global_thre_delta(val<2,i64> new_delta, val<1> flush = val<1>{0})
-    {
-        flush.fanout(hard<SC_GLOBAL_THRE_PIPE_STAGES + 2>{});
-        val<2,i64> apply_delta = select(flush, val<2,i64>{0}, val<2,i64>{global_thre_pipe[SC_GLOBAL_THRE_PIPE_STAGES-1]});
-        apply_delta.fanout(hard<2>{});
-        val<1> apply_upd = apply_delta != val<2,i64>{0};
-        val<1> apply_inc = apply_delta > val<2,i64>{0};
-        execute_if(apply_upd, [&](){
-            global_thre = update_ctr(global_thre, apply_inc);
-        });
-        for (u64 i = SC_GLOBAL_THRE_PIPE_STAGES-1; i != 0; i--) {
-            global_thre_pipe[i] = select(flush, val<2,i64>{0}, val<2,i64>{global_thre_pipe[i-1]});
-        }
-        global_thre_pipe[0] = select(flush, val<2,i64>{0}, new_delta);
-    }
-
-#endif
-
     void update_cycle(instruction_info &block_end_info)
     {
         val<1> &mispredict = block_end_info.is_mispredict;
@@ -2419,9 +1839,6 @@ struct my_bp_v1 : predictor {
 #endif
                 true_block = 1;
             });
-#ifdef MY_SC
-            pipe_global_thre_delta(val<2,i64>{0}, val<1>{0});
-#endif
             return; // stop here
         }
         mispredict.fanout(hard<3>{});
@@ -2589,55 +2006,14 @@ struct my_bp_v1 : predictor {
 #endif
 
         val<1> extra_cycle_base = some_badpred1 | mispredict | (disagree_mask != hard<0>{});
-#ifdef MY_SC
-        sc_sum.fanout(hard<3>{});
-        // use_sc.fanout(hard<LINEINST*3>{});
-        // match1.fanout(hard<LINEINST*2>{});
-        // branch_pc.fanout(hard<LINEINST*2>{});
-        // threshold.fanout(hard<LINEINST>{});
-
-        // compute intermediate signals once, reuse below
-        sc_wrong_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            val<1> sc_pred_bit = sc_pred[offset];
-            return sc_pred_bit != branch_taken[offset];
-        }};
-        sc_wrong_arr.fanout(hard<3>{});
-        
-        
-        
-        do_update_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            return sc_wrong_arr[offset] | ~use_sc[offset];
-        }};
-        do_update_arr.fanout(hard<6>{});
-        prov_hit_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            return val<NUMG>{match1[offset]} != val<NUMG>{0};
-        }};
-        prov_hit_arr.fanout(hard<6>{});
-        thre_guard_arr = arr<val<1>,LINEINST>{[&](u64 offset){
-            val<TOTAL_THREBITS> abs_sc = select(sc_sum[offset]>val<TOTAL_THREBITS,i64>{0}, val<TOTAL_THREBITS>{sc_sum[offset]}, val<TOTAL_THREBITS>{val<TOTAL_THREBITS,i64>{0}-sc_sum[offset]});
-            return abs_sc > (threshold[offset]>>hard<1>{});
-            // return val<1>{1};
-        }};
-
-        val<1> sc_need_update = arr<val<1>,LINEINST>{[&](u64 offset){
-            return is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
-        }}.fold_or();
-
-        val<1> extra_cycle = extra_cycle_base | sc_need_update;
-#else
         val<1> extra_cycle = extra_cycle_base;
-#endif
 
         extra_cycle.fanout(hard<NUMG*2+8>{});
         need_extra_cycle(extra_cycle);
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
         val<1> p1_update = disagree_mask != hard<0>{};
-#ifdef MY_SC
-        perf_count_extra_cycle(extra_cycle, some_badpred1, mispredict, p1_update, sc_need_update);
-#else
         perf_count_extra_cycle(extra_cycle, some_badpred1, mispredict, p1_update);
-#endif
 #endif
 #endif
 
@@ -3043,172 +2419,8 @@ struct my_bp_v1 : predictor {
 #endif
         });
 
-#if defined(MY_SC) && defined(SC_FGEHL)
-        // FGEHL history: use existing framework signals only (last resolved branch + block next_pc)
-        val<64> last_branch_pc = branch_pc[num_branch-1];
-        val<1> last_branch_taken = branch_dir[num_branch-1];
-        val<1> last_forward = next_pc > last_branch_pc;
-        val<FHIST_BITS> next_pc_fold = val<FHIST_BITS>{next_pc >> 2};
-        val<FHIST_BITS> branch_pc_fold = val<FHIST_BITS>{last_branch_pc >> 1};
-        val<FHIST_BITS> new_fhist = (val<FHIST_BITS>{fhist} << hard<3>{}) ^ next_pc_fold ^ branch_pc_fold;
-        execute_if(last_branch_taken & last_forward, [&](){
-            fhist = new_fhist;
-        });
-#endif
-#if defined(MY_SC) && defined(SC_USE_BHIST)
-        val<64> last_branch_pc_b = branch_pc[num_branch-1];
-        val<1> last_branch_taken_b = branch_dir[num_branch-1];
-        val<1> last_backward = next_pc < last_branch_pc_b;
-        val<BHIST_BITS> next_pc_fold_b = val<BHIST_BITS>{next_pc >> 2};
-        val<BHIST_BITS> branch_pc_fold_b = val<BHIST_BITS>{last_branch_pc_b >> 1};
-        val<BHIST_BITS> new_bhist = (val<BHIST_BITS>{bhist} << hard<3>{}) ^ next_pc_fold_b ^ branch_pc_fold_b;
-        val<16> next_pc_low16_b = next_pc;
-        val<16> branch_pc_low16_b = last_branch_pc_b;
-        val<IMLI_REGION_BITS> next_pc_region_b = next_pc_low16_b >> hard<IMLI_REGION_SHIFT>{};
-        val<IMLI_REGION_BITS> branch_pc_region_b = branch_pc_low16_b >> hard<IMLI_REGION_SHIFT>{};
-        val<1> same_target_region = next_pc_region_b == val<IMLI_REGION_BITS>{last_backward_target_region};
-        val<1> same_branch_region = branch_pc_region_b == val<IMLI_REGION_BITS>{last_backward_pc_region};
-        val<IMLI_BITS> ta_imli_inc = update_ctr(val<IMLI_BITS>{ta_imli}, val<1>{1});
-        val<IMLI_BITS> br_imli_inc = update_ctr(val<IMLI_BITS>{br_imli}, val<1>{1});
-        val<1> do_backward_hist_update = last_branch_taken_b & last_backward;
-        execute_if(do_backward_hist_update, [&](){
-            bhist = new_bhist;
-            ta_imli = select(same_target_region, ta_imli_inc, val<IMLI_BITS>{0});
-            br_imli = select(same_branch_region, br_imli_inc, val<IMLI_BITS>{0});
-            last_backward_target_region = next_pc_region_b;
-            last_backward_pc_region = branch_pc_region_b;
-        });
-#endif
-
-
-#ifdef MY_SC
-
-
-        //global_thre: majority vote across all qualifying offsets
-        arr<val<1>,LINEINST> thre_update_en = [&](u64 offset){
-            return is_branch[offset] & do_update_arr[offset] & thre_guard_arr[offset];
-        };
-        thre_update_en.fanout(hard<2>{});
-        // Meta-style signed accumulation:
-        // +1 when SC is wrong, -1 when SC is right, 0 when no update.
-        arr<val<2,i64>,LINEINST> gthre_incr = [&](u64 offset) -> val<2,i64> {
-            val<1> update_en = thre_update_en[offset];
-            val<1> dec_sign = ~sc_wrong_arr[offset]; // 0:+1, 1:-1
-            return select(update_en.fo1(), concat(dec_sign.fo1(), val<1>{1}), val<2>{0});
-        };
-        auto gthre_vote = gthre_incr.fo1().fold_add();
-        val<1> global_thre_upd = gthre_vote != val<decltype(gthre_vote)::size, i64>{0};
-        val<1> global_thre_inc = gthre_vote > val<decltype(gthre_vote)::size, i64>{0};
-        val<1> global_thre_decsign = ~global_thre_inc;
-        global_thre_inc.fanout(hard<2>{});
-        val<2,i64> gthre_delta = select(global_thre_upd.fo1(), concat(global_thre_decsign.fo1(), val<1>{1}), val<2>{0});
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
-        if (static_cast<bool>(global_thre_upd)) {
-            perf_global_thre_update++;
-            if (static_cast<bool>(global_thre_inc))
-                perf_global_thre_inc++;
-            else
-                perf_global_thre_dec++;
-        }
-#endif
-#endif
-        pipe_global_thre_delta(gthre_delta, mispredict);
-
-        
-#ifdef SC_USE_BIAS
-        bias_high_idx.fanout(hard<4>{});
-#endif
-
-
-        //per-offset updates: bias_pc and thre1 (no write conflicts)
-        for (u64 offset = 0; offset < LINEINST; offset++) {
-#ifdef SC_USE_BIAS
-            val<LOGBIAS-LOGLINEINST-2> high_idx = bias_high_idx;
-            val<2> write_tage_info = tage_info[offset];
-#endif
-            val<PRE_PC_THREBITS> old_thre1 = thre1[offset];
-            val<PRE_PC_THREBITS> new_thre1 = update_ctr(old_thre1, sc_wrong_arr[offset]);
-#if defined(SC_USE_BIAS) || defined(SC_USE_GEHL) || defined(SC_FGEHL) || defined(SC_BGEHL)
-            [[maybe_unused]] val<1> sc_update_en = is_branch[offset] & do_update_arr[offset] & prov_hit_arr[offset];
-#endif
-#ifdef SC_USE_BIAS
-            write_tage_info.fanout(hard<4>{});
-            high_idx.fanout(hard<4>{});
-            execute_if(sc_update_en, [&](){
-                arr<val<PERCWIDTH,i64>,4> new_bias_vec = arr<val<PERCWIDTH,i64>,4>{[&](u64 bank){
-                    val<PERCWIDTH,i64> old_lane = val<PERCWIDTH,i64>{bias_bank_map[bank][offset]};
-                    val<PERCWIDTH,i64> new_lane = update_ctr(old_lane, branch_taken[offset]);
-                    return select(write_tage_info==val<2>{bank}, new_lane, old_lane);
-                }};
-                bias_pc[offset].write(high_idx, new_bias_vec);
-            });
-#endif
-#ifdef SC_USE_GEHL
-            for (u64 k = 0; k < NUMGEHL; k++) {
-                val<LOGGEHL-LOGLINEINST> gehl_write_idx = gehl_idx[k];
-                val<PERCWIDTH,i64> old_gehl = gehl_map[k][offset];
-                gehl_write_idx.fanout(hard<2>{});
-                old_gehl.fanout(hard<2>{});
-                execute_if(sc_update_en, [&](){
-                    gehl[k][offset].write(gehl_write_idx, update_ctr(old_gehl, branch_taken[offset]));
-                });
-            }
-#endif
-#ifdef SC_FGEHL
-            val<LOGFGEHL-LOGLINEINST> fgehl_write_idx = fgehl_idx;
-            val<PERCWIDTH,i64> old_fgehl = fgehl_map[offset];
-            fgehl_write_idx.fanout(hard<2>{});
-            old_fgehl.fanout(hard<2>{});
-            execute_if(sc_update_en, [&](){
-                fgehl[offset].write(fgehl_write_idx, update_ctr(old_fgehl, branch_taken[offset]));
-            });
-#endif
-#ifdef SC_USE_BHIST
-#ifdef SC_BGEHL
-            val<LOGBGEHL-LOGLINEINST> bgehl_write_idx = bgehl_idx;
-            val<PERCWIDTH,i64> old_bgehl = bgehl_map[offset];
-            bgehl_write_idx.fanout(hard<2>{});
-            old_bgehl.fanout(hard<2>{});
-            execute_if(sc_update_en, [&](){
-                bgehl[offset].write(bgehl_write_idx, update_ctr(old_bgehl, branch_taken[offset]));
-            });
-#endif
-#ifdef SC_USE_TAIMLI
-            val<LOGIMLI-LOGLINEINST> imlita_write_idx = imlita_idx;
-            val<PERCWIDTH,i64> old_imlita = imlita_map[offset];
-            imlita_write_idx.fanout(hard<2>{});
-            old_imlita.fanout(hard<2>{});
-            execute_if(sc_update_en, [&](){
-                imlita[offset].write(imlita_write_idx, update_ctr(old_imlita, branch_taken[offset]));
-            });
-#endif
-#ifdef SC_USE_BRIMLI
-            val<LOGIMLI-LOGLINEINST> imlibr_write_idx = imlibr_idx;
-            val<PERCWIDTH,i64> old_imlibr = imlibr_map[offset];
-            imlibr_write_idx.fanout(hard<2>{});
-            old_imlibr.fanout(hard<2>{});
-            execute_if(sc_update_en, [&](){
-                imlibr[offset].write(imlibr_write_idx, update_ctr(old_imlibr, branch_taken[offset]));
-            });
-#endif
-#ifdef SC_BGEHL
-#ifdef PERF_COUNTERS
-            perf_bgehl_write_ops += static_cast<u64>(sc_update_en);
-#endif
-#endif
-#endif
-            thre1[offset] = select(thre_update_en[offset],new_thre1,thre1[offset]);
-        }
-#endif
-
-#ifdef CHEATING_MODE
-#ifdef PERF_COUNTERS
-#ifdef MY_SC
-#ifdef SC_BGEHL
-        perf_count_bgehl(is_branch);
-#endif
-#endif
         perf_count_end_of_cycle(is_branch, branch_taken, mispredict, allocate, postmask, noalloc);
 #endif
 #endif
@@ -3230,7 +2442,6 @@ struct my_bp_v1 : predictor {
 #undef perf_bimodal_correct
 #undef perf_bimodal_wrong
 #undef perf_mispred_blame_tage
-#undef perf_mispred_blame_sc
 #undef perf_mispred_blame_p1
 #undef perf_table_reads
 #undef perf_table_hits
@@ -3242,45 +2453,6 @@ struct my_bp_v1 : predictor {
 #undef perf_extra_cycle_badpred
 #undef perf_extra_cycle_mispredict
 #undef perf_extra_cycle_p1_update
-#undef perf_extra_cycle_sc_update
-#undef perf_sc_override
-#undef perf_sc_override_correct
-#undef perf_sc_use
-#undef perf_sc_use_correct
-#undef perf_sc_use_taken
-#undef perf_sc_use_nottaken
-#undef perf_sc_use_same_as_tage
-#undef perf_sc_use_flip_tage
-#undef perf_sc_use_weak
-#undef perf_sc_use_mid
-#undef perf_sc_use_sat
-#undef perf_sc_stage_prov_hit
-#undef perf_sc_stage_do_update
-#undef perf_sc_stage_candidate
-#undef perf_sc_stage_guard_pass
-#undef perf_sc_skip_no_provider
-#undef perf_sc_skip_no_do_update
-#undef perf_sc_skip_guard
-#undef perf_global_thre_update
-#undef perf_global_thre_inc
-#undef perf_global_thre_dec
-#undef perf_thre_update
-#undef perf_thre_update_inc
-#undef perf_thre_update_dec
-#undef perf_mispred_sc_not_used
-#undef perf_mispred_sc_keep
-#undef perf_mispred_sc_flip
-#undef perf_mispred_sc_flip_harmful
-#undef perf_mispred_sc_flip_both_wrong
-#undef perf_bgehl_read_ops
-#undef perf_bgehl_write_ops
-#undef perf_bgehl_branch_slots
-#undef perf_bgehl_filter_allow
-#undef perf_bgehl_filter_block
-#undef perf_bgehl_nonzero_contrib
-#undef perf_bgehl_update_candidate
-#undef perf_bgehl_update_allow
-#undef perf_bgehl_update_block
 #undef perf_share_route_zero
 #undef perf_share_route_one
 #undef perf_group_idx_mismatch
