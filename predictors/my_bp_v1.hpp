@@ -78,10 +78,6 @@
 #define MY_BP_V1_P1_MICRO_TAGE 0
 #endif
 
-#ifndef MY_BP_V1_P1_AHEAD
-#define MY_BP_V1_P1_AHEAD 0
-#endif
-
 #if MY_BP_V1_SHARE_DISABLE_LEVEL < 0 || MY_BP_V1_SHARE_DISABLE_LEVEL > 3
 #error "MY_BP_V1_SHARE_DISABLE_LEVEL must be in [0, 3]"
 #endif
@@ -237,13 +233,8 @@ struct my_bp_v1 : predictor {
     reg<1> true_block = 1;
 
     // for P1
-    static constexpr u64 P1A_PIPE = 2;
     reg<GHIST1> global_history1;
     reg<index1_bits> index1;
-    reg<1> p1a_valid[P1A_PIPE];
-    reg<64-LOGLB> p1a_line_pc[P1A_PIPE];
-    reg<index1_bits> p1a_index[P1A_PIPE];
-    reg<LINEINST> p1a_pred_vec[P1A_PIPE];
     reg<index1_bits> p1_idx_used;
     arr<reg<1>,LINEINST> readp1; // prediction bits read from P1 table for each offset
     reg<LINEINST> p1; // P1 predictions
@@ -1211,7 +1202,6 @@ struct my_bp_v1 : predictor {
     zone P1_SC_CLUSTER;
     // P1 (gshare)
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
-    rwram<1,(1<<index1_bits),4> table1_pred_ahead[LINEINST] {"P1 pred ahead"}; // ahead path with buffered writes
     ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
     #ifdef MY_SC
     //bias_pc is concat pc and tage
@@ -1314,125 +1304,6 @@ struct my_bp_v1 : predictor {
 #endif
     }
 
-#if MY_BP_V1_P1_MICRO_TAGE
-    struct mt_hash_pack {
-        val<LOGLINEINST> offset;
-        arr<val<MT_LOGSETS>,MT_NT> idx;
-        arr<val<MT_TAGW0>,MT_NT> tag;
-    };
-
-    struct mt_consume_pack {
-        val<1> tag_hit;
-        val<1> hit;
-        val<2> pid;
-        val<1> pred;
-        val<1> weak;
-        val<MT_NT> hitmask;
-    };
-
-    mt_hash_pack mt_hash(val<64> inst_pc)
-    {
-        val<std::max(index1_bits,LOGG)> lineaddr = inst_pc >> LOGLB;
-        lineaddr.fanout(hard<8>{});
-        val<LOGLINEINST> offset = inst_pc.fo1() >> 2;
-        val<MT_LOGSETS> pc9 = lineaddr;
-        val<MT_HTAGW0> pctag = val<MT_HTAGW0>{lineaddr}.reverse();
-
-        mt_hash_pack h{
-            .offset = offset,
-            .idx = [&](u64 i) -> val<MT_LOGSETS> {
-                return pc9 ^ mt_gfolds.template get<0>(i);
-            },
-            .tag = [&](u64 i) -> val<MT_TAGW0> {
-                return concat(offset, pctag ^ mt_gfolds.template get<1>(i));
-            },
-        };
-        return h;
-    }
-
-    mt_consume_pack mt_consume(mt_hash_pack h, val<1> pipe_line_valid)
-    {
-        arr<val<1>,MT_NT> hit = [&](u64 i) -> val<1> {
-            return pipe_line_valid & (val<MT_TAGW0>{mt_pipe_rtag[i]} == h.tag[i]);
-        };
-        val<1> hit0 = hit[0];
-        val<1> hit1 = hit[1];
-        val<1> hit2 = hit[2];
-        val<1> hit3 = hit[3];
-        val<1> any_hit = hit0 | hit1 | hit2 | hit3;
-
-        val<2> pid = select(hit3, val<2>{3}, select(hit2, val<2>{2}, select(hit1, val<2>{1}, val<2>{0})));
-        val<2> sel_hyst = select(hit3, val<2>{mt_pipe_rhyst[3]},
-                         select(hit2, val<2>{mt_pipe_rhyst[2]},
-                         select(hit1, val<2>{mt_pipe_rhyst[1]}, val<2>{mt_pipe_rhyst[0]})));
-        val<1> pred = select(hit3, val<1>{mt_pipe_rpred[3]},
-                      select(hit2, val<1>{mt_pipe_rpred[2]},
-                      select(hit1, val<1>{mt_pipe_rpred[1]}, val<1>{mt_pipe_rpred[0]})));
-        val<1> weak = sel_hyst == hard<0>{};
-        val<1> allow_pid = pid >= hard<MT_USE_MIN_PID>{};
-        val<1> allow_hyst = sel_hyst >= hard<MT_USE_MIN_HYST>{};
-        (void)allow_hyst;
-        val<1> use_micro = any_hit & allow_pid;
-        return mt_consume_pack{
-            .tag_hit = any_hit,
-            .hit = use_micro,
-            .pid = pid,
-            .pred = pred,
-            .weak = weak,
-            .hitmask = hit.concat(),
-        };
-    }
-
-    template<u64 OFF>
-    void mt_store_meta(mt_hash_pack h, mt_consume_pack c, val<1> gshare_pred)
-    {
-        static_assert(OFF < LINEINST);
-        mt_meta_tag_hit[OFF] = c.tag_hit;
-        mt_meta_hit[OFF] = c.hit;
-        mt_meta_pid[OFF] = c.pid;
-        mt_meta_provider_pred[OFF] = c.pred;
-        mt_meta_provider_weak[OFF] = c.weak;
-        mt_meta_gshare_pred[OFF] = gshare_pred;
-        mt_meta_hitmask[OFF] = c.hitmask;
-        static_loop<MT_NT>([&]<u64 J>(){
-            mt_meta_idx[J][OFF] = h.idx[J];
-            mt_meta_tag[J][OFF] = h.tag[J];
-            mt_meta_rpred[J][OFF] = val<1>{mt_pipe_rpred[J]};
-            mt_meta_rhyst[J][OFF] = val<2>{mt_pipe_rhyst[J]};
-            mt_meta_ru[J][OFF] = val<1>{mt_pipe_ru[J]};
-        });
-    }
-
-    void mt_issue(val<64> inst_pc, mt_hash_pack h)
-    {
-        mt_pipe_pc = inst_pc;
-        static_loop<MT_NT>([&]<u64 J>(){
-            mt_pipe_rtag[J] = mt_tag[J].read(h.idx[J]);
-            mt_pipe_rpred[J] = mt_pred[J].read(h.idx[J]);
-            mt_pipe_rhyst[J] = mt_hyst[J].read(h.idx[J]);
-            mt_pipe_ru[J] = mt_u[J].read(h.idx[J]);
-        });
-    }
-
-    template<u64 OFF>
-    val<1> mt_predict_offset(val<64> line_base_pc, val<1> gshare_pred, val<1> pipe_line_valid)
-    {
-        static_assert(OFF < LINEINST);
-        val<LOGLINEINST> offset = hard<OFF>{};
-        val<64> inst_pc = line_base_pc | (val<64>{offset} << 2);
-        mt_hash_pack h = mt_hash(inst_pc);
-        mt_consume_pack c = mt_consume(h, pipe_line_valid);
-        mt_store_meta<OFF>(h, c, gshare_pred);
-        return select(c.hit, c.pred, gshare_pred);
-    }
-
-    void mt_history_update(val<PATHBITS> bits)
-    {
-        mt_gfolds.update(bits);
-    }
-#endif
-
-
     void new_block(val<64> inst_pc)
     {
         val<LOGLINEINST> offset = inst_pc.fo1() >> 2;
@@ -1451,29 +1322,9 @@ struct my_bp_v1 : predictor {
         }
     }
 
-    void p1_prefetch_next_line(val<64> next_pc)
-    {
-        val<64-LOGLB> next_line_pc = next_pc >> LOGLB;
-        val<index1_bits> next_idx = p1_compute_index(next_pc);
-        next_idx.fanout(hard<LINEINST + 2>{});
-        arr<val<1>,LINEINST> next_readp1 = [&](u64 offset) -> val<1> {
-            return table1_pred_ahead[offset].read(next_idx);
-        };
-
-        p1a_valid[1] = p1a_valid[0];
-        p1a_line_pc[1] = p1a_line_pc[0];
-        p1a_index[1] = p1a_index[0];
-        p1a_pred_vec[1] = p1a_pred_vec[0];
-
-        p1a_valid[0] = 1;
-        p1a_line_pc[0] = next_line_pc;
-        p1a_index[0] = next_idx;
-        p1a_pred_vec[0] = next_readp1.concat();
-    }
-
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
-        inst_pc.fanout(hard<40>{});
+        inst_pc.fanout(hard<5>{});
         new_block(inst_pc);
 
         val<64-LOGLB> cur_line_pc = inst_pc >> LOGLB;
@@ -1481,18 +1332,11 @@ struct my_bp_v1 : predictor {
         val<index1_bits> cur_idx = p1_compute_index(inst_pc);
         cur_idx.fanout(hard<LINEINST + 6>{});
         index1 = cur_idx;
-#if MY_BP_V1_P1_AHEAD
-        val<1> p1a_ready = val<1>{p1a_valid[1]};
-        p1a_ready.fanout(hard<2>{});
-        val<LINEINST> p1_vec = select(p1a_ready, val<LINEINST>{p1a_pred_vec[1]}, val<LINEINST>{0});
-        p1_idx_used = select(p1a_ready.fo1(), val<index1_bits>{p1a_index[1]}, cur_idx);
-#else
         for (u64 offset=0; offset<LINEINST; offset++) {
             readp1[offset] = table1_pred[offset].read(cur_idx);
         }
         val<LINEINST> p1_vec = readp1.concat();
         p1_idx_used = cur_idx;
-#endif
 #if MY_BP_V1_P1_MICRO_TAGE
         val<LINEINST> gshare_line = p1_vec;
         auto gshare_split = gshare_line.make_array(val<1>{});
@@ -1501,18 +1345,74 @@ struct my_bp_v1 : predictor {
         line_base_pc.fanout(hard<LINEINST>{});
         pipe_line_valid.fanout(hard<LINEINST>{});
         static_loop<LINEINST>([&]<u64 I>(){
-            mt_line_pred[I] = mt_predict_offset<I>(line_base_pc, gshare_split[I], pipe_line_valid);
+            val<LOGLINEINST> mt_offset = hard<I>{};
+            val<64> mt_inst_pc = line_base_pc | (val<64>{mt_offset} << 2);
+            val<std::max(index1_bits,LOGG)> mt_lineaddr = mt_inst_pc >> LOGLB;
+            mt_lineaddr.fanout(hard<8>{});
+            val<MT_LOGSETS> mt_pc9 = mt_lineaddr;
+            val<MT_HTAGW0> mt_pctag = val<MT_HTAGW0>{mt_lineaddr}.reverse();
+            arr<val<MT_LOGSETS>,MT_NT> mt_idx = [&](u64 j) -> val<MT_LOGSETS> {
+                return mt_pc9 ^ mt_gfolds.template get<0>(j);
+            };
+            arr<val<MT_TAGW0>,MT_NT> mt_tag_vec = [&](u64 j) -> val<MT_TAGW0> {
+                return concat(mt_offset, mt_pctag ^ mt_gfolds.template get<1>(j));
+            };
+            arr<val<1>,MT_NT> mt_hit = [&](u64 j) -> val<1> {
+                return pipe_line_valid & (val<MT_TAGW0>{mt_pipe_rtag[j]} == mt_tag_vec[j]);
+            };
+            val<MT_NT> mt_hitmask = mt_hit.concat();
+            mt_hitmask.fanout(hard<2>{});
+            val<1> mt_any_hit = mt_hitmask != hard<0>{};
+            val<MT_NT> mt_pri_hitmask = mt_hitmask.reverse().one_hot().reverse();
+            arr<val<1>,MT_NT> mt_pri_hit = mt_pri_hitmask.make_array(val<1>{});
+            val<2> mt_pid = arr<val<2>,MT_NT>{[&](u64 j) -> val<2> {
+                return select(mt_pri_hit[j], val<2>{j}, val<2>{0});
+            }}.fold_or();
+            val<2> mt_hyst_pick = arr<val<2>,MT_NT>{[&](u64 j) -> val<2> {
+                return select(mt_pri_hit[j], val<2>{mt_pipe_rhyst[j]}, val<2>{0});
+            }}.fold_or();
+            val<1> mt_pred_pick = arr<val<1>,MT_NT>{[&](u64 j) -> val<1> {
+                return select(mt_pri_hit[j], val<1>{mt_pipe_rpred[j]}, val<1>{0});
+            }}.fold_or();
+            val<2> mt_sel_hyst = select(mt_any_hit, mt_hyst_pick, val<2>{mt_pipe_rhyst[0]});
+            val<1> mt_pred = select(mt_any_hit, mt_pred_pick, val<1>{mt_pipe_rpred[0]});
+            val<1> mt_weak = mt_sel_hyst == hard<0>{};
+            val<1> mt_allow_pid = mt_pid >= hard<MT_USE_MIN_PID>{};
+            val<1> mt_allow_hyst = mt_sel_hyst >= hard<MT_USE_MIN_HYST>{};
+            (void)mt_allow_hyst;
+            val<1> mt_use_micro = mt_any_hit & mt_allow_pid;
+
+            mt_meta_tag_hit[I] = mt_any_hit;
+            mt_meta_hit[I] = mt_use_micro;
+            mt_meta_pid[I] = mt_pid;
+            mt_meta_provider_pred[I] = mt_pred;
+            mt_meta_provider_weak[I] = mt_weak;
+            mt_meta_gshare_pred[I] = gshare_split[I];
+            mt_meta_hitmask[I] = mt_hitmask;
+            static_loop<MT_NT>([&]<u64 J>(){
+                mt_meta_idx[J][I] = mt_idx[J];
+                mt_meta_tag[J][I] = mt_tag_vec[J];
+                mt_meta_rpred[J][I] = val<1>{mt_pipe_rpred[J]};
+                mt_meta_rhyst[J][I] = val<2>{mt_pipe_rhyst[J]};
+                mt_meta_ru[J][I] = val<1>{mt_pipe_ru[J]};
+            });
+            mt_line_pred[I] = select(mt_use_micro, mt_pred, gshare_split[I]);
         });
         p1 = mt_line_pred.concat();
 
-        mt_hash_pack issue_h = mt_hash(inst_pc);
-        mt_issue(inst_pc, issue_h);
+        val<std::max(index1_bits,LOGG)> mt_issue_lineaddr = inst_pc >> LOGLB;
+        mt_issue_lineaddr.fanout(hard<8>{});
+        val<MT_LOGSETS> mt_issue_pc9 = mt_issue_lineaddr;
+        mt_pipe_pc = inst_pc;
+        static_loop<MT_NT>([&]<u64 J>(){
+            val<MT_LOGSETS> mt_issue_idx = mt_issue_pc9 ^ mt_gfolds.template get<0>(J);
+            mt_pipe_rtag[J] = mt_tag[J].read(mt_issue_idx);
+            mt_pipe_rpred[J] = mt_pred[J].read(mt_issue_idx);
+            mt_pipe_rhyst[J] = mt_hyst[J].read(mt_issue_idx);
+            mt_pipe_ru[J] = mt_u[J].read(mt_issue_idx);
+        });
 #else
         p1 = p1_vec;
-#endif
-#if MY_BP_V1_P1_AHEAD
-        val<64> next_line_pc = (val<64>{cur_line_pc} + val<64>{1}) << LOGLB;
-        p1_prefetch_next_line(next_line_pc);
 #endif
         p1.fanout(hard<LINEINST>{});
         val<1> p1_taken = (block_entry & p1) != hard<0>{};
@@ -1522,7 +1422,6 @@ struct my_bp_v1 : predictor {
     val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc)
     {
         val<1> p1_taken = ((block_entry<<block_size) & p1) != hard<0>{};
-        (void)inst_pc;
         return p1_taken;
     };
     void read_tag_pred_physical(
@@ -2516,7 +2415,7 @@ struct my_bp_v1 : predictor {
                 global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
                 gfolds.update(val<PATHBITS>{next_pc>>2});
 #if MY_BP_V1_P1_MICRO_TAGE
-                mt_history_update(val<PATHBITS>{next_pc>>2});
+                mt_gfolds.update(val<PATHBITS>{next_pc>>2});
 #endif
                 true_block = 1;
             });
@@ -2660,6 +2559,12 @@ struct my_bp_v1 : predictor {
         disagree_mask.fanout(hard<2+2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
+        // Read P1 hysteresis before extra_cycle scheduling so read/write can be separated by extra cycle.
+        arr<val<1>,LINEINST> p1_weak = [&](u64 offset) -> val<1> {
+            return execute_if(disagree[offset], [&](){
+                return ~table1_hyst[offset].read(p1_idx_used);
+            });
+        };
 
         // read the bimodal hysteresis if bimodal caused a misprediction
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
@@ -2831,28 +2736,22 @@ struct my_bp_v1 : predictor {
 #endif
 
         // P1 update policy:
-        // - if P1 is correct: update hysteresis;
-        // - if P1 is wrong: update pred of the provider that produced P1.
+        // - update prediction when P1 hysteresis is weak and P1 source is gshare;
+        // - update hysteresis for every resolved branch.
         arr<val<1>,LINEINST> p1_pred_write_req = [&](u64 offset) -> val<1> {
-            val<1> p1_correct = p1_split[offset] == branch_taken[offset];
 #if MY_BP_V1_P1_MICRO_TAGE
             val<1> p1_from_gshare = ~val<1>{mt_meta_hit[offset]};
 #else
             val<1> p1_from_gshare = val<1>{1};
 #endif
-            return is_branch[offset] & ~p1_correct & p1_from_gshare;
+            return p1_weak[offset] & p1_from_gshare;
         };
         for (u64 offset=0; offset<LINEINST; offset++) {
-            val<1> p1_correct = p1_split[offset] == branch_taken[offset];
-            execute_if(is_branch[offset] & p1_correct, [&](){
-                table1_hyst[offset].write(p1_idx_used, is_branch[offset]);
+            execute_if(is_branch[offset], [&](){
+                table1_hyst[offset].write(p1_idx_used, ~disagree[offset]);
             });
             execute_if(p1_pred_write_req[offset], [&](){
-#if MY_BP_V1_P1_AHEAD
-                table1_pred_ahead[offset].write(p1_idx_used, branch_taken[offset], val<1>{0});
-#else
-                table1_pred[offset].write(p1_idx_used, branch_taken[offset]);
-#endif
+                table1_pred[offset].write(p1_idx_used, p2_split[offset]);
             });
         }
 
@@ -3140,7 +3039,7 @@ struct my_bp_v1 : predictor {
             global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc>>2};
             gfolds.update(val<PATHBITS>{next_pc>>2});
 #if MY_BP_V1_P1_MICRO_TAGE
-            mt_history_update(val<PATHBITS>{next_pc>>2});
+            mt_gfolds.update(val<PATHBITS>{next_pc>>2});
 #endif
         });
 
