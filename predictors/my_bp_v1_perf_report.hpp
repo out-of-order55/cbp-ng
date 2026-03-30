@@ -391,6 +391,126 @@ inline PerfReportTotals print_main_perf_report(
     }
     os << "└──────┴──────┴───────┴───────┴────┘\n";
 
+    os << "\n┌─ P1 Micro-TAGE (P1 vs P2) ──────────────────────────────────────┐\n";
+    os << "│ P1 Branch Slots:         " << std::setw(36) << std::left << state.perf_mt_p1_slots << "│\n";
+    os << "│ P1 Match/Disagree P2:    " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_p1_match_p2) + " / " + std::to_string(state.perf_mt_p1_disagree_p2)) << "│\n";
+    if (state.perf_mt_p1_slots > 0) {
+        os << "│ P1 Match Rate vs P2:     " << std::setw(35) << std::left
+           << (std::to_string(100.0 * state.perf_mt_p1_match_p2 / state.perf_mt_p1_slots)).substr(0, 6) + "%" << "│\n";
+    } else {
+        os << "│ P1 Match Rate vs P2:     " << std::setw(36) << std::left << "N/A" << "│\n";
+    }
+    os << "│ P1 Source Micro/Gshare:  " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_p1_from_micro) + " / " + std::to_string(state.perf_mt_p1_from_gshare)) << "│\n";
+    os << "│ Micro Match/Disagree:    " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_p1_micro_match_p2) + " / " + std::to_string(state.perf_mt_p1_micro_disagree_p2)) << "│\n";
+    os << "│ Gshare Match/Disagree:   " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_p1_gshare_match_p2) + " / " + std::to_string(state.perf_mt_p1_gshare_disagree_p2)) << "│\n";
+    os << "│ Provider Hit/ Wrong:     " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_provider_hit) + " / " + std::to_string(state.perf_mt_provider_wrong)) << "│\n";
+    os << "│ UClr Gate Inc/Dec:       " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_uclr_ctr_gate) + " / " +
+           std::to_string(state.perf_mt_uclr_ctr_inc) + " / " +
+           std::to_string(state.perf_mt_uclr_ctr_dec)) << "│\n";
+    os << "│ UClr Sat / UReset:       " << std::setw(36) << std::left
+       << (std::to_string(state.perf_mt_uclr_sat) + " / " + std::to_string(state.perf_mt_u_reset)) << "│\n";
+    os << "└─────────────────────────────────────────────────────────────────┘\n";
+
+    os << "\n┌─ P1 Predictor Accuracy (vs P2) ────────────────────────────────┐\n";
+    os << "│ Predictor │ Count │ Match │ Disagree │ Accuracy │\n";
+    os << "├───────────┼───────┼───────┼──────────┼──────────┤\n";
+    os << "│ Gshare    │ " << std::setw(5) << std::right << state.perf_mt_p1_from_gshare << " │ "
+       << std::setw(5) << std::right << state.perf_mt_p1_gshare_match_p2 << " │ "
+       << std::setw(8) << std::right << state.perf_mt_p1_gshare_disagree_p2 << " │ ";
+    if (state.perf_mt_p1_from_gshare > 0) {
+        os << std::fixed << std::setprecision(2)
+           << std::setw(8) << std::right
+           << (100.0 * state.perf_mt_p1_gshare_match_p2 / state.perf_mt_p1_from_gshare) << "% │\n";
+    } else {
+        os << "    N/A │\n";
+    }
+    os << "│ MicroTot  │ " << std::setw(5) << std::right << state.perf_mt_p1_from_micro << " │ "
+       << std::setw(5) << std::right << state.perf_mt_p1_micro_match_p2 << " │ "
+       << std::setw(8) << std::right << state.perf_mt_p1_micro_disagree_p2 << " │ ";
+    if (state.perf_mt_p1_from_micro > 0) {
+        os << std::fixed << std::setprecision(2)
+           << std::setw(8) << std::right
+           << (100.0 * state.perf_mt_p1_micro_match_p2 / state.perf_mt_p1_from_micro) << "% │\n";
+    } else {
+        os << "    N/A │\n";
+    }
+    os << "│ P1 Total  │ " << std::setw(5) << std::right << state.perf_mt_p1_slots << " │ "
+       << std::setw(5) << std::right << state.perf_mt_p1_match_p2 << " │ "
+       << std::setw(8) << std::right << state.perf_mt_p1_disagree_p2 << " │ ";
+    if (state.perf_mt_p1_slots > 0) {
+        os << std::fixed << std::setprecision(2)
+           << std::setw(8) << std::right
+           << (100.0 * state.perf_mt_p1_match_p2 / state.perf_mt_p1_slots) << "% │\n";
+    } else {
+        os << "    N/A │\n";
+    }
+    os << "└───────────┴───────┴───────┴──────────┴──────────┘\n";
+
+    os << "\n┌─ P1 Micro-TAGE Table Stats (TAGE-style) ───────────────────────────────────────────────────────────────┐\n";
+    os << "│ Tbl │ Reads │ Hits │ Hit%  │ Use │ Correct │ UseAcc% │ Alloc │ C0(weak) │ C1(mwk) │ C2(mst) │ C3(str) │\n";
+    os << "├─────┼───────┼──────┼───────┼─────┼─────────┼─────────┼───────┼──────────┼─────────┼─────────┼─────────┤\n";
+    for (std::size_t t = 0; t < 4; t++) {
+        std::uint64_t reads = state.perf_mt_table_reads[t];
+        std::uint64_t hits = state.perf_mt_table_hits[t];
+        std::uint64_t use = state.perf_mt_provider_use_table[t];
+        std::uint64_t ok = state.perf_mt_provider_correct_table[t];
+        std::uint64_t alloc = state.perf_mt_table_alloc[t];
+        std::uint64_t c0 = state.perf_mt_conf[t][0], c1 = state.perf_mt_conf[t][1], c2 = state.perf_mt_conf[t][2], c3 = state.perf_mt_conf[t][3];
+        std::uint64_t ct = c0 + c1 + c2 + c3;
+
+        os << "│ " << std::setw(3) << std::left << t << " │ "
+           << std::setw(5) << std::right << reads << " │ "
+           << std::setw(4) << std::right << hits << " │ ";
+        if (reads > 0) {
+            os << std::fixed << std::setprecision(1) << std::setw(5) << std::right << (100.0 * hits / reads) << "% │ ";
+        } else {
+            os << "  N/A │ ";
+        }
+        os << std::setw(3) << std::right << use << " │ "
+           << std::setw(7) << std::right << ok << " │ ";
+        if (use > 0) {
+            os << std::fixed << std::setprecision(1) << std::setw(7) << std::right << (100.0 * ok / use) << "% │ ";
+        } else {
+            os << "    N/A │ ";
+        }
+        os << std::setw(5) << std::right << alloc << " │ ";
+        if (ct > 0) {
+            os << std::setw(5) << c0 << "(" << std::fixed << std::setprecision(0) << std::setw(2) << (100.0 * c0 / ct) << "%) │ ";
+            os << std::setw(5) << c1 << "(" << std::setw(2) << (100.0 * c1 / ct) << "%) │ ";
+            os << std::setw(5) << c2 << "(" << std::setw(2) << (100.0 * c2 / ct) << "%) │ ";
+            os << std::setw(5) << c3 << "(" << std::setw(2) << (100.0 * c3 / ct) << "%) │\n";
+        } else {
+            os << "     N/A │      N/A │      N/A │      N/A │\n";
+        }
+    }
+    os << "└─────┴───────┴──────┴───────┴─────┴─────────┴─────────┴───────┴──────────┴─────────┴─────────┴─────────┘\n";
+
+    os << "\n┌─ P1 Micro-TAGE Per-Table Events ────────────────────────────────┐\n";
+    os << "│ Tbl │ Hit │ Use │ AllocPk │ AllocReq │ PredReq │ HystReq │ UReq │ UClrReq │ TagW │ PredW │ HystW │ UW │\n";
+    os << "├─────┼─────┼─────┼─────────┼──────────┼─────────┼─────────┼──────┼─────────┼──────┼───────┼───────┼────┤\n";
+    for (std::size_t t = 0; t < 4; t++) {
+        os << "│ " << std::setw(3) << std::left << t << " │ "
+           << std::setw(3) << std::right << state.perf_mt_provider_hit_table[t] << " │ "
+           << std::setw(3) << std::right << state.perf_mt_provider_use_table[t] << " │ "
+           << std::setw(7) << std::right << state.perf_mt_alloc_pick_table[t] << " │ "
+           << std::setw(8) << std::right << state.perf_mt_alloc_req_table[t] << " │ "
+           << std::setw(7) << std::right << state.perf_mt_pred_req_table[t] << " │ "
+           << std::setw(7) << std::right << state.perf_mt_hyst_req_table[t] << " │ "
+           << std::setw(4) << std::right << state.perf_mt_u_req_table[t] << " │ "
+           << std::setw(7) << std::right << state.perf_mt_uclear_req_table[t] << " │ "
+           << std::setw(4) << std::right << state.perf_mt_tag_w_table[t] << " │ "
+           << std::setw(5) << std::right << state.perf_mt_pred_w_table[t] << " │ "
+           << std::setw(5) << std::right << state.perf_mt_hyst_w_table[t] << " │ "
+           << std::setw(2) << std::right << state.perf_mt_u_w_table[t] << " │\n";
+    }
+    os << "└─────┴─────┴─────┴─────────┴──────────┴─────────┴─────────┴──────┴─────────┴──────┴───────┴───────┴────┘\n";
+
     os << "\n┌─ Verification ──────────────────────────────────────────────────┐\n";
     os << "│ Source total matches predictions: ";
     if (total_all == state.perf_predictions) {

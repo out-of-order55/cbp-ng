@@ -89,6 +89,42 @@ struct PerfState {
     std::array<std::uint64_t, NUMP> perf_phys_hyst_w = {};
     std::array<std::uint64_t, NUMP> perf_phys_u_w = {};
     std::array<std::array<std::uint64_t, 4>, NUMG> perf_conf = {};
+
+    // P1 micro-TAGE counters (P1 correctness is defined against P2 direction).
+    std::uint64_t perf_mt_p1_slots = 0;
+    std::uint64_t perf_mt_p1_match_p2 = 0;
+    std::uint64_t perf_mt_p1_disagree_p2 = 0;
+    std::uint64_t perf_mt_p1_from_micro = 0;
+    std::uint64_t perf_mt_p1_from_gshare = 0;
+    std::uint64_t perf_mt_p1_micro_match_p2 = 0;
+    std::uint64_t perf_mt_p1_micro_disagree_p2 = 0;
+    std::uint64_t perf_mt_p1_gshare_match_p2 = 0;
+    std::uint64_t perf_mt_p1_gshare_disagree_p2 = 0;
+    std::uint64_t perf_mt_provider_hit = 0;
+    std::array<std::uint64_t, 4> perf_mt_provider_hit_table = {};
+    std::array<std::uint64_t, 4> perf_mt_provider_use_table = {};
+    std::array<std::uint64_t, 4> perf_mt_provider_correct_table = {};
+    std::array<std::uint64_t, 4> perf_mt_provider_wrong_table = {};
+    std::array<std::uint64_t, 4> perf_mt_table_reads = {};
+    std::array<std::uint64_t, 4> perf_mt_table_hits = {};
+    std::array<std::uint64_t, 4> perf_mt_table_alloc = {};
+    std::array<std::array<std::uint64_t, 4>, 4> perf_mt_conf = {};
+    std::uint64_t perf_mt_provider_wrong = 0;
+    std::uint64_t perf_mt_uclr_ctr_gate = 0;
+    std::uint64_t perf_mt_uclr_ctr_inc = 0;
+    std::uint64_t perf_mt_uclr_ctr_dec = 0;
+    std::uint64_t perf_mt_uclr_sat = 0;
+    std::uint64_t perf_mt_u_reset = 0;
+    std::array<std::uint64_t, 4> perf_mt_alloc_pick_table = {};
+    std::array<std::uint64_t, 4> perf_mt_alloc_req_table = {};
+    std::array<std::uint64_t, 4> perf_mt_pred_req_table = {};
+    std::array<std::uint64_t, 4> perf_mt_hyst_req_table = {};
+    std::array<std::uint64_t, 4> perf_mt_u_req_table = {};
+    std::array<std::uint64_t, 4> perf_mt_uclear_req_table = {};
+    std::array<std::uint64_t, 4> perf_mt_tag_w_table = {};
+    std::array<std::uint64_t, 4> perf_mt_pred_w_table = {};
+    std::array<std::uint64_t, 4> perf_mt_hyst_w_table = {};
+    std::array<std::uint64_t, 4> perf_mt_u_w_table = {};
 };
 
 } // namespace my_bp_v1_perf
