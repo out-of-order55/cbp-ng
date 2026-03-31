@@ -3,18 +3,6 @@
 #define USE_ALT
 #define RESET_UBITS
 
-#if defined(GATE)
-#error "GATE configuration has been removed from my_bp_v1."
-#endif
-
-#if defined(DEBUG_ENERGY)
-#error "DEBUG_ENERGY configuration has been removed from my_bp_v1."
-#endif
-
-#if defined(MY_BP_V1_DISABLE_SC) || defined(MY_SC) || defined(SC_CFG_BASE) || defined(SC_CFG_MEDIUM) || defined(SC_CFG_FULL) || defined(SC_USE_BIAS) || defined(SC_FGEHL) || defined(SC_BGEHL) || defined(SC_USE_TAIMLI) || defined(SC_USE_BRIMLI) || defined(SC_USE_FHIST) || defined(SC_USE_BHIST) || defined(SC_GLOBAL_THRE_INIT) || defined(SC_GLOBAL_THRE_PIPE_STAGES)
-#error "SC configuration has been removed from my_bp_v1."
-#endif
-
 #ifndef MY_BP_V1_PERF_ENABLE_TRACE_DB
 #define MY_BP_V1_PERF_ENABLE_TRACE_DB 1
 #endif
@@ -74,7 +62,7 @@ struct split_row_ram2 {
     }
 };
 
-template<u64 LOGLB=6, u64 NUMG=14, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=300, u64 LOGP1=14, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
+template<u64 LOGLB=6, u64 NUMG=14, u64 LOGG=11, u64 LOGB=12, u64 TAGW=12, u64 GHIST=300, u64 LOGP1=13, u64 GHIST1=6,u64 LOGBANKS = 1,u64 LOGBIAS = 11>
 struct my_bp_v1 : predictor {
     // provides 2^(LOGLB-2) predictions per cycle
     // P2 is a TAGE, P1 is a gshare
