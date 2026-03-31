@@ -36,6 +36,8 @@ import os
 import math
 import csv
 import argparse
+import re
+from collections import defaultdict
 
 # 预测器配置
 PREDICTORS = {
@@ -92,6 +94,36 @@ def parse_storage_config(config_str):
             key, val = item.split('=', 1)
             params[key.strip()] = int(val.strip())
     return params
+
+def infer_trace_group(trace_name):
+    """将 trace 名称映射到组名（含 5-prefix 特例）"""
+    # 用户要求：5 开头 trace 归为同一组
+    if trace_name.startswith('5'):
+        return 'spec5xx'
+
+    group = trace_name
+
+    # step1: 去除末尾 "_digits"
+    if '_' in group:
+        prefix, suffix = group.rsplit('_', 1)
+        if suffix.isdigit() and prefix:
+            group = prefix
+
+    # step2: 去除末尾 ".digits"
+    group = re.sub(r'\.\d+$', '', group)
+    # step3: 去除末尾 "-digits"
+    group = re.sub(r'-\d+$', '', group)
+
+    return group if group else trace_name
+
+def build_trace_groups(benchmarks):
+    """根据 trace 名称构建分组"""
+    groups = defaultdict(list)
+    for bench in benchmarks:
+        groups[infer_trace_group(bench)].append(bench)
+    for traces in groups.values():
+        traces.sort()
+    return dict(sorted(groups.items(), key=lambda kv: kv[0]))
 
 def calc_storage(params):
     """计算预测器存储开销"""
@@ -312,6 +344,59 @@ def calc_metrics_per_trace_latency(data):
     trace_p1_lat, trace_p2_lat = compute_trace_level_latencies(data)
     return calc_metrics(data, trace_p1_lat, trace_p2_lat)
 
+def aggregate_results(results, benchmarks, name):
+    """将多条 trace 的原始计数器聚合为一条记录"""
+    agg = {
+        'name': name,
+        'instructions': 0,
+        'branches': 0,
+        'condbr': 0,
+        'npred': 0,
+        'extra': 0,
+        'diverge': 0,
+        'diverge_at_end': 0,
+        'misp': 0,
+        'p1_lat': 0.0,
+        'p2_lat': 0.0,
+        'epi': 0.0,
+    }
+    total_instructions = 0
+    weighted_epi = 0.0
+
+    for bench in benchmarks:
+        d = results[bench]
+        agg['instructions'] += int(d['instructions'])
+        agg['branches'] += int(d['branches'])
+        agg['condbr'] += int(d['condbr'])
+        agg['npred'] += int(d['npred'])
+        agg['extra'] += int(d['extra'])
+        agg['diverge'] += int(d['diverge'])
+        agg['diverge_at_end'] += int(d['diverge_at_end'])
+        agg['misp'] += int(d['misp'])
+        agg['p1_lat'] = max(agg['p1_lat'], float(d['p1_lat']))
+        agg['p2_lat'] = max(agg['p2_lat'], float(d['p2_lat']))
+
+        instr = int(d['instructions'])
+        total_instructions += instr
+        weighted_epi += float(d['epi']) * instr
+
+    agg['epi'] = (weighted_epi / total_instructions) if total_instructions > 0 else 0.0
+    return agg
+
+def aggregate_ref_mpki(ref_mpki, benchmarks, instr_results):
+    """用指令数加权聚合 reference MPKI"""
+    ref_misp = 0.0
+    ref_instr = 0.0
+    for bench in benchmarks:
+        if bench not in ref_mpki:
+            continue
+        instr = float(instr_results[bench]['instructions'])
+        ref_misp += (float(ref_mpki[bench]) / 1000.0) * instr
+        ref_instr += instr
+    if ref_instr <= 0:
+        return None
+    return (ref_misp / ref_instr) * 1000.0
+
 def summarize_predictor_metrics(results, benchmarks):
     """按 per-trace 延迟口径汇总 common benchmarks 上的指标"""
     p1_lat, p2_lat = compute_predictor_level_latencies(results, benchmarks)
@@ -496,6 +581,75 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
     print("=" * 155)
     return rows
 
+def print_per_group_comparison(group_members, results1, results2, ref_mpki,
+                               name1='tage', name2='my_bp'):
+    """打印每个 trace 组的聚合对比"""
+    print("\n" + "=" * 170)
+    print("=== Per-Group Comparison (Aggregated by Trace Prefix) ===")
+    print("=" * 170)
+
+    header = f"{'Group':<28} {'#Traces':>8} {'Ref MPKI':>10} {name1+' MPKI':>11} {name2+' MPKI':>11} "
+    header += f"{'Δ MPKI':>9} {name1+' Acc':>10} {name2+' Acc':>10} {'Δ Acc':>9} "
+    header += f"{name1+' EPI':>9} {name2+' EPI':>9} {name1+' VFS':>9} {name2+' VFS':>9} {'Δ VFS':>9}"
+    print(header)
+    print("-" * 170)
+
+    rows = []
+    for group, traces in group_members.items():
+        gdata1 = aggregate_results(results1, traces, group)
+        gdata2 = aggregate_results(results2, traces, group)
+
+        gp1_1, gp2_1 = compute_predictor_level_latencies(results1, traces)
+        gp1_2, gp2_2 = compute_predictor_level_latencies(results2, traces)
+        m1 = calc_metrics(gdata1, gp1_1, gp2_1)
+        m2 = calc_metrics(gdata2, gp1_2, gp2_2)
+        v1 = calc_vfs(m1['ipc'], m1['cpi'], m1['epi'])
+        v2 = calc_vfs(m2['ipc'], m2['cpi'], m2['epi'])
+
+        d_mpki = ((m2['mpki'] - m1['mpki']) / m1['mpki'] * 100) if m1['mpki'] > 0 else 0.0
+        d_acc = (m2['accuracy'] - m1['accuracy']) * 100.0
+        d_vfs = ((v2 - v1) / v1 * 100) if v1 > 0 else 0.0
+        g_ref_mpki = aggregate_ref_mpki(ref_mpki, traces, results1)
+
+        row = {
+            'group': group,
+            'num_traces': len(traces),
+            'ref_mpki': g_ref_mpki,
+            'mpki1': m1['mpki'],
+            'mpki2': m2['mpki'],
+            'd_mpki': d_mpki,
+            'acc1': m1['accuracy'],
+            'acc2': m2['accuracy'],
+            'd_acc': d_acc,
+            'epi1': m1['epi'],
+            'epi2': m2['epi'],
+            'vfs1': v1,
+            'vfs2': v2,
+            'd_vfs': d_vfs,
+            'instructions': gdata1['instructions'],
+            'condbr': gdata1['condbr'],
+            'misp1': gdata1['misp'],
+            'misp2': gdata2['misp'],
+            'members': ';'.join(traces),
+        }
+        rows.append(row)
+
+    rows.sort(key=lambda x: x['d_acc'], reverse=True)
+    for row in rows:
+        ref_str = f"{row['ref_mpki']:.3f}" if row['ref_mpki'] is not None else "N/A"
+        line = f"{row['group']:<28} {row['num_traces']:>8} {ref_str:>10} "
+        line += f"{row['mpki1']:>9.3f} {row['mpki2']:>9.3f} "
+        line += f"{'+' if row['d_mpki'] > 0 else ''}{row['d_mpki']:>7.2f}% "
+        line += f"{row['acc1']*100:>8.2f}% {row['acc2']*100:>8.2f}% "
+        line += f"{'+' if row['d_acc'] > 0 else ''}{row['d_acc']:>7.3f}% "
+        line += f"{row['epi1']:>7.1f} {row['epi2']:>7.1f} "
+        line += f"{row['vfs1']:>7.4f} {row['vfs2']:>7.4f} "
+        line += f"{'+' if row['d_vfs'] > 0 else ''}{row['d_vfs']:>7.2f}%"
+        print(line)
+
+    print("=" * 170)
+    return rows
+
 def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
                              summary1, summary2,
                              name1='tage', name2='my_bp'):
@@ -646,6 +800,46 @@ def export_csv(common_benchmarks, metrics1, metrics2, data1, data2, ref_mpki,
 
     print(f"\nCSV report exported to: {output_file}")
 
+def derive_group_output_path(output_file):
+    base, ext = os.path.splitext(output_file)
+    if not ext:
+        ext = '.csv'
+    return f"{base}_groups{ext}"
+
+def export_group_csv(group_rows, output_file='comparison_report_groups.csv',
+                     name1='tage', name2='my_bp'):
+    """导出分组聚合报告"""
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'Group', 'num_traces', 'ref_mpki',
+            f'{name1}_accuracy', f'{name2}_accuracy', 'accuracy_diff',
+            f'{name1}_mpki', f'{name2}_mpki', 'mpki_diff_pct',
+            f'{name1}_epi', f'{name2}_epi', 'epi_ratio',
+            f'{name1}_vfs', f'{name2}_vfs', 'vfs_diff_pct',
+            'instructions', 'condbr', f'{name1}_misp', f'{name2}_misp', 'misp_diff',
+            'members'
+        ])
+
+        for row in sorted(group_rows, key=lambda x: x['group']):
+            writer.writerow([
+                row['group'],
+                row['num_traces'],
+                row['ref_mpki'] if row['ref_mpki'] is not None else '',
+                row['acc1'], row['acc2'], row['d_acc'],
+                row['mpki1'], row['mpki2'], row['d_mpki'],
+                row['epi1'], row['epi2'], (row['epi2'] / row['epi1']) if row['epi1'] > 0 else 0.0,
+                row['vfs1'], row['vfs2'], row['d_vfs'],
+                row['instructions'],
+                row['condbr'],
+                row['misp1'],
+                row['misp2'],
+                row['misp2'] - row['misp1'],
+                row['members']
+            ])
+
+    print(f"Grouped CSV report exported to: {output_file}")
+
 def main():
     parser = argparse.ArgumentParser(description='Compare two branch predictors')
 
@@ -733,6 +927,9 @@ def main():
         print(f"  Compare has: {list(results2.keys())[:5]}...")
         sys.exit(1)
 
+    group_members = build_trace_groups(common)
+    print(f"Trace groups: {len(group_members)}")
+
     # 存储对比：优先使用用户指定的配置，否则从 PREDICTORS 获取
     storage1 = None
     storage2 = None
@@ -770,11 +967,15 @@ def main():
     # 打印每 benchmark 对比（包含 reference MPKI）
     print_per_benchmark_comparison(common, metrics1, metrics2, results1, results2, ref_mpki, name1, name2)
 
+    # 打印每组聚合对比
+    group_rows = print_per_group_comparison(group_members, results1, results2, ref_mpki, name1, name2)
+
     # 打印总体统计
     overall = print_overall_statistics(common, metrics1, metrics2, ref_mpki, summary1, summary2, name1, name2)
 
     # 导出 CSV（包含 reference MPKI）
     export_csv(common, metrics1, metrics2, results1, results2, ref_mpki, args.output, name1, name2)
+    export_group_csv(group_rows, derive_group_output_path(args.output), name1, name2)
 
     print("\nDone!")
 

@@ -1074,14 +1074,14 @@ struct my_bp_v1 : predictor {
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
-        inst_pc.fanout(hard<5>{});
+        inst_pc.fanout(hard<3>{});
         new_block(inst_pc);
 
         val<64-LOGLB> cur_line_pc = inst_pc >> LOGLB;
-        cur_line_pc.fanout(hard<4>{});
+        // cur_line_pc.fanout(hard<4>{});
         val<index1_bits> cur_idx = p1_compute_index(inst_pc);
-        cur_idx.fanout(hard<LINEINST + 6>{});
-        index1 = cur_idx;
+        cur_idx.fanout(hard<LINEINST + 1>{});
+        // index1 = cur_idx;
         for (u64 offset=0; offset<LINEINST; offset++) {
             readp1[offset] = table1_pred[offset].read(cur_idx);
         }
@@ -1267,7 +1267,12 @@ struct my_bp_v1 : predictor {
             snap_u[3][SLOT] = u2_p3[SLOT];
         });
 
+
         static_loop<NUMG_GROUP>([&]<u64 G>(){
+            snap_tag[G].fanout(hard<2>{});
+            snap_pred[G].fanout(hard<2>{});
+            snap_hyst[G].fanout(hard<2>{});
+            snap_u[G].fanout(hard<2>{});
             readt[2*G] = snap_tag[G][0];
             readt[2*G+1] = snap_tag[G][1];
             readc[2*G] = snap_pred[G][0];
@@ -1626,7 +1631,7 @@ struct my_bp_v1 : predictor {
         p2 = tage_p2;
         p2.fanout(hard<LINEINST>{});
         val<1> taken = (block_entry & p2) != hard<0>{};
-        taken.fanout(hard<2>{});
+        // taken.fanout(hard<2>{});
 
         reuse_prediction(~val<1>{block_entry>>(LINEINST-1)});
         return taken;
@@ -1678,13 +1683,14 @@ struct my_bp_v1 : predictor {
         correct_pred.fanout(hard<NUMG+2>{});
         p1_idx_used.fanout(hard<3*LINEINST>{});
         p2.fanout(hard<2>{});
+        p1.fanout(hard<2>{});
         bindex.fanout(hard<LINEINST+2>{});
         // gindex.fanout(hard<8>{});
         htag.fanout(hard<2>{});
         // readb.fanout(hard<2>{});
         readt.fanout(hard<4>{});
         readc.fanout(hard<2>{});
-        readh.fanout(hard<2>{});
+        readh.fanout(hard<3>{});
         //SC fix
         match1.fanout(hard<2>{});
         group_row_idx.fanout(hard<3>{});
@@ -1746,6 +1752,7 @@ struct my_bp_v1 : predictor {
         };
         primary_wrong.fanout(hard<2>{});
         arr<val<1>,LINEINST> bhyst_bim_primary = [&](u64 offset){ return actual_match1[offset] >> NUMG; };
+        bhyst_bim_primary.fanout(hard<3>{});
 
         // select some candidate entries for allocation
         val<NUMG> mispmask = mispredict.replicate(hard<NUMG>{}).concat();
@@ -1814,23 +1821,23 @@ struct my_bp_v1 : predictor {
                 return ~table1_hyst[offset].read(p1_idx_used);
             });
         };
-        p1_weak.fanout(hard<2>{});
+        p1_weak.fanout(hard<4>{});
 
         // read the bimodal hysteresis if bimodal caused a misprediction
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
             // returns 1 iff cause of misprediction and hysteresis is weak
-            return execute_if(bhyst_bim_primary[offset].fo1() & primary_wrong[offset], [&](){
+            return execute_if(bhyst_bim_primary[offset] & primary_wrong[offset], [&](){
                 return ~bhyst[offset].read(bindex); // hyst=0 means weak
             });
         };
-        b_weak.fanout(hard<2>{});
+        b_weak.fanout(hard<4>{});
 
         // determine which primary global predictions are incorrect with a weak hysteresis
         arr<val<1>,NUMG> g_weak = [&] (u64 i) -> val<1> {
             // returns 1 iff incorrect primary prediction and hysteresis is weak
             return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
         };
-        g_weak.fanout(hard<3>{});
+        g_weak.fanout(hard<5>{});
 
         arr<val<1>,NUMG> g_sat = [&](u64 i) {
             return readh[i]==hard<3>{};
@@ -1967,16 +1974,20 @@ struct my_bp_v1 : predictor {
         // P1 update policy:
         // - update prediction when P1 hysteresis is weak and P1 source is gshare;
         // - update hysteresis for every resolved branch.
+        arr<val<1>,LINEINST> p1_hyst_write_req = [&](u64 offset) -> val<1> {
+            return is_branch[offset] & ~p1_weak[offset];
+        };
+        p1_hyst_write_req.fanout(hard<3>{});
         arr<val<1>,LINEINST> p1_pred_write_req = [&](u64 offset) -> val<1> {
 #if MY_BP_V1_P1_MICRO_TAGE
             val<1> p1_from_gshare = ~val<1>{mt_meta_hit[offset]};
 #else
             val<1> p1_from_gshare = val<1>{1};
 #endif
-            return p1_weak[offset] & p1_from_gshare;
+            return is_branch[offset] & ~p1_hyst_write_req[offset] & p1_from_gshare;
         };
         for (u64 offset=0; offset<LINEINST; offset++) {
-            execute_if(is_branch[offset], [&](){
+            execute_if(p1_hyst_write_req[offset], [&](){
                 table1_hyst[offset].write(p1_idx_used, ~disagree[offset]);
             });
             execute_if(p1_pred_write_req[offset], [&](){
@@ -1988,7 +1999,7 @@ struct my_bp_v1 : predictor {
         {
             const u64 p1_idx = static_cast<u64>(p1_idx_used);
             for (u64 offset=0; offset<LINEINST; offset++) {
-                if (!static_cast<bool>(is_branch[offset])) continue;
+                if (!static_cast<bool>(p1_hyst_write_req[offset])) continue;
                 perf_shadow_p1_hyst[offset][p1_idx] = static_cast<u8>(static_cast<bool>(~disagree[offset]));
             }
         }
@@ -2200,15 +2211,17 @@ struct my_bp_v1 : predictor {
 
         // update incorrect bimodal prediction if primary provider and hysteresis is weak
         for (u64 offset=0; offset<LINEINST; offset++) {
-            execute_if(b_weak[offset].fo1(), [&](){
+            execute_if(b_weak[offset], [&](){
                 bim[offset].write(bindex,branch_taken[offset]);
             });
         }
 
         // update bimodal hysteresis if bimodal is primary provider
+        arr<val<1>,LINEINST> bhyst_write_req = [&](u64 offset) -> val<1> {
+            return is_branch[offset] & bhyst_bim_primary[offset] & (~b_weak[offset]);
+        };
         for (u64 offset=0; offset<LINEINST; offset++) {
-            val<1> bim_primary = match1[offset] >> NUMG;
-            execute_if(is_branch[offset] & bim_primary.fo1(), [&](){
+            execute_if(bhyst_write_req[offset], [&](){
                 bhyst[offset].write(bindex,~primary_wrong[offset]);
             });
         }
@@ -2217,9 +2230,7 @@ struct my_bp_v1 : predictor {
         {
             const u64 bim_idx = static_cast<u64>(bindex);
             for (u64 offset=0; offset<LINEINST; offset++) {
-                const bool branch_here = static_cast<bool>(is_branch[offset]);
-                const bool bim_primary = static_cast<bool>((match1[offset] >> NUMG));
-                if (!branch_here || !bim_primary) continue;
+                if (!static_cast<bool>(bhyst_write_req[offset])) continue;
                 perf_shadow_bhyst[offset][bim_idx] = static_cast<u8>(static_cast<bool>(~primary_wrong[offset]));
             }
         }
@@ -2249,20 +2260,28 @@ struct my_bp_v1 : predictor {
         write_pred_physical(pred_we, pred_row0, pred_row1, upd_s0, upd_s1, upd_s2);
 
         // update global prediction hysteresis if primary provider or allocated entry
+        arr<val<1>,NUMG> g_hyst_write_lane = [&](u64 i) -> val<1> {
+            return (primary[i] & select(g_weak[i], val<1>{0}, val<1>{1})) | allocate[i];
+        };
         arr<val<1>,NUMG_GROUP> hyst_we = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
             u64 i0 = 2 * g;
             u64 i1 = i0 + 1;
-            return (primary[i0] & (~((g_sat[i0])&(~badpred1[i0])))) | allocate[i0] | (primary[i1] & (~((g_sat[i1])&(~badpred1[i1])))) | allocate[i1];
+            return (primary[i0] & (~g_weak[i0]) &
+                    (~((g_sat[i0])&(~badpred1[i0])))) |
+                   allocate[i0] |
+                   (primary[i1] & (~g_weak[i1]) &
+                    (~((g_sat[i1])&(~badpred1[i1])))) |
+                   allocate[i1];
         }};
         arr<val<2>,NUMG_GROUP> hyst_row0 = arr<val<2>,NUMG_GROUP>{[&](u64 g) -> val<2> {
             u64 i0 = 2 * g;
-            val<1> we0 = primary[i0] | allocate[i0];
+            val<1> we0 = g_hyst_write_lane[i0];
             val<2> newh0 = select(allocate[i0], val<2>{0}, update_ctr(readh[i0], ~badpred1[i0]));
             return select(we0, newh0, val<2>{snap_hyst[g][0]});
         }};
         arr<val<2>,NUMG_GROUP> hyst_row1 = arr<val<2>,NUMG_GROUP>{[&](u64 g) -> val<2> {
             u64 i1 = 2 * g + 1;
-            val<1> we1 = primary[i1] | allocate[i1];
+            val<1> we1 = g_hyst_write_lane[i1];
             val<2> newh1 = select(allocate[i1], val<2>{0}, update_ctr(readh[i1], ~badpred1[i1]));
             return select(we1, newh1, val<2>{snap_hyst[g][1]});
         }};
