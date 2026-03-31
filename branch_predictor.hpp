@@ -10,6 +10,7 @@
 #include "predictors/hashed_perceptron.hpp"
 #include "predictors/tutorial/tutorial.hpp"
 #include "predictors/my_bp_v1.hpp"
+#include "predictors/my_bp_v1_ahead_pipe.hpp"
 
 #ifdef PREDICTOR
 using branch_predictor = PREDICTOR;
