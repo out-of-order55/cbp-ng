@@ -74,16 +74,6 @@ struct PerfState {
     std::uint64_t perf_bgehl_update_candidate = 0;
     std::uint64_t perf_bgehl_update_allow = 0;
     std::uint64_t perf_bgehl_update_block = 0;
-    std::array<std::uint64_t, 3> perf_share_route_zero = {};
-    std::array<std::uint64_t, 3> perf_share_route_one = {};
-    std::array<std::uint64_t, NUMP> perf_group_idx_mismatch = {};
-    std::uint64_t perf_group_idx_samples = 0;
-    std::array<std::array<std::uint64_t, NUMP>, NUMG> perf_logical_tag_hit_phys = {};
-    std::array<std::array<std::uint64_t, NUMP>, NUMG> perf_logical_sel_phys = {};
-    std::array<std::uint64_t, NUMP> perf_phys_slot0_hit = {};
-    std::array<std::uint64_t, NUMP> perf_phys_slot1_hit = {};
-    std::array<std::uint64_t, NUMP> perf_phys_any_hit = {};
-    std::array<std::uint64_t, NUMP> perf_phys_dual_slot_hit = {};
     std::array<std::uint64_t, NUMP> perf_phys_tag_w = {};
     std::array<std::uint64_t, NUMP> perf_phys_pred_w = {};
     std::array<std::uint64_t, NUMP> perf_phys_hyst_w = {};
