@@ -391,6 +391,12 @@ inline PerfReportTotals print_main_perf_report(
     }
     os << "└──────┴──────┴───────┴───────┴────┘\n";
 
+    os << "\n┌─ Hyst Skip (Saturated + Correct) ───────────────────────────────┐\n";
+    os << "│ P1 Skip Count:            " << std::setw(36) << std::left << state.perf_hyst_skip_p1 << "│\n";
+    os << "│ Bimodal Skip Count:       " << std::setw(36) << std::left << state.perf_hyst_skip_bim << "│\n";
+    os << "│ TAGE Skip Count:          " << std::setw(36) << std::left << state.perf_hyst_skip_tage << "│\n";
+    os << "└─────────────────────────────────────────────────────────────────┘\n";
+
     os << "\n┌─ P1 Micro-TAGE (P1 vs P2) ──────────────────────────────────────┐\n";
     os << "│ P1 Branch Slots:         " << std::setw(36) << std::left << state.perf_mt_p1_slots << "│\n";
     os << "│ P1 Match/Disagree P2:    " << std::setw(36) << std::left

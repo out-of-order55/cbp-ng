@@ -252,6 +252,8 @@ struct my_bp_v1 : predictor {
 
 #ifdef PERF_COUNTERS
     my_bp_v1_perf::PerfState<NUMG> perf_event_state;
+    std::array<std::array<u8, (1 << index1_bits)>, LINEINST> perf_shadow_p1_hyst = {};
+    std::array<std::array<u8, (1 << bindex_bits)>, LINEINST> perf_shadow_bhyst = {};
 
     // Store prediction source per offset (set in predict2, read in update_cycle)
     // 0=bimodal, 1=provider, 2=alt
@@ -297,6 +299,9 @@ struct my_bp_v1 : predictor {
 #define perf_phys_pred_w perf_event_state.perf_phys_pred_w
 #define perf_phys_hyst_w perf_event_state.perf_phys_hyst_w
 #define perf_phys_u_w perf_event_state.perf_phys_u_w
+#define perf_hyst_skip_p1 perf_event_state.perf_hyst_skip_p1
+#define perf_hyst_skip_bim perf_event_state.perf_hyst_skip_bim
+#define perf_hyst_skip_tage perf_event_state.perf_hyst_skip_tage
 #define perf_conf perf_event_state.perf_conf
 #define perf_mt_p1_slots perf_event_state.perf_mt_p1_slots
 #define perf_mt_p1_match_p2 perf_event_state.perf_mt_p1_match_p2
@@ -770,6 +775,46 @@ struct my_bp_v1 : predictor {
         perf_extra_cycle_badpred    += static_cast<u64>(some_badpred1);
         perf_extra_cycle_mispredict += static_cast<u64>(mispredict);
         perf_extra_cycle_p1_update  += static_cast<u64>(p1_update);
+    }
+
+    void perf_count_hyst_skip_events(
+        arr<val<1>,LINEINST> &is_branch,
+        arr<val<1>,LINEINST> &disagree,
+        arr<val<1>,LINEINST> &primary_wrong,
+        arr<val<1>,LINEINST> &bhyst_bim_primary,
+        arr<val<1>,NUMG> &primary,
+        arr<val<1>,NUMG> &allocate,
+        arr<val<1>,NUMG> &badpred1,
+        arr<val<1>,NUMG> &g_sat)
+    {
+        const u64 p1_idx = static_cast<u64>(p1_idx_used);
+        const u64 bim_idx = static_cast<u64>(bindex);
+
+        for (u64 offset = 0; offset < LINEINST; offset++) {
+            if (!static_cast<bool>(is_branch[offset])) continue;
+
+            const bool p1_correct = !static_cast<bool>(disagree[offset]);
+            if (p1_correct && perf_shadow_p1_hyst[offset][p1_idx] != 0) {
+                perf_hyst_skip_p1++;
+            }
+
+            const bool bim_primary = static_cast<bool>(bhyst_bim_primary[offset]);
+            const bool bim_correct = !static_cast<bool>(primary_wrong[offset]);
+            if (bim_primary && bim_correct && perf_shadow_bhyst[offset][bim_idx] != 0) {
+                perf_hyst_skip_bim++;
+            }
+        }
+
+        for (u64 i = 0; i < NUMG; i++) {
+            const bool tage_skip =
+                static_cast<bool>(primary[i]) &&
+                !static_cast<bool>(allocate[i]) &&
+                !static_cast<bool>(badpred1[i]) &&
+                static_cast<bool>(g_sat[i]);
+            if (tage_skip) {
+                perf_hyst_skip_tage++;
+            }
+        }
     }
 
 
@@ -1666,7 +1711,7 @@ struct my_bp_v1 : predictor {
         val<NUMG> primary_mask = actual_match1.fold_or();
         primary_mask.fanout(hard<2>{});
         arr<val<1>,NUMG> primary = primary_mask.make_array(val<1>{});
-        primary.fanout(hard<3>{});
+        primary.fanout(hard<4>{});
 
         arr<val<1>,LINEINST> primary_wrong = [&](u64 offset){
             return pred1[offset] != branch_taken[offset];
@@ -1716,7 +1761,7 @@ struct my_bp_v1 : predictor {
         arr<val<1>,NUMG> badpred1 = [&](u64 i){
             return readc[i] != bdir[i];
         };
-        badpred1.fanout(hard<3>{});
+        badpred1.fanout(hard<4>{});
 
         // associate to each global table a bit telling if local prediction differs from secondary prediction
         arr<val<1>,NUMG> altdiffer = [&](u64 i){
@@ -1755,6 +1800,26 @@ struct my_bp_v1 : predictor {
             // returns 1 iff incorrect primary prediction and hysteresis is weak
             return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
         };
+        g_weak.fanout(hard<2>{});
+
+        arr<val<1>,NUMG> g_sat = [&](u64 i) {
+            return readh[i]==hard<3>{};
+        };
+
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        perf_count_hyst_skip_events(
+            is_branch,
+            disagree,
+            primary_wrong,
+            bhyst_bim_primary,
+            primary,
+            allocate,
+            badpred1,
+            g_sat);
+#endif
+#endif
+
         // need extra cycle for modifying prediction bits and for TAGE allocation
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
 #ifdef CHEATING_MODE
@@ -1887,6 +1952,17 @@ struct my_bp_v1 : predictor {
                 table1_pred[offset].write(p1_idx_used, p2_split[offset]);
             });
         }
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        {
+            const u64 p1_idx = static_cast<u64>(p1_idx_used);
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                if (!static_cast<bool>(is_branch[offset])) continue;
+                perf_shadow_p1_hyst[offset][p1_idx] = static_cast<u8>(static_cast<bool>(~disagree[offset]));
+            }
+        }
+#endif
+#endif
 
 #if MY_BP_V1_P1_MICRO_TAGE
         // Micro-TAGE update on all resolved branch offsets in this block.
@@ -2105,6 +2181,19 @@ struct my_bp_v1 : predictor {
                 bhyst[offset].write(bindex,~primary_wrong[offset]);
             });
         }
+#ifdef CHEATING_MODE
+#ifdef PERF_COUNTERS
+        {
+            const u64 bim_idx = static_cast<u64>(bindex);
+            for (u64 offset=0; offset<LINEINST; offset++) {
+                const bool branch_here = static_cast<bool>(is_branch[offset]);
+                const bool bim_primary = static_cast<bool>((match1[offset] >> NUMG));
+                if (!branch_here || !bim_primary) continue;
+                perf_shadow_bhyst[offset][bim_idx] = static_cast<u8>(static_cast<bool>(~primary_wrong[offset]));
+            }
+        }
+#endif
+#endif
 
         // update incorrect global prediction if primary provider and the hysteresis is weak;
         // initialize global prediction in the allocated entry
@@ -2132,7 +2221,7 @@ struct my_bp_v1 : predictor {
         arr<val<1>,NUMG_GROUP> hyst_we = arr<val<1>,NUMG_GROUP>{[&](u64 g) -> val<1> {
             u64 i0 = 2 * g;
             u64 i1 = i0 + 1;
-            return primary[i0] | allocate[i0] | primary[i1] | allocate[i1];
+            return (primary[i0] & (~((g_sat[i0])&(~badpred1[i0])))) | allocate[i0] | (primary[i1] & (~((g_sat[i1])&(~badpred1[i1])))) | allocate[i1];
         }};
         arr<val<2>,NUMG_GROUP> hyst_row0 = arr<val<2>,NUMG_GROUP>{[&](u64 g) -> val<2> {
             u64 i0 = 2 * g;
@@ -2224,5 +2313,8 @@ struct my_bp_v1 : predictor {
 #undef perf_phys_pred_w
 #undef perf_phys_hyst_w
 #undef perf_phys_u_w
+#undef perf_hyst_skip_p1
+#undef perf_hyst_skip_bim
+#undef perf_hyst_skip_tage
 #undef perf_conf
 #endif
