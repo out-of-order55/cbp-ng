@@ -1781,18 +1781,38 @@ struct my_bp_v1 : predictor {
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
         // Read P1 hysteresis before extra_cycle scheduling so read/write can be separated by extra cycle.
-        arr<val<1>,LINEINST> p1_weak = [&](u64 offset) -> val<1> {
-            return execute_if(disagree[offset], [&](){
-                return ~table1_hyst[offset].read(p1_idx_used);
+        arr<val<1>,LINEINST> p1_hyst_old = [&](u64 offset) -> val<1> {
+            return execute_if(is_branch[offset], [&](){
+                return table1_hyst[offset].read(p1_idx_used);
             });
+        };
+        arr<val<1>,LINEINST> p1_weak = [&](u64 offset) -> val<1> {
+            return disagree[offset] & ~p1_hyst_old[offset];
+        };
+        arr<val<1>,LINEINST> p1_hyst_write_req = [&](u64 offset) -> val<1> {
+            return is_branch[offset] & (disagree[offset] | ~p1_hyst_old[offset]);
+        };
+        arr<val<1>,LINEINST> p1_hyst_rw_conflict = [&](u64 offset) -> val<1> {
+            return p1_hyst_write_req[offset];
         };
 
         // read the bimodal hysteresis if bimodal caused a misprediction
+        arr<val<1>,LINEINST> bhyst_old = [&](u64 offset) -> val<1> {
+            return execute_if(is_branch[offset] & bhyst_bim_primary[offset], [&](){
+                return bhyst[offset].read(bindex);
+            });
+        };
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
             // returns 1 iff cause of misprediction and hysteresis is weak
-            return execute_if(bhyst_bim_primary[offset].fo1() & primary_wrong[offset], [&](){
-                return ~bhyst[offset].read(bindex); // hyst=0 means weak
-            });
+            return bhyst_bim_primary[offset] & primary_wrong[offset] & ~bhyst_old[offset];
+        };
+        arr<val<1>,LINEINST> bhyst_write_req = [&](u64 offset) -> val<1> {
+            return is_branch[offset] & bhyst_bim_primary[offset] &
+                   (primary_wrong[offset] | ~bhyst_old[offset]);
+        };
+        arr<val<1>,LINEINST> bhyst_rw_conflict = [&](u64 offset) -> val<1> {
+            return is_branch[offset] & bhyst_bim_primary[offset] &
+                   ~primary_wrong[offset] & ~bhyst_old[offset];
         };
 
         // determine which primary global predictions are incorrect with a weak hysteresis
@@ -1822,6 +1842,8 @@ struct my_bp_v1 : predictor {
 
         // need extra cycle for modifying prediction bits and for TAGE allocation
         val<1> some_badpred1 = (primary_mask & badpred1.concat()) != hard<0>{};
+        val<1> p1_hyst_need_rmw_cycle = p1_hyst_rw_conflict.concat() != hard<0>{};
+        val<1> bhyst_need_rmw_cycle = bhyst_rw_conflict.concat() != hard<0>{};
 #ifdef CHEATING_MODE
 #ifdef PERF_COUNTERS
         // some_badpred1 is consumed by extra_cycle and PERF counters in this mode.
@@ -1829,7 +1851,12 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
 
-        val<1> extra_cycle_base = some_badpred1 | mispredict | (disagree_mask != hard<0>{});
+        val<1> extra_cycle_base =
+            some_badpred1 |
+            mispredict |
+            (disagree_mask != hard<0>{}) |
+            p1_hyst_need_rmw_cycle |
+            bhyst_need_rmw_cycle;
         val<1> extra_cycle = extra_cycle_base;
 
         extra_cycle.fanout(hard<NUMG*2+8>{});
@@ -1945,7 +1972,7 @@ struct my_bp_v1 : predictor {
             return p1_weak[offset] & p1_from_gshare;
         };
         for (u64 offset=0; offset<LINEINST; offset++) {
-            execute_if(is_branch[offset], [&](){
+            execute_if(p1_hyst_write_req[offset], [&](){
                 table1_hyst[offset].write(p1_idx_used, ~disagree[offset]);
             });
             execute_if(p1_pred_write_req[offset], [&](){
@@ -2176,8 +2203,7 @@ struct my_bp_v1 : predictor {
 
         // update bimodal hysteresis if bimodal is primary provider
         for (u64 offset=0; offset<LINEINST; offset++) {
-            val<1> bim_primary = match1[offset] >> NUMG;
-            execute_if(is_branch[offset] & bim_primary.fo1(), [&](){
+            execute_if(bhyst_write_req[offset], [&](){
                 bhyst[offset].write(bindex,~primary_wrong[offset]);
             });
         }
