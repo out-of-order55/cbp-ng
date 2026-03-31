@@ -83,7 +83,7 @@ for filename in os.listdir(directory):
         # throughput in instructions predicted (P2) per cycle
         IPC = instructions / cycles
 
-        # cycles lost per correct-path instruction because of mispredictions
+        # cycles lost per correct-path instruction because of misprediction
         CPI = MPI * (p2_to_exec_stages + p2_latency - max(1,min(p1_latency,p2_latency)))
 
         #print(f"{name},{IPC:.6f},{CPI:.6f},{EPI}")

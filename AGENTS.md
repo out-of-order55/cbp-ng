@@ -21,17 +21,16 @@
 ## 工作流程（Must）
 
 1. 每次开始先进入 plan 流程；若运行环境不支持显式 plan mode，也必须先给出计划。
-2. 计划必须写入工作目录 `doc/` 子目录，文件内容用英文。
-3. 修改后必须先编译，再运行指定 trace；若失败必须继续修复直到无错误。
-4. 提交不需要提交doc，只提交更改的代码
-5. 添加的性能计数器要使用函数封装
+2. 修改后必须先编译，再运行指定 trace；若失败必须继续修复直到无错误。
+3. 提交不需要提交doc，只提交更改的代码
+4. 添加的性能计数器要使用函数封装
 
 ## 变更类型与验证矩阵（Must）
 
 ### A. 修改 `my_bp_v1` 且属于计数器类改动
 
 ```bash
-./compile my_bp -DPREDICTOR="my_bp_v1<>" -DVERBOSE -DPERF_COUNTERS -DCHEATING_MODE -DFREE_FANOUT
+./compile my_bp -DPREDICTOR="my_bp_v1<>" -DVERBOSE -DPERF_COUNTERS -DCHEATING_MODE
 ```
 
 ### B. 修改 `my_bp_v1` 且属于功能类改动（非计数器）
@@ -98,6 +97,7 @@ execute_if(was_used | do_alloc, [&](){
 5. 默认不改已有函数的外部行为与签名；若必须修改，需在计划中说明影响与理由。
 6. 生成文件不得写入 `/tmp`，只能放在工作目录及子目录。
 7. 测试unit文件放入test文件夹，测试完成后删除可执行文件，无论性能测试还是unit测试
+8. 不要随意使用fo1
 
 ## 交付清单（Must）
 

@@ -887,14 +887,9 @@ struct my_bp_v1 : predictor {
 #endif
 #endif
 
-    
-    // Cluster P1 + bpred tables.
-    zone P1_CLUSTER;
-    // P1 (gshare)
+    // Keep prediction-path tables in one zone to minimize cross-zone wiring.
     ram<val<1>,(1<<index1_bits)> table1_pred[LINEINST] {"P1 pred"}; // P1 prediction bit
     ram<val<1>,(1<<bindex_bits)> bim[LINEINST] {"bpred"}; // bimodal prediction bits
-    // Put TAGE tables in a dedicated cluster.
-    zone TAGE_CLUSTER;
     // P2 (TAGE)
     split_row_ram2<TAGW,(1<<LOGG_SH)> gtag_p[NUMP] {"tags"}; // tags (2-slot row, split 2xRAM)
     ram<arr<val<1>,2>,(1<<LOGG_SH)> gpred_p[NUMP] {"gpred"}; // predictions (2-slot row)
