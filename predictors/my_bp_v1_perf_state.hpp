@@ -91,6 +91,9 @@ struct PerfState {
     std::uint64_t perf_hyst_skip_p1 = 0;
     std::uint64_t perf_hyst_skip_bim = 0;
     std::uint64_t perf_hyst_skip_tage = 0;
+    std::uint64_t perf_weak_wrong_p1 = 0;
+    std::uint64_t perf_weak_wrong_bim = 0;
+    std::uint64_t perf_weak_wrong_tage = 0;
     std::array<std::array<std::uint64_t, 4>, NUMG> perf_conf = {};
 
     // P1 micro-TAGE counters (P1 correctness is defined against P2 direction).

@@ -397,6 +397,12 @@ inline PerfReportTotals print_main_perf_report(
     os << "│ TAGE Skip Count:          " << std::setw(36) << std::left << state.perf_hyst_skip_tage << "│\n";
     os << "└─────────────────────────────────────────────────────────────────┘\n";
 
+    os << "\n┌─ Weak & Wrong Events ───────────────────────────────────────────┐\n";
+    os << "│ P1 Weak&Wrong:            " << std::setw(36) << std::left << state.perf_weak_wrong_p1 << "│\n";
+    os << "│ Bim Weak&Wrong:           " << std::setw(36) << std::left << state.perf_weak_wrong_bim << "│\n";
+    os << "│ TAGE Weak&Wrong:          " << std::setw(36) << std::left << state.perf_weak_wrong_tage << "│\n";
+    os << "└─────────────────────────────────────────────────────────────────┘\n";
+
     os << "\n┌─ P1 Micro-TAGE (P1 vs P2) ──────────────────────────────────────┐\n";
     os << "│ P1 Branch Slots:         " << std::setw(36) << std::left << state.perf_mt_p1_slots << "│\n";
     os << "│ P1 Match/Disagree P2:    " << std::setw(36) << std::left

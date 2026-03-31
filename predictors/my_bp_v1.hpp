@@ -302,6 +302,9 @@ struct my_bp_v1 : predictor {
 #define perf_hyst_skip_p1 perf_event_state.perf_hyst_skip_p1
 #define perf_hyst_skip_bim perf_event_state.perf_hyst_skip_bim
 #define perf_hyst_skip_tage perf_event_state.perf_hyst_skip_tage
+#define perf_weak_wrong_p1 perf_event_state.perf_weak_wrong_p1
+#define perf_weak_wrong_bim perf_event_state.perf_weak_wrong_bim
+#define perf_weak_wrong_tage perf_event_state.perf_weak_wrong_tage
 #define perf_conf perf_event_state.perf_conf
 #define perf_mt_p1_slots perf_event_state.perf_mt_p1_slots
 #define perf_mt_p1_match_p2 perf_event_state.perf_mt_p1_match_p2
@@ -813,6 +816,31 @@ struct my_bp_v1 : predictor {
                 static_cast<bool>(g_sat[i]);
             if (tage_skip) {
                 perf_hyst_skip_tage++;
+            }
+        }
+    }
+
+    void perf_count_weak_wrong_events(
+        arr<val<1>,LINEINST> is_branch,
+        arr<val<1>,LINEINST> p1_weak,
+        arr<val<1>,LINEINST> b_weak,
+        arr<val<1>,NUMG> g_weak)
+    {
+        for (u64 offset = 0; offset < LINEINST; offset++) {
+            if (!static_cast<bool>(is_branch[offset])) continue;
+
+            if (static_cast<bool>(p1_weak[offset])) {
+                perf_weak_wrong_p1++;
+            }
+
+            if (static_cast<bool>(b_weak[offset])) {
+                perf_weak_wrong_bim++;
+            }
+        }
+
+        for (u64 i = 0; i < NUMG; i++) {
+            if (static_cast<bool>(g_weak[i])) {
+                perf_weak_wrong_tage++;
             }
         }
     }
@@ -1786,6 +1814,7 @@ struct my_bp_v1 : predictor {
                 return ~table1_hyst[offset].read(p1_idx_used);
             });
         };
+        p1_weak.fanout(hard<2>{});
 
         // read the bimodal hysteresis if bimodal caused a misprediction
         arr<val<1>,LINEINST> b_weak = [&] (u64 offset) -> val<1> {
@@ -1794,13 +1823,14 @@ struct my_bp_v1 : predictor {
                 return ~bhyst[offset].read(bindex); // hyst=0 means weak
             });
         };
+        b_weak.fanout(hard<2>{});
 
         // determine which primary global predictions are incorrect with a weak hysteresis
         arr<val<1>,NUMG> g_weak = [&] (u64 i) -> val<1> {
             // returns 1 iff incorrect primary prediction and hysteresis is weak
             return primary[i] & badpred1[i] & (readh[i]==hard<0>{});
         };
-        g_weak.fanout(hard<2>{});
+        g_weak.fanout(hard<3>{});
 
         arr<val<1>,NUMG> g_sat = [&](u64 i) {
             return readh[i]==hard<3>{};
@@ -1926,11 +1956,12 @@ struct my_bp_v1 : predictor {
         write_ubit_physical(u_we, u_row0, u_row1, upd_s0, upd_s1, upd_s2, extra_cycle);
 
         auto p1_split = p1.make_array(val<1>{});
-        p1_split.fanout(hard<2>{});
+        p1_split.fanout(hard<4>{});
         auto p2_split = p2.make_array(val<1>{});
         p2_split.fanout(hard<4>{});
 #ifdef PERF_COUNTERS
         perf_count_p1_vs_p2(is_branch, p1_split, p2_split);
+        perf_count_weak_wrong_events(is_branch, p1_weak, b_weak, g_weak);
 #endif
 
         // P1 update policy:
@@ -2316,5 +2347,8 @@ struct my_bp_v1 : predictor {
 #undef perf_hyst_skip_p1
 #undef perf_hyst_skip_bim
 #undef perf_hyst_skip_tage
+#undef perf_weak_wrong_p1
+#undef perf_weak_wrong_bim
+#undef perf_weak_wrong_tage
 #undef perf_conf
 #endif
