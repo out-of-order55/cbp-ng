@@ -316,11 +316,13 @@ def calc_metrics(data, p1_lat, p2_lat):
     # 计算 IPC, CPI
     instructions = float(data['instructions'])
     mispredictions = float(data['misp'])
+    extra_cycles = float(data['extra'])
 
     cycles = calc_prediction_cycles(data, p1_lat, p2_lat)
 
     ipc = instructions / cycles if cycles > 0 else 0
     mpi = mispredictions / instructions if instructions > 0 else 0
+    eci = extra_cycles / instructions if instructions > 0 else 0
     cpi = mpi * (P2_TO_EXEC_STAGES + p2_lat - max(1, min(p1_lat, p2_lat)))
     divergences = float(data['diverge'])
     pred_cycles = float(data['npred'])
@@ -335,6 +337,7 @@ def calc_metrics(data, p1_lat, p2_lat):
         'ipc': ipc,
         'cpi': cpi,
         'mpi': mpi,
+        'eci': eci,
         'dpi': dpi,
         'ppi': ppi
     }
@@ -406,6 +409,7 @@ def summarize_predictor_metrics(results, benchmarks):
     sum_cpi = 0.0
     sum_epi = 0.0
     sum_mpi = 0.0
+    sum_eci = 0.0
     sum_dpi = 0.0
     sum_ppi = 0.0
 
@@ -418,6 +422,7 @@ def summarize_predictor_metrics(results, benchmarks):
         sum_cpi += metrics['cpi']
         sum_epi += metrics['epi']
         sum_mpi += metrics['mpi']
+        sum_eci += metrics['eci']
         sum_dpi += metrics['dpi']
         sum_ppi += metrics['ppi']
 
@@ -427,6 +432,7 @@ def summarize_predictor_metrics(results, benchmarks):
             'cpi': 0.0,
             'epi': 0.0,
             'mpi': 0.0,
+            'eci': 0.0,
             'dpi': 0.0,
             'ppi': 0.0,
             'mpki': 0.0,
@@ -439,6 +445,7 @@ def summarize_predictor_metrics(results, benchmarks):
     cpi = sum_cpi / count
     epi = sum_epi / count
     mpi = sum_mpi / count
+    eci = sum_eci / count
     dpi = sum_dpi / count
     ppi = sum_ppi / count
 
@@ -447,6 +454,7 @@ def summarize_predictor_metrics(results, benchmarks):
         'cpi': cpi,
         'epi': epi,
         'mpi': mpi,
+        'eci': eci,
         'dpi': dpi,
         'ppi': ppi,
         'mpki': mpi * 1000.0,
@@ -520,17 +528,21 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
                                    data1, data2, ref_mpki,
                                    name1='tage', name2='my_bp'):
     """打印每个 benchmark 的对比"""
-    print("\n" + "=" * 155)
+    table_width = 268
+    print("\n" + "=" * table_width)
     print("=== Per-Benchmark Comparison ===")
-    print("=" * 155)
+    print("=" * table_width)
 
     header = f"{'Benchmark':<28} {'Ref MPKI':>10} {name1+' MPKI':>11} {name2+' MPKI':>11} "
     header += f"{'vs Ref1':>9} {'vs Ref2':>9} "
     header += f"{name1+' Acc':>10} {name2+' Acc':>10} {'Δ Acc':>9} "
     header += f"{name1+' EPI':>8} {name2+' EPI':>8} {'Norm':>7} "
+    header += f"{name1+' Extra':>12} {name2+' Extra':>12} {'Δ Extra':>9} "
+    header += f"{name1+' CPI':>10} {name2+' CPI':>10} {'Δ CPI':>8} "
+    header += f"{name1+' IPC':>10} {name2+' IPC':>10} {'Δ IPC':>8} "
     header += f"{name1+' VFS':>8} {name2+' VFS':>8} {'Δ VFS':>9}"
     print(header)
-    print("-" * 155)
+    print("-" * table_width)
 
     rows = []
     for bench in sorted(common_benchmarks):
@@ -540,6 +552,11 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
 
         d_acc = (m2['accuracy'] - m1['accuracy']) * 100
         norm_epi = m2['epi'] / m1['epi'] if m1['epi'] > 0 else 0
+        extra1 = int(data1[bench]['extra'])
+        extra2 = int(data2[bench]['extra'])
+        d_extra = ((extra2 - extra1) / extra1 * 100) if extra1 > 0 else (100.0 if extra2 > 0 else 0.0)
+        d_cpi = ((m2['cpi'] - m1['cpi']) / m1['cpi'] * 100) if m1['cpi'] > 0 else 0.0
+        d_ipc = ((m2['ipc'] - m1['ipc']) / m1['ipc'] * 100) if m1['ipc'] > 0 else 0.0
 
         # vs reference MPKI
         d_mpki1_ref = ((m1['mpki'] - ref) / ref * 100) if ref and ref > 0 else 0
@@ -556,6 +573,9 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
             'd_mpki1_ref': d_mpki1_ref, 'd_mpki2_ref': d_mpki2_ref,
             'acc1': m1['accuracy'], 'acc2': m2['accuracy'], 'd_acc': d_acc,
             'epi1': m1['epi'], 'epi2': m2['epi'], 'norm_epi': norm_epi,
+            'extra1': extra1, 'extra2': extra2, 'd_extra': d_extra,
+            'cpi1': m1['cpi'], 'cpi2': m2['cpi'], 'd_cpi': d_cpi,
+            'ipc1': m1['ipc'], 'ipc2': m2['ipc'], 'd_ipc': d_ipc,
             'vfs1': v1, 'vfs2': v2, 'd_vfs': d_vfs,
             'instr': data1[bench]['instructions'],
             'condbr': data1[bench]['condbr'],
@@ -574,25 +594,36 @@ def print_per_benchmark_comparison(common_benchmarks, metrics1, metrics2,
         line += f"{row['acc1']*100:>8.2f}% {row['acc2']*100:>8.2f}% "
         line += f"{'+' if row['d_acc']>0 else ''}{row['d_acc']:>7.3f}% "
         line += f"{row['epi1']:>6.1f} {row['epi2']:>6.1f} {row['norm_epi']:>7.4f} "
+        line += f"{row['extra1']:>10d} {row['extra2']:>10d} "
+        line += f"{'+' if row['d_extra']>0 else ''}{row['d_extra']:>7.2f}% "
+        line += f"{row['cpi1']:>8.5f} {row['cpi2']:>8.5f} "
+        line += f"{'+' if row['d_cpi']>0 else ''}{row['d_cpi']:>6.2f}% "
+        line += f"{row['ipc1']:>8.4f} {row['ipc2']:>8.4f} "
+        line += f"{'+' if row['d_ipc']>0 else ''}{row['d_ipc']:>6.2f}% "
         line += f"{row['vfs1']:>6.4f} {row['vfs2']:>6.4f} "
         line += f"{'+' if row['d_vfs']>0 else ''}{row['d_vfs']:>7.2f}%"
         print(line)
 
-    print("=" * 155)
+    print("=" * table_width)
     return rows
 
 def print_per_group_comparison(group_members, results1, results2, ref_mpki,
                                name1='tage', name2='my_bp'):
     """打印每个 trace 组的聚合对比"""
-    print("\n" + "=" * 170)
+    table_width = 258
+    print("\n" + "=" * table_width)
     print("=== Per-Group Comparison (Aggregated by Trace Prefix) ===")
-    print("=" * 170)
+    print("=" * table_width)
 
     header = f"{'Group':<28} {'#Traces':>8} {'Ref MPKI':>10} {name1+' MPKI':>11} {name2+' MPKI':>11} "
     header += f"{'Δ MPKI':>9} {name1+' Acc':>10} {name2+' Acc':>10} {'Δ Acc':>9} "
-    header += f"{name1+' EPI':>9} {name2+' EPI':>9} {name1+' VFS':>9} {name2+' VFS':>9} {'Δ VFS':>9}"
+    header += f"{name1+' EPI':>9} {name2+' EPI':>9} "
+    header += f"{name1+' Extra':>12} {name2+' Extra':>12} {'Δ Extra':>9} "
+    header += f"{name1+' CPI':>10} {name2+' CPI':>10} {'Δ CPI':>8} "
+    header += f"{name1+' IPC':>10} {name2+' IPC':>10} {'Δ IPC':>8} "
+    header += f"{name1+' VFS':>9} {name2+' VFS':>9} {'Δ VFS':>9}"
     print(header)
-    print("-" * 170)
+    print("-" * table_width)
 
     rows = []
     for group, traces in group_members.items():
@@ -608,6 +639,11 @@ def print_per_group_comparison(group_members, results1, results2, ref_mpki,
 
         d_mpki = ((m2['mpki'] - m1['mpki']) / m1['mpki'] * 100) if m1['mpki'] > 0 else 0.0
         d_acc = (m2['accuracy'] - m1['accuracy']) * 100.0
+        extra1 = int(gdata1['extra'])
+        extra2 = int(gdata2['extra'])
+        d_extra = ((extra2 - extra1) / extra1 * 100) if extra1 > 0 else (100.0 if extra2 > 0 else 0.0)
+        d_cpi = ((m2['cpi'] - m1['cpi']) / m1['cpi'] * 100) if m1['cpi'] > 0 else 0.0
+        d_ipc = ((m2['ipc'] - m1['ipc']) / m1['ipc'] * 100) if m1['ipc'] > 0 else 0.0
         d_vfs = ((v2 - v1) / v1 * 100) if v1 > 0 else 0.0
         g_ref_mpki = aggregate_ref_mpki(ref_mpki, traces, results1)
 
@@ -623,6 +659,15 @@ def print_per_group_comparison(group_members, results1, results2, ref_mpki,
             'd_acc': d_acc,
             'epi1': m1['epi'],
             'epi2': m2['epi'],
+            'extra1': extra1,
+            'extra2': extra2,
+            'd_extra': d_extra,
+            'cpi1': m1['cpi'],
+            'cpi2': m2['cpi'],
+            'd_cpi': d_cpi,
+            'ipc1': m1['ipc'],
+            'ipc2': m2['ipc'],
+            'd_ipc': d_ipc,
             'vfs1': v1,
             'vfs2': v2,
             'd_vfs': d_vfs,
@@ -643,11 +688,17 @@ def print_per_group_comparison(group_members, results1, results2, ref_mpki,
         line += f"{row['acc1']*100:>8.2f}% {row['acc2']*100:>8.2f}% "
         line += f"{'+' if row['d_acc'] > 0 else ''}{row['d_acc']:>7.3f}% "
         line += f"{row['epi1']:>7.1f} {row['epi2']:>7.1f} "
+        line += f"{row['extra1']:>10d} {row['extra2']:>10d} "
+        line += f"{'+' if row['d_extra'] > 0 else ''}{row['d_extra']:>7.2f}% "
+        line += f"{row['cpi1']:>8.5f} {row['cpi2']:>8.5f} "
+        line += f"{'+' if row['d_cpi'] > 0 else ''}{row['d_cpi']:>6.2f}% "
+        line += f"{row['ipc1']:>8.4f} {row['ipc2']:>8.4f} "
+        line += f"{'+' if row['d_ipc'] > 0 else ''}{row['d_ipc']:>6.2f}% "
         line += f"{row['vfs1']:>7.4f} {row['vfs2']:>7.4f} "
         line += f"{'+' if row['d_vfs'] > 0 else ''}{row['d_vfs']:>7.2f}%"
         print(line)
 
-    print("=" * 170)
+    print("=" * table_width)
     return rows
 
 def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
@@ -686,6 +737,8 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
     harmonic_ipc2 = summary2['ipc']
     avg_cpi1 = summary1['cpi']
     avg_cpi2 = summary2['cpi']
+    avg_eci1 = summary1['eci']
+    avg_eci2 = summary2['eci']
     avg_vfs1 = summary1['vfs']
     avg_vfs2 = summary2['vfs']
     avg_dpi1 = summary1['dpi']
@@ -723,6 +776,10 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
     print(f"Average CPI               {avg_cpi1:>13.6f} {avg_cpi2:>13.6f} "
           f"{'+' if d_cpi>0 else ''}{d_cpi:.2f}% (lower is better)")
 
+    d_eci = ((avg_eci2 - avg_eci1) / avg_eci1 * 100) if avg_eci1 > 0 else 0
+    print(f"Average ECI               {avg_eci1:>13.6f} {avg_eci2:>13.6f} "
+          f"{'+' if d_eci>0 else ''}{d_eci:.2f}% (lower is better)")
+
     d_dpi = ((avg_dpi2 - avg_dpi1) / avg_dpi1 * 100) if avg_dpi1 > 0 else 0
     print(f"Average DPI               {avg_dpi1:>13.6f} {avg_dpi2:>13.6f} "
           f"{'+' if d_dpi>0 else ''}{d_dpi:.2f}% (lower is better)")
@@ -746,6 +803,7 @@ def print_overall_statistics(common_benchmarks, metrics1, metrics2, ref_mpki,
         'avg_epi1': avg_epi1, 'avg_epi2': avg_epi2,
         'harmonic_ipc1': harmonic_ipc1, 'harmonic_ipc2': harmonic_ipc2,
         'avg_cpi1': avg_cpi1, 'avg_cpi2': avg_cpi2,
+        'avg_eci1': avg_eci1, 'avg_eci2': avg_eci2,
         'avg_dpi1': avg_dpi1, 'avg_dpi2': avg_dpi2,
         'avg_ppi1': avg_ppi1, 'avg_ppi2': avg_ppi2,
         'avg_vfs1': avg_vfs1, 'avg_vfs2': avg_vfs2
@@ -764,6 +822,9 @@ def export_csv(common_benchmarks, metrics1, metrics2, data1, data2, ref_mpki,
                   f'{name1}_mpki', f'{name2}_mpki', 'mpki_diff_pct',
                   f'{name1}_mpki_vs_ref', f'{name2}_mpki_vs_ref',
                   f'{name1}_epi', f'{name2}_epi', 'epi_ratio',
+                  f'{name1}_extra', f'{name2}_extra', 'extra_diff_pct',
+                  f'{name1}_cpi', f'{name2}_cpi', 'cpi_diff_pct',
+                  f'{name1}_ipc', f'{name2}_ipc', 'ipc_diff_pct',
                   f'{name1}_vfs', f'{name2}_vfs', 'vfs_diff_pct',
                   'instructions', 'condbr',
                   f'{name1}_misp', f'{name2}_misp', 'misp_diff']
@@ -789,6 +850,12 @@ def export_csv(common_benchmarks, metrics1, metrics2, data1, data2, ref_mpki,
                 mpki1_vs_ref if mpki1_vs_ref is not None else '',
                 mpki2_vs_ref if mpki2_vs_ref is not None else '',
                 m1['epi'], m2['epi'], (m2['epi'] / m1['epi']) if m1['epi'] > 0 else 0,
+                data1[bench]['extra'],
+                data2[bench]['extra'],
+                ((data2[bench]['extra'] - data1[bench]['extra']) / data1[bench]['extra'] * 100)
+                if data1[bench]['extra'] > 0 else (100.0 if data2[bench]['extra'] > 0 else 0.0),
+                m1['cpi'], m2['cpi'], ((m2['cpi'] - m1['cpi']) / m1['cpi'] * 100) if m1['cpi'] > 0 else 0,
+                m1['ipc'], m2['ipc'], ((m2['ipc'] - m1['ipc']) / m1['ipc'] * 100) if m1['ipc'] > 0 else 0,
                 v1, v2, ((v2 - v1) / v1 * 100) if v1 > 0 else 0,
                 data1[bench]['instructions'],
                 data1[bench]['condbr'],
@@ -816,6 +883,9 @@ def export_group_csv(group_rows, output_file='comparison_report_groups.csv',
             f'{name1}_accuracy', f'{name2}_accuracy', 'accuracy_diff',
             f'{name1}_mpki', f'{name2}_mpki', 'mpki_diff_pct',
             f'{name1}_epi', f'{name2}_epi', 'epi_ratio',
+            f'{name1}_extra', f'{name2}_extra', 'extra_diff_pct',
+            f'{name1}_cpi', f'{name2}_cpi', 'cpi_diff_pct',
+            f'{name1}_ipc', f'{name2}_ipc', 'ipc_diff_pct',
             f'{name1}_vfs', f'{name2}_vfs', 'vfs_diff_pct',
             'instructions', 'condbr', f'{name1}_misp', f'{name2}_misp', 'misp_diff',
             'members'
@@ -829,6 +899,9 @@ def export_group_csv(group_rows, output_file='comparison_report_groups.csv',
                 row['acc1'], row['acc2'], row['d_acc'],
                 row['mpki1'], row['mpki2'], row['d_mpki'],
                 row['epi1'], row['epi2'], (row['epi2'] / row['epi1']) if row['epi1'] > 0 else 0.0,
+                row['extra1'], row['extra2'], row['d_extra'],
+                row['cpi1'], row['cpi2'], row['d_cpi'],
+                row['ipc1'], row['ipc2'], row['d_ipc'],
                 row['vfs1'], row['vfs2'], row['d_vfs'],
                 row['instructions'],
                 row['condbr'],
